@@ -33,13 +33,8 @@ pub enum TypeError<'tcx> {
     UnsafetyMismatch(ExpectedFound<hir::Unsafety>),
     AbiMismatch(ExpectedFound<abi::Abi>),
     Mutability,
-    BoxMutability,
-    PtrMutability,
-    RefMutability,
-    VecMutability,
     TupleSize(ExpectedFound<usize>),
     FixedArraySize(ExpectedFound<usize>),
-    TyParamSize(ExpectedFound<usize>),
     ArgCount,
     RegionsDoesNotOutlive(&'tcx Region, &'tcx Region),
     RegionsNotSame(&'tcx Region, &'tcx Region),
@@ -47,17 +42,15 @@ pub enum TypeError<'tcx> {
     RegionsInsufficientlyPolymorphic(BoundRegion, &'tcx Region),
     RegionsOverlyPolymorphic(BoundRegion, &'tcx Region),
     Sorts(ExpectedFound<Ty<'tcx>>),
-    IntegerAsChar,
     IntMismatch(ExpectedFound<ty::IntVarValue>),
     FloatMismatch(ExpectedFound<ast::FloatTy>),
     Traits(ExpectedFound<DefId>),
-    BuiltinBoundsMismatch(ExpectedFound<ty::BuiltinBounds>),
     VariadicMismatch(ExpectedFound<bool>),
     CyclicTy,
-    ConvergenceMismatch(ExpectedFound<bool>),
     ProjectionNameMismatched(ExpectedFound<Name>),
     ProjectionBoundsLength(ExpectedFound<usize>),
-    TyParamDefaultMismatch(ExpectedFound<type_variable::Default<'tcx>>)
+    TyParamDefaultMismatch(ExpectedFound<type_variable::Default<'tcx>>),
+    ExistentialMismatch(ExpectedFound<&'tcx ty::Slice<ty::ExistentialPredicate<'tcx>>>),
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug, Copy)]
@@ -99,18 +92,6 @@ impl<'tcx> fmt::Display for TypeError<'tcx> {
                        values.found)
             }
             Mutability => write!(f, "types differ in mutability"),
-            BoxMutability => {
-                write!(f, "boxed types differ in mutability")
-            }
-            VecMutability => write!(f, "vectors differ in mutability"),
-            PtrMutability => write!(f, "pointers differ in mutability"),
-            RefMutability => write!(f, "references differ in mutability"),
-            TyParamSize(values) => {
-                write!(f, "expected a type with {} type params, \
-                           found one with {} type params",
-                       values.expected,
-                       values.found)
-            }
             FixedArraySize(values) => {
                 write!(f, "expected an array with a fixed size of {} elements, \
                            found one with {} elements",
@@ -154,22 +135,6 @@ impl<'tcx> fmt::Display for TypeError<'tcx> {
                                        format!("trait `{}`",
                                                tcx.item_path_str(values.found)))
             }),
-            BuiltinBoundsMismatch(values) => {
-                if values.expected.is_empty() {
-                    write!(f, "expected no bounds, found `{}`",
-                           values.found)
-                } else if values.found.is_empty() {
-                    write!(f, "expected bounds `{}`, found no bounds",
-                           values.expected)
-                } else {
-                    write!(f, "expected bounds `{}`, found bounds `{}`",
-                           values.expected,
-                           values.found)
-                }
-            }
-            IntegerAsChar => {
-                write!(f, "expected an integral type, found `char`")
-            }
             IntMismatch(ref values) => {
                 write!(f, "expected `{:?}`, found `{:?}`",
                        values.expected,
@@ -185,11 +150,6 @@ impl<'tcx> fmt::Display for TypeError<'tcx> {
                        if values.expected { "variadic" } else { "non-variadic" },
                        if values.found { "variadic" } else { "non-variadic" })
             }
-            ConvergenceMismatch(ref values) => {
-                write!(f, "expected {} fn, found {} function",
-                       if values.expected { "converging" } else { "diverging" },
-                       if values.found { "converging" } else { "diverging" })
-            }
             ProjectionNameMismatched(ref values) => {
                 write!(f, "expected {}, found {}",
                        values.expected,
@@ -204,6 +164,10 @@ impl<'tcx> fmt::Display for TypeError<'tcx> {
                 write!(f, "conflicting type parameter defaults `{}` and `{}`",
                        values.expected.ty,
                        values.found.ty)
+            }
+            ExistentialMismatch(ref values) => {
+                report_maybe_different(f, format!("trait `{}`", values.expected),
+                                       format!("trait `{}`", values.found))
             }
         }
     }
@@ -241,8 +205,9 @@ impl<'a, 'gcx, 'lcx, 'tcx> ty::TyS<'tcx> {
             }
             ty::TyFnDef(..) => format!("fn item"),
             ty::TyFnPtr(_) => "fn pointer".to_string(),
-            ty::TyTrait(ref inner) => {
-                format!("trait {}", tcx.item_path_str(inner.principal.def_id()))
+            ty::TyDynamic(ref inner, ..) => {
+                inner.principal().map_or_else(|| "trait".to_string(),
+                    |p| format!("trait {}", tcx.item_path_str(p.def_id())))
             }
             ty::TyClosure(..) => "closure".to_string(),
             ty::TyTuple(_) => "tuple".to_string(),
@@ -318,10 +283,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                                           expected.ty,
                                           found.ty));
 
-                match
-                    self.map.as_local_node_id(expected.def_id)
-                            .and_then(|node_id| self.map.opt_span(node_id))
-                {
+                match self.map.span_if_local(expected.def_id) {
                     Some(span) => {
                         db.span_note(span, "a default was defined here...");
                     }
@@ -335,10 +297,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                     expected.origin_span,
                     "...that was applied to an unconstrained type variable here");
 
-                match
-                    self.map.as_local_node_id(found.def_id)
-                            .and_then(|node_id| self.map.opt_span(node_id))
-                {
+                match self.map.span_if_local(found.def_id) {
                     Some(span) => {
                         db.span_note(span, "a second default was defined here...");
                     }

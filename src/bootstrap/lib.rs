@@ -13,23 +13,69 @@
 //! This module, and its descendants, are the implementation of the Rust build
 //! system. Most of this build system is backed by Cargo but the outer layer
 //! here serves as the ability to orchestrate calling Cargo, sequencing Cargo
-//! builds, building artifacts like LLVM, etc.
+//! builds, building artifacts like LLVM, etc. The goals of rustbuild are:
 //!
-//! More documentation can be found in each respective module below.
+//! * To be an easily understandable, easily extensible, and maintainable build
+//!   system.
+//! * Leverage standard tools in the Rust ecosystem to build the compiler, aka
+//!   crates.io and Cargo.
+//! * A standard interface to build across all platforms, including MSVC
+//!
+//! ## Architecture
+//!
+//! Although this build system defers most of the complicated logic to Cargo
+//! itself, it still needs to maintain a list of targets and dependencies which
+//! it can itself perform. Rustbuild is made up of a list of rules with
+//! dependencies amongst them (created in the `step` module) and then knows how
+//! to execute each in sequence. Each time rustbuild is invoked, it will simply
+//! iterate through this list of steps and execute each serially in turn.  For
+//! each step rustbuild relies on the step internally being incremental and
+//! parallel. Note, though, that the `-j` parameter to rustbuild gets forwarded
+//! to appropriate test harnesses and such.
+//!
+//! Most of the "meaty" steps that matter are backed by Cargo, which does indeed
+//! have its own parallelism and incremental management. Later steps, like
+//! tests, aren't incremental and simply run the entire suite currently.
+//!
+//! When you execute `x.py build`, the steps which are executed are:
+//!
+//! * First, the python script is run. This will automatically download the
+//!   stage0 rustc and cargo according to `src/stage0.txt`, or using the cached
+//!   versions if they're available. These are then used to compile rustbuild
+//!   itself (using Cargo). Finally, control is then transferred to rustbuild.
+//!
+//! * Rustbuild takes over, performs sanity checks, probes the environment,
+//!   reads configuration, builds up a list of steps, and then starts executing
+//!   them.
+//!
+//! * The stage0 libstd is compiled
+//! * The stage0 libtest is compiled
+//! * The stage0 librustc is compiled
+//! * The stage1 compiler is assembled
+//! * The stage1 libstd, libtest, librustc are compiled
+//! * The stage2 compiler is assembled
+//! * The stage2 libstd, libtest, librustc are compiled
+//!
+//! Each step is driven by a separate Cargo project and rustbuild orchestrates
+//! copying files between steps and otherwise preparing for Cargo to run.
+//!
+//! ## Further information
+//!
+//! More documentation can be found in each respective module below, and you can
+//! also check out the `src/bootstrap/README.md` file for more information.
 
 extern crate build_helper;
 extern crate cmake;
 extern crate filetime;
 extern crate gcc;
 extern crate getopts;
-extern crate md5;
 extern crate num_cpus;
 extern crate rustc_serialize;
 extern crate toml;
-extern crate regex;
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Component, PathBuf, Path};
 use std::process::Command;
@@ -58,10 +104,12 @@ mod channel;
 mod check;
 mod clean;
 mod compile;
+mod metadata;
 mod config;
 mod dist;
 mod doc;
 mod flags;
+mod install;
 mod native;
 mod sanity;
 mod step;
@@ -76,7 +124,7 @@ mod job {
 }
 
 pub use config::Config;
-pub use flags::Flags;
+pub use flags::{Flags, Subcommand};
 
 /// A structure representing a Rust compiler.
 ///
@@ -119,17 +167,27 @@ pub struct Build {
     version: String,
     package_vers: String,
     local_rebuild: bool,
-    bootstrap_key: String,
-    bootstrap_key_stage0: String,
 
     // Probed tools at runtime
-    gdb_version: Option<String>,
     lldb_version: Option<String>,
     lldb_python_dir: Option<String>,
 
     // Runtime state filled in later on
     cc: HashMap<String, (gcc::Tool, Option<PathBuf>)>,
     cxx: HashMap<String, gcc::Tool>,
+    crates: HashMap<String, Crate>,
+    is_sudo: bool,
+}
+
+#[derive(Debug)]
+struct Crate {
+    name: String,
+    deps: Vec<String>,
+    path: PathBuf,
+    doc_step: String,
+    build_step: String,
+    test_step: String,
+    bench_step: String,
 }
 
 /// The various "modes" of invoking Cargo.
@@ -162,7 +220,9 @@ impl Build {
     /// By default all build output will be placed in the current directory.
     pub fn new(flags: Flags, config: Config) -> Build {
         let cwd = t!(env::current_dir());
-        let src = flags.src.clone().unwrap_or(cwd.clone());
+        let src = flags.src.clone().or_else(|| {
+            env::var_os("SRC").map(|x| x.into())
+        }).unwrap_or(cwd.clone());
         let out = cwd.join("build");
 
         let stage0_root = out.join(&config.build).join("stage0/bin");
@@ -175,6 +235,16 @@ impl Build {
             None => stage0_root.join(exe("cargo", &config.build)),
         };
         let local_rebuild = config.local_rebuild;
+
+        let is_sudo = match env::var_os("SUDO_USER") {
+            Some(sudo_user) => {
+                match env::var_os("USER") {
+                    Some(user) => user != sudo_user,
+                    None => false,
+                }
+            }
+            None => false,
+        };
 
         Build {
             flags: flags,
@@ -191,26 +261,23 @@ impl Build {
             ver_date: None,
             version: String::new(),
             local_rebuild: local_rebuild,
-            bootstrap_key: String::new(),
-            bootstrap_key_stage0: String::new(),
             package_vers: String::new(),
             cc: HashMap::new(),
             cxx: HashMap::new(),
-            gdb_version: None,
+            crates: HashMap::new(),
             lldb_version: None,
             lldb_python_dir: None,
+            is_sudo: is_sudo,
         }
     }
 
     /// Executes the entire build, as configured by the flags and configuration.
     pub fn build(&mut self) {
-        use step::Source::*;
-
         unsafe {
             job::setup();
         }
 
-        if self.flags.clean {
+        if let Subcommand::Clean = self.flags.cmd {
             return clean::clean(self);
         }
 
@@ -220,257 +287,22 @@ impl Build {
         sanity::check(self);
         self.verbose("collecting channel variables");
         channel::collect(self);
-        // If local-rust is the same as the current version, then force a local-rebuild
+        // If local-rust is the same major.minor as the current version, then force a local-rebuild
         let local_version_verbose = output(
             Command::new(&self.rustc).arg("--version").arg("--verbose"));
         let local_release = local_version_verbose
             .lines().filter(|x| x.starts_with("release:"))
             .next().unwrap().trim_left_matches("release:").trim();
-        if local_release == self.release {
-            self.verbose(&format!("auto-detected local-rebuild {}", self.release));
+        if local_release.split('.').take(2).eq(self.release.split('.').take(2)) {
+            self.verbose(&format!("auto-detected local-rebuild {}", local_release));
             self.local_rebuild = true;
         }
         self.verbose("updating submodules");
         self.update_submodules();
+        self.verbose("learning about cargo");
+        metadata::build(self);
 
-        // The main loop of the build system.
-        //
-        // The `step::all` function returns a topographically sorted list of all
-        // steps that need to be executed as part of this build. Each step has a
-        // corresponding entry in `step.rs` and indicates some unit of work that
-        // needs to be done as part of the build.
-        //
-        // Almost all of these are simple one-liners that shell out to the
-        // corresponding functionality in the extra modules, where more
-        // documentation can be found.
-        let steps = step::all(self);
-
-        self.verbose("bootstrap build plan:");
-        for step in &steps {
-            self.verbose(&format!("{:?}", step));
-        }
-
-        for target in steps {
-            let doc_out = self.out.join(&target.target).join("doc");
-            match target.src {
-                Llvm { _dummy } => {
-                    native::llvm(self, target.target);
-                }
-                TestHelpers { _dummy } => {
-                    native::test_helpers(self, target.target);
-                }
-                Libstd { compiler } => {
-                    compile::std(self, target.target, &compiler);
-                }
-                Libtest { compiler } => {
-                    compile::test(self, target.target, &compiler);
-                }
-                Librustc { compiler } => {
-                    compile::rustc(self, target.target, &compiler);
-                }
-                LibstdLink { compiler, host } => {
-                    compile::std_link(self, target.target, &compiler, host);
-                }
-                LibtestLink { compiler, host } => {
-                    compile::test_link(self, target.target, &compiler, host);
-                }
-                LibrustcLink { compiler, host } => {
-                    compile::rustc_link(self, target.target, &compiler, host);
-                }
-                Rustc { stage: 0 } => {
-                    // nothing to do...
-                }
-                Rustc { stage } => {
-                    compile::assemble_rustc(self, stage, target.target);
-                }
-                ToolLinkchecker { stage } => {
-                    compile::tool(self, stage, target.target, "linkchecker");
-                }
-                ToolRustbook { stage } => {
-                    compile::tool(self, stage, target.target, "rustbook");
-                }
-                ToolErrorIndex { stage } => {
-                    compile::tool(self, stage, target.target,
-                                  "error_index_generator");
-                }
-                ToolCargoTest { stage } => {
-                    compile::tool(self, stage, target.target, "cargotest");
-                }
-                ToolTidy { stage } => {
-                    compile::tool(self, stage, target.target, "tidy");
-                }
-                ToolCompiletest { stage } => {
-                    compile::tool(self, stage, target.target, "compiletest");
-                }
-                DocBook { stage } => {
-                    doc::rustbook(self, stage, target.target, "book", &doc_out);
-                }
-                DocNomicon { stage } => {
-                    doc::rustbook(self, stage, target.target, "nomicon",
-                                  &doc_out);
-                }
-                DocStandalone { stage } => {
-                    doc::standalone(self, stage, target.target, &doc_out);
-                }
-                DocStd { stage } => {
-                    doc::std(self, stage, target.target, &doc_out);
-                }
-                DocTest { stage } => {
-                    doc::test(self, stage, target.target, &doc_out);
-                }
-                DocRustc { stage } => {
-                    doc::rustc(self, stage, target.target, &doc_out);
-                }
-                DocErrorIndex { stage } => {
-                    doc::error_index(self, stage, target.target, &doc_out);
-                }
-
-                CheckLinkcheck { stage } => {
-                    check::linkcheck(self, stage, target.target);
-                }
-                CheckCargoTest { stage } => {
-                    check::cargotest(self, stage, target.target);
-                }
-                CheckTidy { stage } => {
-                    check::tidy(self, stage, target.target);
-                }
-                CheckRPass { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass", "run-pass");
-                }
-                CheckRPassFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass", "run-pass-fulldeps");
-                }
-                CheckCFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "compile-fail", "compile-fail");
-                }
-                CheckCFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "compile-fail", "compile-fail-fulldeps")
-                }
-                CheckPFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "parse-fail", "parse-fail");
-                }
-                CheckRFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-fail", "run-fail");
-                }
-                CheckRFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-fail", "run-fail-fulldeps");
-                }
-                CheckPretty { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "pretty");
-                }
-                CheckPrettyRPass { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass");
-                }
-                CheckPrettyRPassFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass-fulldeps");
-                }
-                CheckPrettyRFail { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-fail");
-                }
-                CheckPrettyRFailFull { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-fail-fulldeps");
-                }
-                CheckPrettyRPassValgrind { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "pretty", "run-pass-valgrind");
-                }
-                CheckMirOpt { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "mir-opt", "mir-opt");
-                }
-                CheckCodegen { compiler } => {
-                    if self.config.codegen_tests {
-                        check::compiletest(self, &compiler, target.target,
-                                           "codegen", "codegen");
-                    }
-                }
-                CheckCodegenUnits { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "codegen-units", "codegen-units");
-                }
-                CheckIncremental { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "incremental", "incremental");
-                }
-                CheckUi { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "ui", "ui");
-                }
-                CheckDebuginfo { compiler } => {
-                    if target.target.contains("msvc") {
-                        // nothing to do
-                    } else if target.target.contains("apple") {
-                        check::compiletest(self, &compiler, target.target,
-                                           "debuginfo-lldb", "debuginfo");
-                    } else {
-                        check::compiletest(self, &compiler, target.target,
-                                           "debuginfo-gdb", "debuginfo");
-                    }
-                }
-                CheckRustdoc { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "rustdoc", "rustdoc");
-                }
-                CheckRPassValgrind { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-pass-valgrind", "run-pass-valgrind");
-                }
-                CheckDocs { compiler } => {
-                    check::docs(self, &compiler);
-                }
-                CheckErrorIndex { compiler } => {
-                    check::error_index(self, &compiler);
-                }
-                CheckRMake { compiler } => {
-                    check::compiletest(self, &compiler, target.target,
-                                       "run-make", "run-make")
-                }
-                CheckCrateStd { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Libstd)
-                }
-                CheckCrateTest { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Libtest)
-                }
-                CheckCrateRustc { compiler } => {
-                    check::krate(self, &compiler, target.target, Mode::Librustc)
-                }
-
-                DistDocs { stage } => dist::docs(self, stage, target.target),
-                DistMingw { _dummy } => dist::mingw(self, target.target),
-                DistRustc { stage } => dist::rustc(self, stage, target.target),
-                DistStd { compiler } => dist::std(self, &compiler, target.target),
-                DistSrc { _dummy } => dist::rust_src(self),
-
-                DebuggerScripts { stage } => {
-                    let compiler = Compiler::new(stage, target.target);
-                    dist::debugger_scripts(self,
-                                           &self.sysroot(&compiler),
-                                           target.target);
-                }
-
-                AndroidCopyLibs { compiler } => {
-                    check::android_copy_libs(self, &compiler, target.target);
-                }
-
-                // pseudo-steps
-                Dist { .. } |
-                Doc { .. } |
-                CheckTarget { .. } |
-                Check { .. } => {}
-            }
-        }
+        step::run(self);
     }
 
     /// Updates all git submodules that we have.
@@ -557,17 +389,22 @@ impl Build {
                 continue
             }
 
-            if !submodule.path.exists() {
-                t!(fs::create_dir_all(&submodule.path));
-            }
+            // `submodule.path` is the relative path to a submodule (from the repository root)
+            // `submodule_path` is the path to a submodule from the cwd
+
+            // use `submodule.path` when e.g. executing a submodule specific command from the
+            // repository root
+            // use `submodule_path` when e.g. executing a normal git command for the submodule
+            // (set via `current_dir`)
+            let submodule_path = self.src.join(submodule.path);
 
             match submodule.state {
                 State::MaybeDirty => {
                     // drop staged changes
-                    self.run(git().current_dir(submodule.path)
+                    self.run(git().current_dir(&submodule_path)
                                   .args(&["reset", "--hard"]));
                     // drops unstaged changes
-                    self.run(git().current_dir(submodule.path)
+                    self.run(git().current_dir(&submodule_path)
                                   .args(&["clean", "-fdx"]));
                 },
                 State::NotInitialized => {
@@ -577,9 +414,9 @@ impl Build {
                 State::OutOfSync => {
                     // drops submodule commits that weren't reported to the (outer) git repository
                     self.run(git_submodule().arg("update").arg(submodule.path));
-                    self.run(git().current_dir(submodule.path)
+                    self.run(git().current_dir(&submodule_path)
                                   .args(&["reset", "--hard"]));
-                    self.run(git().current_dir(submodule.path)
+                    self.run(git().current_dir(&submodule_path)
                                   .args(&["clean", "-fdx"]));
                 },
             }
@@ -637,11 +474,12 @@ impl Build {
         // how the actual compiler itself is called.
         //
         // These variables are primarily all read by
-        // src/bootstrap/{rustc,rustdoc.rs}
+        // src/bootstrap/bin/{rustc.rs,rustdoc.rs}
         cargo.env("RUSTC", self.out.join("bootstrap/debug/rustc"))
              .env("RUSTC_REAL", self.compiler_path(compiler))
              .env("RUSTC_STAGE", stage.to_string())
              .env("RUSTC_DEBUGINFO", self.config.rust_debuginfo.to_string())
+             .env("RUSTC_DEBUGINFO_LINES", self.config.rust_debuginfo_lines.to_string())
              .env("RUSTC_CODEGEN_UNITS",
                   self.config.rust_codegen_units.to_string())
              .env("RUSTC_DEBUG_ASSERTIONS",
@@ -655,7 +493,9 @@ impl Build {
              .env("RUSTDOC_REAL", self.rustdoc(compiler))
              .env("RUSTC_FLAGS", self.rustc_flags(target).join(" "));
 
-        self.add_bootstrap_key(compiler, &mut cargo);
+        // Enable usage of unstable features
+        cargo.env("RUSTC_BOOTSTRAP", "1");
+        self.add_rust_test_threads(&mut cargo);
 
         // Specify some various options for build scripts used throughout
         // the build.
@@ -667,6 +507,10 @@ impl Build {
                  .env(format!("CFLAGS_{}", target), self.cflags(target).join(" "));
         }
 
+        if self.config.channel == "nightly" && compiler.stage == 2 {
+            cargo.env("RUSTC_SAVE_ANALYSIS", "api".to_string());
+        }
+
         // Environment variables *required* needed throughout the build
         //
         // FIXME: should update code to not require this env var
@@ -675,8 +519,12 @@ impl Build {
         if self.config.verbose || self.flags.verbose {
             cargo.arg("-v");
         }
-        if self.config.rust_optimize {
+        // FIXME: cargo bench does not accept `--release`
+        if self.config.rust_optimize && cmd != "bench" {
             cargo.arg("--release");
+        }
+        if self.config.vendor || self.is_sudo {
+            cargo.arg("--frozen");
         }
         return cargo
     }
@@ -709,12 +557,30 @@ impl Build {
     fn tool_cmd(&self, compiler: &Compiler, tool: &str) -> Command {
         let mut cmd = Command::new(self.tool(&compiler, tool));
         let host = compiler.host;
-        let paths = vec![
+        let mut paths = vec![
             self.cargo_out(compiler, Mode::Libstd, host).join("deps"),
             self.cargo_out(compiler, Mode::Libtest, host).join("deps"),
             self.cargo_out(compiler, Mode::Librustc, host).join("deps"),
             self.cargo_out(compiler, Mode::Tool, host).join("deps"),
         ];
+
+        // On MSVC a tool may invoke a C compiler (e.g. compiletest in run-make
+        // mode) and that C compiler may need some extra PATH modification. Do
+        // so here.
+        if compiler.host.contains("msvc") {
+            let curpaths = env::var_os("PATH").unwrap_or(OsString::new());
+            let curpaths = env::split_paths(&curpaths).collect::<Vec<_>>();
+            for &(ref k, ref v) in self.cc[compiler.host].0.env() {
+                if k != "PATH" {
+                    continue
+                }
+                for path in env::split_paths(v) {
+                    if !curpaths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
         add_lib_path(paths, &mut cmd);
         return cmd
     }
@@ -722,7 +588,7 @@ impl Build {
     /// Get the space-separated set of activated features for the standard
     /// library.
     fn std_features(&self) -> String {
-        let mut features = String::new();
+        let mut features = "panic-unwind".to_string();
         if self.config.debug_jemalloc {
             features.push_str(" debug-jemalloc");
         }
@@ -804,6 +670,11 @@ impl Build {
         self.out.join(target).join("llvm")
     }
 
+    /// Output directory for all documentation for a target
+    fn doc_out(&self, target: &str) -> PathBuf {
+        self.out.join(target).join("doc")
+    }
+
     /// Returns true if no custom `llvm-config` is set for the specified target.
     ///
     /// If no custom `llvm-config` was specified then Rust's llvm will be used.
@@ -863,17 +734,11 @@ impl Build {
         add_lib_path(vec![self.rustc_libdir(compiler)], cmd);
     }
 
-    /// Adds the compiler's bootstrap key to the environment of `cmd`.
-    fn add_bootstrap_key(&self, compiler: &Compiler, cmd: &mut Command) {
-        // In stage0 we're using a previously released stable compiler, so we
-        // use the stage0 bootstrap key. Otherwise we use our own build's
-        // bootstrap key.
-        let bootstrap_key = if compiler.is_snapshot(self) && !self.local_rebuild {
-            &self.bootstrap_key_stage0
-        } else {
-            &self.bootstrap_key
-        };
-        cmd.env("RUSTC_BOOTSTRAP_KEY", bootstrap_key);
+    /// Adds the `RUST_TEST_THREADS` env var if necessary
+    fn add_rust_test_threads(&self, cmd: &mut Command) {
+        if env::var_os("RUST_TEST_THREADS").is_none() {
+            cmd.env("RUST_TEST_THREADS", self.jobs().to_string());
+        }
     }
 
     /// Returns the compiler's libdir where it stores the dynamic libraries that
@@ -975,7 +840,8 @@ impl Build {
         // than an entry here.
 
         let mut base = Vec::new();
-        if target != self.config.build && !target.contains("msvc") {
+        if target != self.config.build && !target.contains("msvc") &&
+            !target.contains("emscripten") {
             base.push(format!("-Clinker={}", self.cc(target).display()));
         }
         return base
@@ -983,9 +849,15 @@ impl Build {
 
     /// Returns the "musl root" for this `target`, if defined
     fn musl_root(&self, target: &str) -> Option<&Path> {
-        self.config.target_config[target].musl_root.as_ref()
+        self.config.target_config.get(target)
+            .and_then(|t| t.musl_root.as_ref())
             .or(self.config.musl_root.as_ref())
             .map(|p| &**p)
+    }
+
+    /// Path to the python interpreter to use
+    fn python(&self) -> &Path {
+        self.config.python.as_ref().unwrap()
     }
 }
 

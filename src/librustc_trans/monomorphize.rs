@@ -26,7 +26,7 @@ pub struct Instance<'tcx> {
 
 impl<'tcx> fmt::Display for Instance<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        ppaux::parameterized(f, &self.substs, self.def, ppaux::Ns::Value, &[])
+        ppaux::parameterized(f, &self.substs, self.def, &[])
     }
 }
 
@@ -60,7 +60,7 @@ pub fn apply_param_substs<'a, 'tcx, T>(scx: &SharedCrateContext<'a, 'tcx>,
 /// Returns the normalized type of a struct field
 pub fn field_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                           param_substs: &Substs<'tcx>,
-                          f: ty::FieldDef<'tcx>)
+                          f: &'tcx ty::FieldDef)
                           -> Ty<'tcx>
 {
     tcx.normalize_associated_type(&f.ty(tcx, param_substs))

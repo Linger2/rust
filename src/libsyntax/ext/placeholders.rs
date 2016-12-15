@@ -13,8 +13,8 @@ use codemap::{DUMMY_SP, dummy_spanned};
 use ext::base::ExtCtxt;
 use ext::expand::{Expansion, ExpansionKind};
 use fold::*;
-use parse::token::{intern, keywords};
 use ptr::P;
+use symbol::{Symbol, keywords};
 use util::move_map::MoveMap;
 use util::small_vector::SmallVector;
 
@@ -88,10 +88,11 @@ impl<'a, 'b> PlaceholderExpander<'a, 'b> {
     }
 
     pub fn add(&mut self, id: ast::NodeId, expansion: Expansion) {
+        let expansion = expansion.fold_with(self);
         self.expansions.insert(id, expansion);
     }
 
-    pub fn remove(&mut self, id: ast::NodeId) -> Expansion {
+    fn remove(&mut self, id: ast::NodeId) -> Expansion {
         self.expansions.remove(&id).unwrap()
     }
 }
@@ -226,7 +227,7 @@ pub fn reconstructed_macro_rules(def: &ast::MacroDef) -> Expansion {
                     span: DUMMY_SP,
                     global: false,
                     segments: vec![ast::PathSegment {
-                        identifier: ast::Ident::with_empty_ctxt(intern("macro_rules")),
+                        identifier: ast::Ident::with_empty_ctxt(Symbol::intern("macro_rules")),
                         parameters: ast::PathParameters::none(),
                     }],
                 },

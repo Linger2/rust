@@ -535,6 +535,7 @@ impl<T: Ord> BinaryHeap<T> {
     ///
     /// ```
     /// #![feature(binary_heap_extras)]
+    /// #![allow(deprecated)]
     ///
     /// use std::collections::BinaryHeap;
     /// let mut heap = BinaryHeap::new();
@@ -549,6 +550,7 @@ impl<T: Ord> BinaryHeap<T> {
     #[unstable(feature = "binary_heap_extras",
                reason = "needs to be audited",
                issue = "28147")]
+    #[rustc_deprecated(since = "1.13.0", reason = "use `peek_mut` instead")]
     pub fn push_pop(&mut self, mut item: T) -> T {
         match self.data.get_mut(0) {
             None => return item,
@@ -575,6 +577,7 @@ impl<T: Ord> BinaryHeap<T> {
     ///
     /// ```
     /// #![feature(binary_heap_extras)]
+    /// #![allow(deprecated)]
     ///
     /// use std::collections::BinaryHeap;
     /// let mut heap = BinaryHeap::new();
@@ -587,6 +590,7 @@ impl<T: Ord> BinaryHeap<T> {
     #[unstable(feature = "binary_heap_extras",
                reason = "needs to be audited",
                issue = "28147")]
+    #[rustc_deprecated(since = "1.13.0", reason = "use `peek_mut` instead")]
     pub fn replace(&mut self, mut item: T) -> Option<T> {
         if !self.is_empty() {
             swap(&mut item, &mut self.data[0]);
@@ -982,7 +986,11 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
+impl<'a, T> ExactSizeIterator for Iter<'a, T> {
+    fn is_empty(&self) -> bool {
+        self.iter.is_empty()
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T> FusedIterator for Iter<'a, T> {}
@@ -1018,7 +1026,11 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> ExactSizeIterator for IntoIter<T> {}
+impl<T> ExactSizeIterator for IntoIter<T> {
+    fn is_empty(&self) -> bool {
+        self.iter.is_empty()
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<T> FusedIterator for IntoIter<T> {}
@@ -1029,7 +1041,7 @@ pub struct Drain<'a, T: 'a> {
     iter: vec::Drain<'a, T>,
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> Iterator for Drain<'a, T> {
     type Item = T;
 
@@ -1044,7 +1056,7 @@ impl<'a, T: 'a> Iterator for Drain<'a, T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> DoubleEndedIterator for Drain<'a, T> {
     #[inline]
     fn next_back(&mut self) -> Option<T> {
@@ -1052,8 +1064,12 @@ impl<'a, T: 'a> DoubleEndedIterator for Drain<'a, T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T: 'a> ExactSizeIterator for Drain<'a, T> {}
+#[stable(feature = "drain", since = "1.6.0")]
+impl<'a, T: 'a> ExactSizeIterator for Drain<'a, T> {
+    fn is_empty(&self) -> bool {
+        self.iter.is_empty()
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T: 'a> FusedIterator for Drain<'a, T> {}

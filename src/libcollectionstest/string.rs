@@ -36,6 +36,12 @@ fn test_from_str() {
 }
 
 #[test]
+fn test_from_cow_str() {
+    assert_eq!(String::from(Cow::Borrowed("string")), "string");
+    assert_eq!(String::from(Cow::Owned(String::from("string"))), "string");
+}
+
+#[test]
 fn test_unsized_to_string() {
     let s: &str = "abc";
     let _: String = (*s).to_string();
@@ -126,7 +132,7 @@ fn test_from_utf16() {
         let s_as_utf16 = s.encode_utf16().collect::<Vec<u16>>();
         let u_as_string = String::from_utf16(&u).unwrap();
 
-        assert!(::rustc_unicode::str::is_utf16(&u));
+        assert!(::std_unicode::str::is_utf16(&u));
         assert_eq!(s_as_utf16, u);
 
         assert_eq!(u_as_string, s);
@@ -223,6 +229,45 @@ fn test_pop() {
     assert_eq!(data.pop().unwrap(), 'b'); // 1 bytes
     assert_eq!(data.pop().unwrap(), '华');
     assert_eq!(data, "ประเทศไทย中");
+}
+
+#[test]
+fn test_split_off_empty() {
+    let orig = "Hello, world!";
+    let mut split = String::from(orig);
+    let empty: String = split.split_off(orig.len());
+    assert!(empty.is_empty());
+}
+
+#[test]
+#[should_panic]
+fn test_split_off_past_end() {
+    let orig = "Hello, world!";
+    let mut split = String::from(orig);
+    split.split_off(orig.len() + 1);
+}
+
+#[test]
+#[should_panic]
+fn test_split_off_mid_char() {
+    let mut orig = String::from("山");
+    orig.split_off(1);
+}
+
+#[test]
+fn test_split_off_ascii() {
+    let mut ab = String::from("ABCD");
+    let cd = ab.split_off(2);
+    assert_eq!(ab, "AB");
+    assert_eq!(cd, "CD");
+}
+
+#[test]
+fn test_split_off_unicode() {
+    let mut nihon = String::from("日本語");
+    let go = nihon.split_off("日本".len());
+    assert_eq!(nihon, "日本");
+    assert_eq!(go, "語");
 }
 
 #[test]

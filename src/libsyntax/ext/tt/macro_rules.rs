@@ -16,13 +16,14 @@ use ext::expand::{Expansion, ExpansionKind};
 use ext::placeholders;
 use ext::tt::macro_parser::{Success, Error, Failure};
 use ext::tt::macro_parser::{MatchedSeq, MatchedNonterminal};
-use ext::tt::macro_parser::parse;
+use ext::tt::macro_parser::{parse, parse_failure_msg};
 use parse::ParseSess;
 use parse::lexer::new_tt_reader;
-use parse::parser::{Parser, Restrictions};
-use parse::token::{self, gensym_ident, NtTT, Token};
+use parse::parser::Parser;
+use parse::token::{self, NtTT, Token};
 use parse::token::Token::*;
 use print;
+use symbol::Symbol;
 use tokenstream::{self, TokenTree};
 
 use std::collections::{HashMap};
@@ -58,7 +59,6 @@ impl<'a> ParserAnyMacro<'a> {
 
 struct MacroRulesMacroExpander {
     name: ast::Ident,
-    imported_from: Option<ast::Ident>,
     lhses: Vec<TokenTree>,
     rhses: Vec<TokenTree>,
     valid: bool,
@@ -76,7 +76,6 @@ impl TTMacroExpander for MacroRulesMacroExpander {
         generic_extension(cx,
                           sp,
                           self.name,
-                          self.imported_from,
                           arg,
                           &self.lhses,
                           &self.rhses)
@@ -87,7 +86,6 @@ impl TTMacroExpander for MacroRulesMacroExpander {
 fn generic_extension<'cx>(cx: &'cx ExtCtxt,
                           sp: Span,
                           name: ast::Ident,
-                          imported_from: Option<ast::Ident>,
                           arg: &[TokenTree],
                           lhses: &[TokenTree],
                           rhses: &[TokenTree])
@@ -100,7 +98,7 @@ fn generic_extension<'cx>(cx: &'cx ExtCtxt,
 
     // Which arm's failure should we report? (the one furthest along)
     let mut best_fail_spot = DUMMY_SP;
-    let mut best_fail_msg = "internal error: ran no matchers".to_string();
+    let mut best_fail_tok = None;
 
     for (i, lhs) in lhses.iter().enumerate() { // try each arm's matchers
         let lhs_tt = match *lhs {
@@ -116,16 +114,15 @@ fn generic_extension<'cx>(cx: &'cx ExtCtxt,
                     _ => cx.span_bug(sp, "malformed macro rhs"),
                 };
                 // rhs has holes ( `$id` and `$(...)` that need filled)
-                let trncbr = new_tt_reader(&cx.parse_sess.span_diagnostic,
-                                           Some(named_matches),
-                                           imported_from,
-                                           rhs);
-                let mut p = Parser::new(cx.parse_sess(), cx.cfg(), Box::new(trncbr));
-                p.directory = cx.current_expansion.module.directory.clone();
-                p.restrictions = match cx.current_expansion.no_noninline_mod {
-                    true => Restrictions::NO_NONINLINE_MOD,
-                    false => Restrictions::empty(),
-                };
+                let trncbr =
+                    new_tt_reader(&cx.parse_sess.span_diagnostic, Some(named_matches), rhs);
+                let mut p = Parser::new(cx.parse_sess(), Box::new(trncbr));
+                let module = &cx.current_expansion.module;
+                p.directory.path = module.directory.clone();
+                p.directory.ownership = cx.current_expansion.directory_ownership;
+                p.root_module_name =
+                    module.mod_path.last().map(|id| (*id.name.as_str()).to_owned());
+
                 p.check_unknown_macro_variable();
                 // Let the context choose how to interpret the result.
                 // Weird, but useful for X-macros.
@@ -139,9 +136,9 @@ fn generic_extension<'cx>(cx: &'cx ExtCtxt,
                     macro_ident: name
                 })
             }
-            Failure(sp, ref msg) => if sp.lo >= best_fail_spot.lo {
+            Failure(sp, tok) => if sp.lo >= best_fail_spot.lo {
                 best_fail_spot = sp;
-                best_fail_msg = (*msg).clone();
+                best_fail_tok = Some(tok);
             },
             Error(err_sp, ref msg) => {
                 cx.span_fatal(err_sp.substitute_dummy(sp), &msg[..])
@@ -149,7 +146,8 @@ fn generic_extension<'cx>(cx: &'cx ExtCtxt,
         }
     }
 
-     cx.span_fatal(best_fail_spot.substitute_dummy(sp), &best_fail_msg[..]);
+    let best_fail_msg = parse_failure_msg(best_fail_tok.expect("ran no matchers"));
+    cx.span_fatal(best_fail_spot.substitute_dummy(sp), &best_fail_msg);
 }
 
 pub struct MacroRulesExpander;
@@ -161,14 +159,13 @@ impl IdentMacroExpander for MacroRulesExpander {
               tts: Vec<tokenstream::TokenTree>,
               attrs: Vec<ast::Attribute>)
               -> Box<MacResult> {
+        let export = attr::contains_name(&attrs, "macro_export");
         let def = ast::MacroDef {
             ident: ident,
             id: ast::DUMMY_NODE_ID,
             span: span,
             imported_from: None,
-            use_locally: true,
             body: tts,
-            export: attr::contains_name(&attrs, "macro_export"),
             allow_internal_unstable: attr::contains_name(&attrs, "allow_internal_unstable"),
             attrs: attrs,
         };
@@ -180,7 +177,7 @@ impl IdentMacroExpander for MacroRulesExpander {
             MacEager::items(placeholders::macro_scope_placeholder().make_items())
         };
 
-        cx.resolver.add_macro(cx.current_expansion.mark, def);
+        cx.resolver.add_macro(cx.current_expansion.mark, def, export);
         result
     }
 }
@@ -192,16 +189,16 @@ impl IdentMacroExpander for MacroRulesExpander {
 
 /// Converts a `macro_rules!` invocation into a syntax extension.
 pub fn compile(sess: &ParseSess, def: &ast::MacroDef) -> SyntaxExtension {
-    let lhs_nm =  gensym_ident("lhs");
-    let rhs_nm =  gensym_ident("rhs");
+    let lhs_nm = ast::Ident::with_empty_ctxt(Symbol::gensym("lhs"));
+    let rhs_nm = ast::Ident::with_empty_ctxt(Symbol::gensym("rhs"));
 
     // The pattern that macro_rules matches.
     // The grammar for macro_rules! is:
     // $( $lhs:tt => $rhs:tt );+
     // ...quasiquoting this would be nice.
     // These spans won't matter, anyways
-    let match_lhs_tok = MatchNt(lhs_nm, token::str_to_ident("tt"));
-    let match_rhs_tok = MatchNt(rhs_nm, token::str_to_ident("tt"));
+    let match_lhs_tok = MatchNt(lhs_nm, ast::Ident::from_str("tt"));
+    let match_rhs_tok = MatchNt(rhs_nm, ast::Ident::from_str("tt"));
     let argument_gram = vec![
         TokenTree::Sequence(DUMMY_SP, Rc::new(tokenstream::SequenceRepetition {
             tts: vec![
@@ -223,12 +220,16 @@ pub fn compile(sess: &ParseSess, def: &ast::MacroDef) -> SyntaxExtension {
     ];
 
     // Parse the macro_rules! invocation (`none` is for no interpolations):
-    let arg_reader = new_tt_reader(&sess.span_diagnostic, None, None, def.body.clone());
+    let arg_reader = new_tt_reader(&sess.span_diagnostic, None, def.body.clone());
 
-    let argument_map = match parse(sess, Vec::new(), arg_reader, &argument_gram) {
+    let argument_map = match parse(sess, arg_reader, &argument_gram) {
         Success(m) => m,
-        Failure(sp, str) | Error(sp, str) => {
-            panic!(sess.span_diagnostic.span_fatal(sp.substitute_dummy(def.span), &str));
+        Failure(sp, tok) => {
+            let s = parse_failure_msg(tok);
+            panic!(sess.span_diagnostic.span_fatal(sp.substitute_dummy(def.span), &s));
+        }
+        Error(sp, s) => {
+            panic!(sess.span_diagnostic.span_fatal(sp.substitute_dummy(def.span), &s));
         }
     };
 
@@ -237,12 +238,14 @@ pub fn compile(sess: &ParseSess, def: &ast::MacroDef) -> SyntaxExtension {
     // Extract the arguments:
     let lhses = match **argument_map.get(&lhs_nm).unwrap() {
         MatchedSeq(ref s, _) => {
-            s.iter().map(|m| match **m {
-                MatchedNonterminal(NtTT(ref tt)) => {
-                    valid &= check_lhs_nt_follows(sess, tt);
-                    (**tt).clone()
+            s.iter().map(|m| {
+                if let MatchedNonterminal(ref nt) = **m {
+                    if let NtTT(ref tt) = **nt {
+                        valid &= check_lhs_nt_follows(sess, tt);
+                        return (*tt).clone();
+                    }
                 }
-                _ => sess.span_diagnostic.span_bug(def.span, "wrong-structured lhs")
+                sess.span_diagnostic.span_bug(def.span, "wrong-structured lhs")
             }).collect::<Vec<TokenTree>>()
         }
         _ => sess.span_diagnostic.span_bug(def.span, "wrong-structured lhs")
@@ -250,9 +253,13 @@ pub fn compile(sess: &ParseSess, def: &ast::MacroDef) -> SyntaxExtension {
 
     let rhses = match **argument_map.get(&rhs_nm).unwrap() {
         MatchedSeq(ref s, _) => {
-            s.iter().map(|m| match **m {
-                MatchedNonterminal(NtTT(ref tt)) => (**tt).clone(),
-                _ => sess.span_diagnostic.span_bug(def.span, "wrong-structured rhs")
+            s.iter().map(|m| {
+                if let MatchedNonterminal(ref nt) = **m {
+                    if let NtTT(ref tt) = **nt {
+                        return (*tt).clone();
+                    }
+                }
+                sess.span_diagnostic.span_bug(def.span, "wrong-structured lhs")
             }).collect()
         }
         _ => sess.span_diagnostic.span_bug(def.span, "wrong-structured rhs")
@@ -269,7 +276,6 @@ pub fn compile(sess: &ParseSess, def: &ast::MacroDef) -> SyntaxExtension {
 
     let exp: Box<_> = Box::new(MacroRulesMacroExpander {
         name: def.ident,
-        imported_from: def.imported_from,
         lhses: lhses,
         rhses: rhses,
         valid: valid,
@@ -786,8 +792,7 @@ fn is_in_follow(tok: &Token, frag: &str) -> Result<bool, (String, &'static str)>
             "pat" => {
                 match *tok {
                     FatArrow | Comma | Eq | BinOp(token::Or) => Ok(true),
-                    Ident(i) if (i.name.as_str() == "if" ||
-                                 i.name.as_str() == "in") => Ok(true),
+                    Ident(i) if i.name == "if" || i.name == "in" => Ok(true),
                     _ => Ok(false)
                 }
             },
@@ -795,8 +800,8 @@ fn is_in_follow(tok: &Token, frag: &str) -> Result<bool, (String, &'static str)>
                 match *tok {
                     OpenDelim(token::DelimToken::Brace) | OpenDelim(token::DelimToken::Bracket) |
                     Comma | FatArrow | Colon | Eq | Gt | Semi | BinOp(token::Or) => Ok(true),
-                    MatchNt(_, ref frag) if frag.name.as_str() == "block" => Ok(true),
-                    Ident(i) if i.name.as_str() == "as" || i.name.as_str() == "where" => Ok(true),
+                    MatchNt(_, ref frag) if frag.name == "block" => Ok(true),
+                    Ident(i) if i.name == "as" || i.name == "where" => Ok(true),
                     _ => Ok(false)
                 }
             },

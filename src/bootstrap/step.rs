@@ -8,592 +8,907 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Major workhorse of rustbuild, definition and dependencies between stages of
-//! the copmile.
+//! Definition of steps of the build system.
 //!
-//! The primary purpose of this module is to define the various `Step`s of
-//! execution of the build. Each `Step` has a corresponding `Source` indicating
-//! what it's actually doing along with a number of dependencies which must be
-//! executed first.
+//! This is where some of the real meat of rustbuild is located, in how we
+//! define targets and the dependencies amongst them. This file can sort of be
+//! viewed as just defining targets in a makefile which shell out to predefined
+//! functions elsewhere about how to execute the target.
 //!
-//! This module will take the CLI as input and calculate the steps required for
-//! the build requested, ensuring that all intermediate pieces are in place.
-//! Essentially this module is a `make`-replacement, but not as good.
+//! The primary function here you're likely interested in is the `build_rules`
+//! function. This will create a `Rules` structure which basically just lists
+//! everything that rustbuild can do. Each rule has a human-readable name, a
+//! path associated with it, some dependencies, and then a closure of how to
+//! actually perform the rule.
+//!
+//! All steps below are defined in self-contained units, so adding a new target
+//! to the build system should just involve adding the meta information here
+//! along with the actual implementation elsewhere. You can find more comments
+//! about how to define rules themselves below.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::mem;
 
-use {Build, Compiler};
+use check::{self, TestKind};
+use compile;
+use dist;
+use doc;
+use flags::Subcommand;
+use install;
+use native;
+use {Compiler, Build, Mode};
 
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
-pub struct Step<'a> {
-    pub src: Source<'a>,
-    pub target: &'a str,
+pub fn run(build: &Build) {
+    let rules = build_rules(build);
+    let steps = rules.plan();
+    rules.run(&steps);
 }
 
-/// Macro used to iterate over all targets that are recognized by the build
-/// system.
-///
-/// Whenever a new step is added it will involve adding an entry here, updating
-/// the dependencies section below, and then adding an implementation of the
-/// step in `build/mod.rs`.
-///
-/// This macro takes another macro as an argument and then calls that macro with
-/// all steps that the build system knows about.
-macro_rules! targets {
-    ($m:ident) => {
-        $m! {
-            // Step representing building the stageN compiler. This is just the
-            // compiler executable itself, not any of the support libraries
-            (rustc, Rustc { stage: u32 }),
+pub fn build_rules(build: &Build) -> Rules {
+    let mut rules = Rules::new(build);
 
-            // Steps for the two main cargo builds. These are parameterized over
-            // the compiler which is producing the artifact.
-            (libstd, Libstd { compiler: Compiler<'a> }),
-            (libtest, Libtest { compiler: Compiler<'a> }),
-            (librustc, Librustc { compiler: Compiler<'a> }),
+    // This is the first rule that we're going to define for rustbuild, which is
+    // used to compile LLVM itself. All rules are added through the `rules`
+    // structure created above and are configured through a builder-style
+    // interface.
+    //
+    // First up we see the `build` method. This represents a rule that's part of
+    // the top-level `build` subcommand. For example `./x.py build` is what this
+    // is associating with. Note that this is normally only relevant if you flag
+    // a rule as `default`, which we'll talk about later.
+    //
+    // Next up we'll see two arguments to this method:
+    //
+    // * `llvm` - this is the "human readable" name of this target. This name is
+    //            not accessed anywhere outside this file itself (e.g. not in
+    //            the CLI nor elsewhere in rustbuild). The purpose of this is to
+    //            easily define dependencies between rules. That is, other rules
+    //            will depend on this with the name "llvm".
+    // * `src/llvm` - this is the relevant path to the rule that we're working
+    //                with. This path is the engine behind how commands like
+    //                `./x.py build src/llvm` work. This should typically point
+    //                to the relevant component, but if there's not really a
+    //                path to be assigned here you can pass something like
+    //                `path/to/nowhere` to ignore it.
+    //
+    // After we create the rule with the `build` method we can then configure
+    // various aspects of it. For example this LLVM rule uses `.host(true)` to
+    // flag that it's a rule only for host targets. In other words, LLVM isn't
+    // compiled for targets configured through `--target` (e.g. those we're just
+    // building a standard library for).
+    //
+    // Next up the `dep` method will add a dependency to this rule. The closure
+    // is yielded the step that represents executing the `llvm` rule itself
+    // (containing information like stage, host, target, ...) and then it must
+    // return a target that the step depends on. Here LLVM is actually
+    // interesting where a cross-compiled LLVM depends on the host LLVM, but
+    // otherwise it has no dependencies.
+    //
+    // To handle this we do a bit of dynamic dispatch to see what the dependency
+    // is. If we're building a LLVM for the build triple, then we don't actually
+    // have any dependencies! To do that we return a dependency on the "dummy"
+    // target which does nothing.
+    //
+    // If we're build a cross-compiled LLVM, however, we need to assemble the
+    // libraries from the previous compiler. This step has the same name as
+    // ours (llvm) but we want it for a different target, so we use the
+    // builder-style methods on `Step` to configure this target to the build
+    // triple.
+    //
+    // Finally, to finish off this rule, we define how to actually execute it.
+    // That logic is all defined in the `native` module so we just delegate to
+    // the relevant function there. The argument to the closure passed to `run`
+    // is a `Step` (defined below) which encapsulates information like the
+    // stage, target, host, etc.
+    rules.build("llvm", "src/llvm")
+         .host(true)
+         .dep(move |s| {
+             if s.target == build.config.build {
+                 dummy(s, build)
+             } else {
+                 s.target(&build.config.build)
+             }
+         })
+         .run(move |s| native::llvm(build, s.target));
 
-            // Links the target produced by the compiler provided into the
-            // host's directory also provided.
-            (libstd_link, LibstdLink {
-                compiler: Compiler<'a>,
-                host: &'a str
-            }),
-            (libtest_link, LibtestLink {
-                compiler: Compiler<'a>,
-                host: &'a str
-            }),
-            (librustc_link, LibrustcLink {
-                compiler: Compiler<'a>,
-                host: &'a str
-            }),
+    // Ok! After that example rule  that's hopefully enough to explain what's
+    // going on here. You can check out the API docs below and also see a bunch
+    // more examples of rules directly below as well.
 
-            // Various tools that we can build as part of the build.
-            (tool_linkchecker, ToolLinkchecker { stage: u32 }),
-            (tool_rustbook, ToolRustbook { stage: u32 }),
-            (tool_error_index, ToolErrorIndex { stage: u32 }),
-            (tool_cargotest, ToolCargoTest { stage: u32 }),
-            (tool_tidy, ToolTidy { stage: u32 }),
-            (tool_compiletest, ToolCompiletest { stage: u32 }),
+    // dummy rule to do nothing, useful when a dep maps to no deps
+    rules.build("dummy", "path/to/nowhere");
 
-            // Steps for long-running native builds. Ideally these wouldn't
-            // actually exist and would be part of build scripts, but for now
-            // these are here.
-            //
-            // There aren't really any parameters to this, but empty structs
-            // with braces are unstable so we just pick something that works.
-            (llvm, Llvm { _dummy: () }),
-            (test_helpers, TestHelpers { _dummy: () }),
-            (debugger_scripts, DebuggerScripts { stage: u32 }),
+    // the compiler with no target libraries ready to go
+    rules.build("rustc", "src/rustc")
+         .dep(move |s| {
+             if s.stage == 0 {
+                 dummy(s, build)
+             } else {
+                 s.name("librustc")
+                  .host(&build.config.build)
+                  .stage(s.stage - 1)
+             }
+         })
+         .run(move |s| compile::assemble_rustc(build, s.stage, s.target));
 
-            // Steps for various pieces of documentation that we can generate,
-            // the 'doc' step is just a pseudo target to depend on a bunch of
-            // others.
-            (doc, Doc { stage: u32 }),
-            (doc_book, DocBook { stage: u32 }),
-            (doc_nomicon, DocNomicon { stage: u32 }),
-            (doc_standalone, DocStandalone { stage: u32 }),
-            (doc_std, DocStd { stage: u32 }),
-            (doc_test, DocTest { stage: u32 }),
-            (doc_rustc, DocRustc { stage: u32 }),
-            (doc_error_index, DocErrorIndex { stage: u32 }),
-
-            // Steps for running tests. The 'check' target is just a pseudo
-            // target to depend on a bunch of others.
-            (check, Check { stage: u32, compiler: Compiler<'a> }),
-            (check_target, CheckTarget { stage: u32, compiler: Compiler<'a> }),
-            (check_linkcheck, CheckLinkcheck { stage: u32 }),
-            (check_cargotest, CheckCargoTest { stage: u32 }),
-            (check_tidy, CheckTidy { stage: u32 }),
-            (check_rpass, CheckRPass { compiler: Compiler<'a> }),
-            (check_rpass_full, CheckRPassFull { compiler: Compiler<'a> }),
-            (check_rpass_valgrind, CheckRPassValgrind { compiler: Compiler<'a> }),
-            (check_rfail, CheckRFail { compiler: Compiler<'a> }),
-            (check_rfail_full, CheckRFailFull { compiler: Compiler<'a> }),
-            (check_cfail, CheckCFail { compiler: Compiler<'a> }),
-            (check_cfail_full, CheckCFailFull { compiler: Compiler<'a> }),
-            (check_pfail, CheckPFail { compiler: Compiler<'a> }),
-            (check_pretty, CheckPretty { compiler: Compiler<'a> }),
-            (check_pretty_rpass, CheckPrettyRPass { compiler: Compiler<'a> }),
-            (check_pretty_rpass_full, CheckPrettyRPassFull { compiler: Compiler<'a> }),
-            (check_pretty_rfail, CheckPrettyRFail { compiler: Compiler<'a> }),
-            (check_pretty_rfail_full, CheckPrettyRFailFull { compiler: Compiler<'a> }),
-            (check_pretty_rpass_valgrind, CheckPrettyRPassValgrind { compiler: Compiler<'a> }),
-            (check_codegen, CheckCodegen { compiler: Compiler<'a> }),
-            (check_codegen_units, CheckCodegenUnits { compiler: Compiler<'a> }),
-            (check_incremental, CheckIncremental { compiler: Compiler<'a> }),
-            (check_ui, CheckUi { compiler: Compiler<'a> }),
-            (check_mir_opt, CheckMirOpt { compiler: Compiler<'a> }),
-            (check_debuginfo, CheckDebuginfo { compiler: Compiler<'a> }),
-            (check_rustdoc, CheckRustdoc { compiler: Compiler<'a> }),
-            (check_docs, CheckDocs { compiler: Compiler<'a> }),
-            (check_error_index, CheckErrorIndex { compiler: Compiler<'a> }),
-            (check_rmake, CheckRMake { compiler: Compiler<'a> }),
-            (check_crate_std, CheckCrateStd { compiler: Compiler<'a> }),
-            (check_crate_test, CheckCrateTest { compiler: Compiler<'a> }),
-            (check_crate_rustc, CheckCrateRustc { compiler: Compiler<'a> }),
-
-            // Distribution targets, creating tarballs
-            (dist, Dist { stage: u32 }),
-            (dist_docs, DistDocs { stage: u32 }),
-            (dist_mingw, DistMingw { _dummy: () }),
-            (dist_rustc, DistRustc { stage: u32 }),
-            (dist_std, DistStd { compiler: Compiler<'a> }),
-            (dist_src, DistSrc { _dummy: () }),
-
-            // Misc targets
-            (android_copy_libs, AndroidCopyLibs { compiler: Compiler<'a> }),
-        }
-    }
-}
-
-// Define the `Source` enum by iterating over all the steps and peeling out just
-// the types that we want to define.
-
-macro_rules! item { ($a:item) => ($a) }
-
-macro_rules! define_source {
-    ($(($short:ident, $name:ident { $($args:tt)* }),)*) => {
-        item! {
-            #[derive(Hash, Eq, PartialEq, Clone, Debug)]
-            pub enum Source<'a> {
-                $($name { $($args)* }),*
+    // Helper for loading an entire DAG of crates, rooted at `name`
+    let krates = |name: &str| {
+        let mut ret = Vec::new();
+        let mut list = vec![name];
+        let mut visited = HashSet::new();
+        while let Some(krate) = list.pop() {
+            let default = krate == name;
+            let krate = &build.crates[krate];
+            let path = krate.path.strip_prefix(&build.src).unwrap();
+            ret.push((krate, path.to_str().unwrap(), default));
+            for dep in krate.deps.iter() {
+                if visited.insert(dep) && dep != "build_helper" {
+                    list.push(dep);
+                }
             }
         }
-    }
-}
-
-targets!(define_source);
-
-/// Calculate a list of all steps described by `build`.
-///
-/// This will inspect the flags passed in on the command line and use that to
-/// build up a list of steps to execute. These steps will then be transformed
-/// into a topologically sorted list which when executed left-to-right will
-/// correctly sequence the entire build.
-pub fn all(build: &Build) -> Vec<Step> {
-    build.verbose("inferred build steps:");
-
-    let mut ret = Vec::new();
-    let mut all = HashSet::new();
-    for target in top_level(build) {
-        fill(build, &target, &mut ret, &mut all);
-    }
-    return ret;
-
-    fn fill<'a>(build: &'a Build,
-                target: &Step<'a>,
-                ret: &mut Vec<Step<'a>>,
-                set: &mut HashSet<Step<'a>>) {
-        if set.insert(target.clone()) {
-            for dep in target.deps(build) {
-                build.verbose(&format!("{:?}\n  -> {:?}", target, dep));
-                fill(build, &dep, ret, set);
-            }
-            ret.push(target.clone());
-        }
-    }
-}
-
-/// Determines what top-level targets are requested as part of this build,
-/// returning them as a list.
-fn top_level(build: &Build) -> Vec<Step> {
-    let mut targets = Vec::new();
-    let stage = build.flags.stage.unwrap_or(2);
-
-    let host = Step {
-        src: Source::Llvm { _dummy: () },
-        target: build.flags.host.iter().next()
-                     .unwrap_or(&build.config.build),
-    };
-    let target = Step {
-        src: Source::Llvm { _dummy: () },
-        target: build.flags.target.iter().next().map(|x| &x[..])
-                     .unwrap_or(host.target)
+        return ret
     };
 
-    // First, try to find steps on the command line.
-    add_steps(build, stage, &host, &target, &mut targets);
-
-    // If none are specified, then build everything.
-    if targets.len() == 0 {
-        let t = Step {
-            src: Source::Llvm { _dummy: () },
-            target: &build.config.build,
-        };
-        if build.config.docs {
-          targets.push(t.doc(stage));
-        }
-        for host in build.config.host.iter() {
-            if !build.flags.host.contains(host) {
-                continue
-            }
-            let host = t.target(host);
-            if host.target == build.config.build {
-                targets.push(host.librustc(host.compiler(stage)));
-            } else {
-                targets.push(host.librustc_link(t.compiler(stage), host.target));
-            }
-            for target in build.config.target.iter() {
-                if !build.flags.target.contains(target) {
-                    continue
-                }
-
-                if host.target == build.config.build {
-                    targets.push(host.target(target)
-                                     .libtest(host.compiler(stage)));
-                } else {
-                    targets.push(host.target(target)
-                                     .libtest_link(t.compiler(stage), host.target));
-                }
-            }
-        }
+    // ========================================================================
+    // Crate compilations
+    //
+    // Tools used during the build system but not shipped
+    rules.build("libstd", "src/libstd")
+         .dep(|s| s.name("build-crate-std_shim"));
+    rules.build("libtest", "src/libtest")
+         .dep(|s| s.name("build-crate-test_shim"));
+    rules.build("librustc", "src/librustc")
+         .dep(|s| s.name("build-crate-rustc-main"));
+    for (krate, path, _default) in krates("std_shim") {
+        rules.build(&krate.build_step, path)
+             .dep(move |s| s.name("rustc").host(&build.config.build).target(s.host))
+             .dep(move |s| {
+                 if s.host == build.config.build {
+                    dummy(s, build)
+                 } else {
+                    s.host(&build.config.build)
+                 }
+             })
+             .run(move |s| {
+                 if s.host == build.config.build {
+                    compile::std(build, s.target, &s.compiler())
+                 } else {
+                    compile::std_link(build, s.target, s.stage, s.host)
+                 }
+             });
+    }
+    for (krate, path, default) in krates("test_shim") {
+        rules.build(&krate.build_step, path)
+             .dep(|s| s.name("libstd"))
+             .dep(move |s| {
+                 if s.host == build.config.build {
+                    dummy(s, build)
+                 } else {
+                    s.host(&build.config.build)
+                 }
+             })
+             .default(default)
+             .run(move |s| {
+                 if s.host == build.config.build {
+                    compile::test(build, s.target, &s.compiler())
+                 } else {
+                    compile::test_link(build, s.target, s.stage, s.host)
+                 }
+             });
+    }
+    for (krate, path, default) in krates("rustc-main") {
+        rules.build(&krate.build_step, path)
+             .dep(|s| s.name("libtest"))
+             .dep(move |s| s.name("llvm").host(&build.config.build).stage(0))
+             .dep(move |s| {
+                 if s.host == build.config.build {
+                    dummy(s, build)
+                 } else {
+                    s.host(&build.config.build)
+                 }
+             })
+             .host(true)
+             .default(default)
+             .run(move |s| {
+                 if s.host == build.config.build {
+                    compile::rustc(build, s.target, &s.compiler())
+                 } else {
+                    compile::rustc_link(build, s.target, s.stage, s.host)
+                 }
+             });
     }
 
-    return targets
+    // ========================================================================
+    // Test targets
+    //
+    // Various unit tests and tests suites we can run
+    {
+        let mut suite = |name, path, dir, mode| {
+            rules.test(name, path)
+                 .dep(|s| s.name("libtest"))
+                 .dep(|s| s.name("tool-compiletest").target(s.host))
+                 .dep(|s| s.name("test-helpers"))
+                 .dep(move |s| {
+                     if s.target.contains("android") {
+                         s.name("android-copy-libs")
+                     } else {
+                         dummy(s, build)
+                     }
+                 })
+                 .default(true)
+                 .run(move |s| {
+                     check::compiletest(build, &s.compiler(), s.target, dir, mode)
+                 });
+        };
 
+        suite("check-rpass", "src/test/run-pass", "run-pass", "run-pass");
+        suite("check-cfail", "src/test/compile-fail", "compile-fail", "compile-fail");
+        suite("check-pfail", "src/test/parse-fail", "parse-fail", "parse-fail");
+        suite("check-rfail", "src/test/run-fail", "run-fail", "run-fail");
+        suite("check-rpass-valgrind", "src/test/run-pass-valgrind",
+              "run-pass-valgrind", "run-pass-valgrind");
+        suite("check-mir-opt", "src/test/mir-opt", "mir-opt", "mir-opt");
+        if build.config.codegen_tests {
+            suite("check-codegen", "src/test/codegen", "codegen", "codegen");
+        }
+        suite("check-codegen-units", "src/test/codegen-units", "codegen-units",
+              "codegen-units");
+        suite("check-incremental", "src/test/incremental", "incremental",
+              "incremental");
+        suite("check-ui", "src/test/ui", "ui", "ui");
+        suite("check-pretty", "src/test/pretty", "pretty", "pretty");
+        suite("check-pretty-rpass", "src/test/run-pass/pretty", "pretty",
+              "run-pass");
+        suite("check-pretty-rfail", "src/test/run-pass/pretty", "pretty",
+              "run-fail");
+        suite("check-pretty-valgrind", "src/test/run-pass-valgrind", "pretty",
+              "run-pass-valgrind");
+    }
+
+    if build.config.build.contains("msvc") {
+        // nothing to do for debuginfo tests
+    } else if build.config.build.contains("apple") {
+        rules.test("check-debuginfo", "src/test/debuginfo")
+             .dep(|s| s.name("libtest"))
+             .dep(|s| s.name("tool-compiletest").host(s.host))
+             .dep(|s| s.name("test-helpers"))
+             .dep(|s| s.name("debugger-scripts"))
+             .run(move |s| check::compiletest(build, &s.compiler(), s.target,
+                                         "debuginfo-lldb", "debuginfo"));
+    } else {
+        rules.test("check-debuginfo", "src/test/debuginfo")
+             .dep(|s| s.name("libtest"))
+             .dep(|s| s.name("tool-compiletest").host(s.host))
+             .dep(|s| s.name("test-helpers"))
+             .dep(|s| s.name("debugger-scripts"))
+             .run(move |s| check::compiletest(build, &s.compiler(), s.target,
+                                         "debuginfo-gdb", "debuginfo"));
+    }
+
+    rules.test("debugger-scripts", "src/etc/lldb_batchmode.py")
+         .run(move |s| dist::debugger_scripts(build, &build.sysroot(&s.compiler()),
+                                         s.target));
+
+    {
+        let mut suite = |name, path, dir, mode| {
+            rules.test(name, path)
+                 .dep(|s| s.name("librustc"))
+                 .dep(|s| s.name("tool-compiletest").target(s.host))
+                 .default(true)
+                 .host(true)
+                 .run(move |s| {
+                     check::compiletest(build, &s.compiler(), s.target, dir, mode)
+                 });
+        };
+
+        suite("check-rpass-full", "src/test/run-pass-fulldeps",
+              "run-pass", "run-pass-fulldeps");
+        suite("check-cfail-full", "src/test/compile-fail-fulldeps",
+              "compile-fail", "compile-fail-fulldeps");
+        suite("check-rmake", "src/test/run-make", "run-make", "run-make");
+        suite("check-rustdoc", "src/test/rustdoc", "rustdoc", "rustdoc");
+        suite("check-pretty-rpass-full", "src/test/run-pass-fulldeps",
+              "pretty", "run-pass-fulldeps");
+        suite("check-pretty-rfail-full", "src/test/run-fail-fulldeps",
+              "pretty", "run-fail-fulldeps");
+    }
+
+    for (krate, path, _default) in krates("std_shim") {
+        rules.test(&krate.test_step, path)
+             .dep(|s| s.name("libtest"))
+             .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                        Mode::Libstd, TestKind::Test,
+                                        Some(&krate.name)));
+    }
+    rules.test("check-std-all", "path/to/nowhere")
+         .dep(|s| s.name("libtest"))
+         .default(true)
+         .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                    Mode::Libstd, TestKind::Test, None));
+
+    // std benchmarks
+    for (krate, path, _default) in krates("std_shim") {
+        rules.bench(&krate.bench_step, path)
+             .dep(|s| s.name("libtest"))
+             .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                        Mode::Libstd, TestKind::Bench,
+                                        Some(&krate.name)));
+    }
+    rules.bench("bench-std-all", "path/to/nowhere")
+         .dep(|s| s.name("libtest"))
+         .default(true)
+         .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                    Mode::Libstd, TestKind::Bench, None));
+
+    for (krate, path, _default) in krates("test_shim") {
+        rules.test(&krate.test_step, path)
+             .dep(|s| s.name("libtest"))
+             .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                        Mode::Libtest, TestKind::Test,
+                                        Some(&krate.name)));
+    }
+    rules.test("check-test-all", "path/to/nowhere")
+         .dep(|s| s.name("libtest"))
+         .default(true)
+         .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                    Mode::Libtest, TestKind::Test, None));
+    for (krate, path, _default) in krates("rustc-main") {
+        rules.test(&krate.test_step, path)
+             .dep(|s| s.name("librustc"))
+             .host(true)
+             .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                        Mode::Librustc, TestKind::Test,
+                                        Some(&krate.name)));
+    }
+    rules.test("check-rustc-all", "path/to/nowhere")
+         .dep(|s| s.name("librustc"))
+         .default(true)
+         .host(true)
+         .run(move |s| check::krate(build, &s.compiler(), s.target,
+                                    Mode::Librustc, TestKind::Test, None));
+
+    rules.test("check-linkchecker", "src/tools/linkchecker")
+         .dep(|s| s.name("tool-linkchecker"))
+         .dep(|s| s.name("default:doc"))
+         .default(true)
+         .host(true)
+         .run(move |s| check::linkcheck(build, s.stage, s.target));
+    rules.test("check-cargotest", "src/tools/cargotest")
+         .dep(|s| s.name("tool-cargotest"))
+         .dep(|s| s.name("librustc"))
+         .host(true)
+         .run(move |s| check::cargotest(build, s.stage, s.target));
+    rules.test("check-tidy", "src/tools/tidy")
+         .dep(|s| s.name("tool-tidy").stage(0))
+         .default(true)
+         .host(true)
+         .run(move |s| check::tidy(build, 0, s.target));
+    rules.test("check-error-index", "src/tools/error_index_generator")
+         .dep(|s| s.name("libstd"))
+         .dep(|s| s.name("tool-error-index").host(s.host))
+         .default(true)
+         .host(true)
+         .run(move |s| check::error_index(build, &s.compiler()));
+    rules.test("check-docs", "src/doc")
+         .dep(|s| s.name("libtest"))
+         .default(true)
+         .host(true)
+         .run(move |s| check::docs(build, &s.compiler()));
+    rules.test("check-distcheck", "distcheck")
+         .dep(|s| s.name("dist-src"))
+         .run(move |_| check::distcheck(build));
+
+
+    rules.build("test-helpers", "src/rt/rust_test_helpers.c")
+         .run(move |s| native::test_helpers(build, s.target));
+    rules.test("android-copy-libs", "path/to/nowhere")
+         .dep(|s| s.name("libtest"))
+         .run(move |s| check::android_copy_libs(build, &s.compiler(), s.target));
+
+    // ========================================================================
+    // Build tools
+    //
+    // Tools used during the build system but not shipped
+    rules.build("tool-rustbook", "src/tools/rustbook")
+         .dep(|s| s.name("librustc"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "rustbook"));
+    rules.build("tool-error-index", "src/tools/error_index_generator")
+         .dep(|s| s.name("librustc"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "error_index_generator"));
+    rules.build("tool-tidy", "src/tools/tidy")
+         .dep(|s| s.name("libstd"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "tidy"));
+    rules.build("tool-linkchecker", "src/tools/linkchecker")
+         .dep(|s| s.name("libstd"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "linkchecker"));
+    rules.build("tool-cargotest", "src/tools/cargotest")
+         .dep(|s| s.name("libstd"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "cargotest"));
+    rules.build("tool-compiletest", "src/tools/compiletest")
+         .dep(|s| s.name("libtest"))
+         .run(move |s| compile::tool(build, s.stage, s.target, "compiletest"));
+
+    // ========================================================================
+    // Documentation targets
+    rules.doc("doc-book", "src/doc/book")
+         .dep(move |s| s.name("tool-rustbook").target(&build.config.build))
+         .default(build.config.docs)
+         .run(move |s| doc::rustbook(build, s.stage, s.target, "book"));
+    rules.doc("doc-nomicon", "src/doc/nomicon")
+         .dep(move |s| s.name("tool-rustbook").target(&build.config.build))
+         .default(build.config.docs)
+         .run(move |s| doc::rustbook(build, s.stage, s.target, "nomicon"));
+    rules.doc("doc-standalone", "src/doc")
+         .dep(move |s| s.name("rustc").host(&build.config.build).target(&build.config.build))
+         .default(build.config.docs)
+         .run(move |s| doc::standalone(build, s.stage, s.target));
+    rules.doc("doc-error-index", "src/tools/error_index_generator")
+         .dep(move |s| s.name("tool-error-index").target(&build.config.build))
+         .dep(move |s| s.name("librustc"))
+         .default(build.config.docs)
+         .host(true)
+         .run(move |s| doc::error_index(build, s.stage, s.target));
+    for (krate, path, default) in krates("std_shim") {
+        rules.doc(&krate.doc_step, path)
+             .dep(|s| s.name("libstd"))
+             .default(default && build.config.docs)
+             .run(move |s| doc::std(build, s.stage, s.target));
+    }
+    for (krate, path, default) in krates("test_shim") {
+        rules.doc(&krate.doc_step, path)
+             .dep(|s| s.name("libtest"))
+             .default(default && build.config.docs)
+             .run(move |s| doc::test(build, s.stage, s.target));
+    }
+    for (krate, path, default) in krates("rustc-main") {
+        rules.doc(&krate.doc_step, path)
+             .dep(|s| s.name("librustc"))
+             .host(true)
+             .default(default && build.config.compiler_docs)
+             .run(move |s| doc::rustc(build, s.stage, s.target));
+    }
+
+    // ========================================================================
+    // Distribution targets
+    rules.dist("dist-rustc", "src/librustc")
+         .dep(move |s| s.name("rustc").host(&build.config.build))
+         .host(true)
+         .default(true)
+         .run(move |s| dist::rustc(build, s.stage, s.target));
+    rules.dist("dist-std", "src/libstd")
+         .dep(move |s| {
+             // We want to package up as many target libraries as possible
+             // for the `rust-std` package, so if this is a host target we
+             // depend on librustc and otherwise we just depend on libtest.
+             if build.config.host.iter().any(|t| t == s.target) {
+                 s.name("librustc")
+             } else {
+                 s.name("libtest")
+             }
+         })
+         .default(true)
+         .run(move |s| dist::std(build, &s.compiler(), s.target));
+    rules.dist("dist-mingw", "path/to/nowhere")
+         .run(move |s| dist::mingw(build, s.target));
+    rules.dist("dist-src", "src")
+         .default(true)
+         .host(true)
+         .run(move |_| dist::rust_src(build));
+    rules.dist("dist-docs", "src/doc")
+         .default(true)
+         .dep(|s| s.name("default:doc"))
+         .run(move |s| dist::docs(build, s.stage, s.target));
+    rules.dist("dist-analysis", "analysis")
+         .dep(|s| s.name("dist-std"))
+         .default(true)
+         .run(move |s| dist::analysis(build, &s.compiler(), s.target));
+    rules.dist("install", "src")
+         .dep(|s| s.name("default:dist"))
+         .run(move |s| install::install(build, s.stage, s.target));
+
+    rules.verify();
+    return rules;
+
+    fn dummy<'a>(s: &Step<'a>, build: &'a Build) -> Step<'a> {
+        s.name("dummy").stage(0)
+         .target(&build.config.build)
+         .host(&build.config.build)
+    }
 }
 
-fn add_steps<'a>(build: &'a Build,
-                 stage: u32,
-                 host: &Step<'a>,
-                 target: &Step<'a>,
-                 targets: &mut Vec<Step<'a>>) {
-    struct Context<'a> {
-        stage: u32,
-        compiler: Compiler<'a>,
-        _dummy: (),
-        host: &'a str,
-    }
-    for step in build.flags.step.iter() {
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+struct Step<'a> {
+    /// Human readable name of the rule this step is executing. Possible names
+    /// are all defined above in `build_rules`.
+    name: &'a str,
 
-        // The macro below insists on hygienic access to all local variables, so
-        // we shove them all in a struct and subvert hygiene by accessing struct
-        // fields instead,
-        let cx = Context {
-            stage: stage,
-            compiler: host.target(&build.config.build).compiler(stage),
-            _dummy: (),
-            host: host.target,
-        };
-        macro_rules! add_step {
-            ($(($short:ident, $name:ident { $($arg:ident: $t:ty),* }),)*) => ({$(
-                let name = stringify!($short).replace("_", "-");
-                if &step[..] == &name[..] {
-                    targets.push(target.$short($(cx.$arg),*));
-                    continue
-                }
-                drop(name);
-            )*})
-        }
+    /// The stage this step is executing in. This is typically 0, 1, or 2.
+    stage: u32,
 
-        targets!(add_step);
+    /// This step will likely involve a compiler, and the target that compiler
+    /// itself is built for is called the host, this variable. Typically this is
+    /// the target of the build machine itself.
+    host: &'a str,
 
-        panic!("unknown step: {}", step);
-    }
-}
-
-macro_rules! constructors {
-    ($(($short:ident, $name:ident { $($arg:ident: $t:ty),* }),)*) => {$(
-        fn $short(&self, $($arg: $t),*) -> Step<'a> {
-            Step {
-                src: Source::$name { $($arg: $arg),* },
-                target: self.target,
-            }
-        }
-    )*}
+    /// The target that this step represents generating. If you're building a
+    /// standard library for a new suite of targets, for example, this'll be set
+    /// to those targets.
+    target: &'a str,
 }
 
 impl<'a> Step<'a> {
-    fn compiler(&self, stage: u32) -> Compiler<'a> {
-        Compiler::new(stage, self.target)
+    /// Creates a new step which is the same as this, except has a new name.
+    fn name(&self, name: &'a str) -> Step<'a> {
+        Step { name: name, ..*self }
     }
 
+    /// Creates a new step which is the same as this, except has a new stage.
+    fn stage(&self, stage: u32) -> Step<'a> {
+        Step { stage: stage, ..*self }
+    }
+
+    /// Creates a new step which is the same as this, except has a new host.
+    fn host(&self, host: &'a str) -> Step<'a> {
+        Step { host: host, ..*self }
+    }
+
+    /// Creates a new step which is the same as this, except has a new target.
     fn target(&self, target: &'a str) -> Step<'a> {
-        Step { target: target, src: self.src.clone() }
+        Step { target: target, ..*self }
     }
 
-    // Define ergonomic constructors for each step defined above so they can be
-    // easily constructed.
-    targets!(constructors);
+    /// Returns the `Compiler` structure that this step corresponds to.
+    fn compiler(&self) -> Compiler<'a> {
+        Compiler::new(self.stage, self.host)
+    }
+}
 
-    /// Mapping of all dependencies for rustbuild.
+struct Rule<'a> {
+    /// The human readable name of this target, defined in `build_rules`.
+    name: &'a str,
+
+    /// The path associated with this target, used in the `./x.py` driver for
+    /// easy and ergonomic specification of what to do.
+    path: &'a str,
+
+    /// The "kind" of top-level command that this rule is associated with, only
+    /// relevant if this is a default rule.
+    kind: Kind,
+
+    /// List of dependencies this rule has. Each dependency is a function from a
+    /// step that's being executed to another step that should be executed.
+    deps: Vec<Box<Fn(&Step<'a>) -> Step<'a> + 'a>>,
+
+    /// How to actually execute this rule. Takes a step with contextual
+    /// information and then executes it.
+    run: Box<Fn(&Step<'a>) + 'a>,
+
+    /// Whether or not this is a "default" rule. That basically means that if
+    /// you run, for example, `./x.py test` whether it's included or not.
+    default: bool,
+
+    /// Whether or not this is a "host" rule, or in other words whether this is
+    /// only intended for compiler hosts and not for targets that are being
+    /// generated.
+    host: bool,
+}
+
+#[derive(PartialEq)]
+enum Kind {
+    Build,
+    Test,
+    Bench,
+    Dist,
+    Doc,
+}
+
+impl<'a> Rule<'a> {
+    fn new(name: &'a str, path: &'a str, kind: Kind) -> Rule<'a> {
+        Rule {
+            name: name,
+            deps: Vec::new(),
+            run: Box::new(|_| ()),
+            path: path,
+            kind: kind,
+            default: false,
+            host: false,
+        }
+    }
+}
+
+/// Builder pattern returned from the various methods on `Rules` which will add
+/// the rule to the internal list on `Drop`.
+struct RuleBuilder<'a: 'b, 'b> {
+    rules: &'b mut Rules<'a>,
+    rule: Rule<'a>,
+}
+
+impl<'a, 'b> RuleBuilder<'a, 'b> {
+    fn dep<F>(&mut self, f: F) -> &mut Self
+        where F: Fn(&Step<'a>) -> Step<'a> + 'a,
+    {
+        self.rule.deps.push(Box::new(f));
+        self
+    }
+
+    fn run<F>(&mut self, f: F) -> &mut Self
+        where F: Fn(&Step<'a>) + 'a,
+    {
+        self.rule.run = Box::new(f);
+        self
+    }
+
+    fn default(&mut self, default: bool) -> &mut Self {
+        self.rule.default = default;
+        self
+    }
+
+    fn host(&mut self, host: bool) -> &mut Self {
+        self.rule.host = host;
+        self
+    }
+}
+
+impl<'a, 'b> Drop for RuleBuilder<'a, 'b> {
+    fn drop(&mut self) {
+        let rule = mem::replace(&mut self.rule, Rule::new("", "", Kind::Build));
+        let prev = self.rules.rules.insert(rule.name, rule);
+        if let Some(prev) = prev {
+            panic!("duplicate rule named: {}", prev.name);
+        }
+    }
+}
+
+pub struct Rules<'a> {
+    build: &'a Build,
+    sbuild: Step<'a>,
+    rules: HashMap<&'a str, Rule<'a>>,
+}
+
+impl<'a> Rules<'a> {
+    fn new(build: &'a Build) -> Rules<'a> {
+        Rules {
+            build: build,
+            sbuild: Step {
+                stage: build.flags.stage.unwrap_or(2),
+                target: &build.config.build,
+                host: &build.config.build,
+                name: "",
+            },
+            rules: HashMap::new(),
+        }
+    }
+
+    /// Creates a new rule of `Kind::Build` with the specified human readable
+    /// name and path associated with it.
     ///
-    /// This function receives a step, the build that we're building for, and
-    /// then returns a list of all the dependencies of that step.
-    pub fn deps(&self, build: &'a Build) -> Vec<Step<'a>> {
-        match self.src {
-            Source::Rustc { stage: 0 } => {
-                Vec::new()
-            }
-            Source::Rustc { stage } => {
-                let compiler = Compiler::new(stage - 1, &build.config.build);
-                vec![self.librustc(compiler)]
-            }
-            Source::Librustc { compiler } => {
-                vec![self.libtest(compiler), self.llvm(())]
-            }
-            Source::Libtest { compiler } => {
-                vec![self.libstd(compiler)]
-            }
-            Source::Libstd { compiler } => {
-                vec![self.rustc(compiler.stage).target(compiler.host)]
-            }
-            Source::LibrustcLink { compiler, host } => {
-                vec![self.librustc(compiler),
-                     self.libtest_link(compiler, host)]
-            }
-            Source::LibtestLink { compiler, host } => {
-                vec![self.libtest(compiler), self.libstd_link(compiler, host)]
-            }
-            Source::LibstdLink { compiler, host } => {
-                vec![self.libstd(compiler),
-                     self.target(host).rustc(compiler.stage)]
-            }
-            Source::Llvm { _dummy } => Vec::new(),
-            Source::TestHelpers { _dummy } => Vec::new(),
-            Source::DebuggerScripts { stage: _ } => Vec::new(),
+    /// The builder returned should be configured further with information such
+    /// as how to actually run this rule.
+    fn build<'b>(&'b mut self, name: &'a str, path: &'a str)
+                 -> RuleBuilder<'a, 'b> {
+        self.rule(name, path, Kind::Build)
+    }
 
-            // Note that all doc targets depend on artifacts from the build
-            // architecture, not the target (which is where we're generating
-            // docs into).
-            Source::DocStd { stage } => {
-                let compiler = self.target(&build.config.build).compiler(stage);
-                vec![self.libstd(compiler)]
-            }
-            Source::DocTest { stage } => {
-                let compiler = self.target(&build.config.build).compiler(stage);
-                vec![self.libtest(compiler)]
-            }
-            Source::DocBook { stage } |
-            Source::DocNomicon { stage } => {
-                vec![self.target(&build.config.build).tool_rustbook(stage)]
-            }
-            Source::DocErrorIndex { stage } => {
-                vec![self.target(&build.config.build).tool_error_index(stage)]
-            }
-            Source::DocStandalone { stage } => {
-                vec![self.target(&build.config.build).rustc(stage)]
-            }
-            Source::DocRustc { stage } => {
-                vec![self.doc_test(stage)]
-            }
-            Source::Doc { stage } => {
-                let mut deps = vec![
-                    self.doc_book(stage), self.doc_nomicon(stage),
-                    self.doc_standalone(stage), self.doc_std(stage),
-                    self.doc_error_index(stage),
-                ];
+    /// Same as `build`, but for `Kind::Test`.
+    fn test<'b>(&'b mut self, name: &'a str, path: &'a str)
+                -> RuleBuilder<'a, 'b> {
+        self.rule(name, path, Kind::Test)
+    }
 
-                if build.config.compiler_docs {
-                    deps.push(self.doc_rustc(stage));
+    /// Same as `build`, but for `Kind::Bench`.
+    fn bench<'b>(&'b mut self, name: &'a str, path: &'a str)
+                -> RuleBuilder<'a, 'b> {
+        self.rule(name, path, Kind::Bench)
+    }
+
+    /// Same as `build`, but for `Kind::Doc`.
+    fn doc<'b>(&'b mut self, name: &'a str, path: &'a str)
+               -> RuleBuilder<'a, 'b> {
+        self.rule(name, path, Kind::Doc)
+    }
+
+    /// Same as `build`, but for `Kind::Dist`.
+    fn dist<'b>(&'b mut self, name: &'a str, path: &'a str)
+                -> RuleBuilder<'a, 'b> {
+        self.rule(name, path, Kind::Dist)
+    }
+
+    fn rule<'b>(&'b mut self,
+                name: &'a str,
+                path: &'a str,
+                kind: Kind) -> RuleBuilder<'a, 'b> {
+        RuleBuilder {
+            rules: self,
+            rule: Rule::new(name, path, kind),
+        }
+    }
+
+    /// Verify the dependency graph defined by all our rules are correct, e.g.
+    /// everything points to a valid something else.
+    fn verify(&self) {
+        for rule in self.rules.values() {
+            for dep in rule.deps.iter() {
+                let dep = dep(&self.sbuild.name(rule.name));
+                if self.rules.contains_key(&dep.name) || dep.name.starts_with("default:") {
+                    continue
                 }
+                panic!("\
 
-                deps
-            }
-            Source::Check { stage, compiler } => {
-                // Check is just a pseudo step which means check all targets,
-                // so just depend on checking all targets.
-                build.config.target.iter().map(|t| {
-                    self.target(t).check_target(stage, compiler)
-                }).collect()
-            }
-            Source::CheckTarget { stage, compiler } => {
-                // CheckTarget here means run all possible test suites for this
-                // target. Most of the time, however, we can't actually run
-                // anything if we're not the build triple as we could be cross
-                // compiling.
-                //
-                // As a result, the base set of targets here is quite stripped
-                // down from the standard set of targets. These suites have
-                // their own internal logic to run in cross-compiled situations
-                // if they'll run at all. For example compiletest knows that
-                // when testing Android targets we ship artifacts to the
-                // emulator.
-                //
-                // When in doubt the rule of thumb for adding to this list is
-                // "should this test suite run on the android bot?"
-                let mut base = vec![
-                    self.check_rpass(compiler),
-                    self.check_rfail(compiler),
-                    self.check_crate_std(compiler),
-                    self.check_crate_test(compiler),
-                    self.check_debuginfo(compiler),
-                    self.dist(stage),
-                ];
+invalid rule dependency graph detected, was a rule added and maybe typo'd?
 
-                // If we're testing the build triple, then we know we can
-                // actually run binaries and such, so we run all possible tests
-                // that we know about.
-                if self.target == build.config.build {
-                    base.extend(vec![
-                        // docs-related
-                        self.check_docs(compiler),
-                        self.check_error_index(compiler),
-                        self.check_rustdoc(compiler),
+    `{}` depends on `{}` which does not exist
 
-                        // UI-related
-                        self.check_cfail(compiler),
-                        self.check_pfail(compiler),
-                        self.check_ui(compiler),
-
-                        // codegen-related
-                        self.check_incremental(compiler),
-                        self.check_codegen(compiler),
-                        self.check_codegen_units(compiler),
-
-                        // misc compiletest-test suites
-                        self.check_rpass_full(compiler),
-                        self.check_rfail_full(compiler),
-                        self.check_cfail_full(compiler),
-                        self.check_pretty_rpass_full(compiler),
-                        self.check_pretty_rfail_full(compiler),
-                        self.check_rpass_valgrind(compiler),
-                        self.check_rmake(compiler),
-                        self.check_mir_opt(compiler),
-
-                        // crates
-                        self.check_crate_rustc(compiler),
-
-                        // pretty
-                        self.check_pretty(compiler),
-                        self.check_pretty_rpass(compiler),
-                        self.check_pretty_rfail(compiler),
-                        self.check_pretty_rpass_valgrind(compiler),
-
-                        // misc
-                        self.check_linkcheck(stage),
-                        self.check_tidy(stage),
-                    ]);
-                }
-                return base
-            }
-            Source::CheckLinkcheck { stage } => {
-                vec![self.tool_linkchecker(stage), self.doc(stage)]
-            }
-            Source::CheckCargoTest { stage } => {
-                vec![self.tool_cargotest(stage),
-                     self.librustc(self.compiler(stage))]
-            }
-            Source::CheckTidy { stage } => {
-                vec![self.tool_tidy(stage)]
-            }
-            Source::CheckMirOpt { compiler} |
-            Source::CheckPrettyRPass { compiler } |
-            Source::CheckPrettyRFail { compiler } |
-            Source::CheckRFail { compiler } |
-            Source::CheckPFail { compiler } |
-            Source::CheckCodegen { compiler } |
-            Source::CheckCodegenUnits { compiler } |
-            Source::CheckIncremental { compiler } |
-            Source::CheckUi { compiler } |
-            Source::CheckRustdoc { compiler } |
-            Source::CheckPretty { compiler } |
-            Source::CheckCFail { compiler } |
-            Source::CheckRPassValgrind { compiler } |
-            Source::CheckRPass { compiler } => {
-                let mut base = vec![
-                    self.libtest(compiler),
-                    self.target(compiler.host).tool_compiletest(compiler.stage),
-                    self.test_helpers(()),
-                ];
-                if self.target.contains("android") {
-                    base.push(self.android_copy_libs(compiler));
-                }
-                base
-            }
-            Source::CheckDebuginfo { compiler } => {
-                vec![
-                    self.libtest(compiler),
-                    self.target(compiler.host).tool_compiletest(compiler.stage),
-                    self.test_helpers(()),
-                    self.debugger_scripts(compiler.stage),
-                ]
-            }
-            Source::CheckRPassFull { compiler } |
-            Source::CheckRFailFull { compiler } |
-            Source::CheckCFailFull { compiler } |
-            Source::CheckPrettyRPassFull { compiler } |
-            Source::CheckPrettyRFailFull { compiler } |
-            Source::CheckPrettyRPassValgrind { compiler } |
-            Source::CheckRMake { compiler } => {
-                vec![self.librustc(compiler),
-                     self.target(compiler.host).tool_compiletest(compiler.stage)]
-            }
-            Source::CheckDocs { compiler } => {
-                vec![self.libstd(compiler)]
-            }
-            Source::CheckErrorIndex { compiler } => {
-                vec![self.libstd(compiler),
-                     self.target(compiler.host).tool_error_index(compiler.stage)]
-            }
-            Source::CheckCrateStd { compiler } => {
-                vec![self.libtest(compiler)]
-            }
-            Source::CheckCrateTest { compiler } => {
-                vec![self.libtest(compiler)]
-            }
-            Source::CheckCrateRustc { compiler } => {
-                vec![self.libtest(compiler)]
-            }
-
-            Source::ToolLinkchecker { stage } |
-            Source::ToolTidy { stage } => {
-                vec![self.libstd(self.compiler(stage))]
-            }
-            Source::ToolErrorIndex { stage } |
-            Source::ToolRustbook { stage } => {
-                vec![self.librustc(self.compiler(stage))]
-            }
-            Source::ToolCargoTest { stage } => {
-                vec![self.libstd(self.compiler(stage))]
-            }
-            Source::ToolCompiletest { stage } => {
-                vec![self.libtest(self.compiler(stage))]
-            }
-
-            Source::DistDocs { stage } => vec![self.doc(stage)],
-            Source::DistMingw { _dummy: _ } => Vec::new(),
-            Source::DistRustc { stage } => {
-                vec![self.rustc(stage)]
-            }
-            Source::DistStd { compiler } => {
-                // We want to package up as many target libraries as possible
-                // for the `rust-std` package, so if this is a host target we
-                // depend on librustc and otherwise we just depend on libtest.
-                if build.config.host.iter().any(|t| t == self.target) {
-                    vec![self.librustc(compiler)]
-                } else {
-                    vec![self.libtest(compiler)]
-                }
-            }
-            Source::DistSrc { _dummy: _ } => Vec::new(),
-
-            Source::Dist { stage } => {
-                let mut base = Vec::new();
-
-                for host in build.config.host.iter() {
-                    let host = self.target(host);
-                    base.push(host.dist_src(()));
-                    base.push(host.dist_rustc(stage));
-                    if host.target.contains("windows-gnu") {
-                        base.push(host.dist_mingw(()));
-                    }
-
-                    let compiler = self.compiler(stage);
-                    for target in build.config.target.iter() {
-                        let target = self.target(target);
-                        if build.config.docs {
-                            base.push(target.dist_docs(stage));
-                        }
-                        base.push(target.dist_std(compiler));
-                    }
-                }
-                return base
-            }
-
-            Source::AndroidCopyLibs { compiler } => {
-                vec![self.libtest(compiler)]
+", rule.name, dep.name);
             }
         }
+    }
+
+    pub fn print_help(&self, command: &str) {
+        let kind = match command {
+            "build" => Kind::Build,
+            "doc" => Kind::Doc,
+            "test" => Kind::Test,
+            "bench" => Kind::Bench,
+            "dist" => Kind::Dist,
+            _ => return,
+        };
+        let rules = self.rules.values().filter(|r| r.kind == kind);
+        let rules = rules.filter(|r| !r.path.contains("nowhere"));
+        let mut rules = rules.collect::<Vec<_>>();
+        rules.sort_by_key(|r| r.path);
+
+        println!("Available paths:\n");
+        for rule in rules {
+            print!("    ./x.py {} {}", command, rule.path);
+
+            println!("");
+        }
+    }
+
+    /// Construct the top-level build steps that we're going to be executing,
+    /// given the subcommand that our build is performing.
+    fn plan(&self) -> Vec<Step<'a>> {
+        // Ok, the logic here is pretty subtle, and involves quite a few
+        // conditionals. The basic idea here is to:
+        //
+        // 1. First, filter all our rules to the relevant ones. This means that
+        //    the command specified corresponds to one of our `Kind` variants,
+        //    and we filter all rules based on that.
+        //
+        // 2. Next, we determine which rules we're actually executing. If a
+        //    number of path filters were specified on the command line we look
+        //    for those, otherwise we look for anything tagged `default`.
+        //
+        // 3. Finally, we generate some steps with host and target information.
+        //
+        // The last step is by far the most complicated and subtle. The basic
+        // thinking here is that we want to take the cartesian product of
+        // specified hosts and targets and build rules with that. The list of
+        // hosts and targets, if not specified, come from the how this build was
+        // configured. If the rule we're looking at is a host-only rule the we
+        // ignore the list of targets and instead consider the list of hosts
+        // also the list of targets.
+        //
+        // Once the host and target lists are generated we take the cartesian
+        // product of the two and then create a step based off them. Note that
+        // the stage each step is associated was specified with the `--step`
+        // flag on the command line.
+        let (kind, paths) = match self.build.flags.cmd {
+            Subcommand::Build { ref paths } => (Kind::Build, &paths[..]),
+            Subcommand::Doc { ref paths } => (Kind::Doc, &paths[..]),
+            Subcommand::Test { ref paths, test_args: _ } => (Kind::Test, &paths[..]),
+            Subcommand::Bench { ref paths, test_args: _ } => (Kind::Bench, &paths[..]),
+            Subcommand::Dist { install } => {
+                if install {
+                    return vec![self.sbuild.name("install")]
+                } else {
+                    (Kind::Dist, &[][..])
+                }
+            }
+            Subcommand::Clean => panic!(),
+        };
+
+        self.rules.values().filter(|rule| rule.kind == kind).filter(|rule| {
+            (paths.len() == 0 && rule.default) || paths.iter().any(|path| {
+                path.ends_with(rule.path)
+            })
+        }).flat_map(|rule| {
+            let hosts = if self.build.flags.host.len() > 0 {
+                &self.build.flags.host
+            } else {
+                &self.build.config.host
+            };
+            let targets = if self.build.flags.target.len() > 0 {
+                &self.build.flags.target
+            } else {
+                &self.build.config.target
+            };
+            // If --target was specified but --host wasn't specified, don't run
+            // any host-only tests
+            let arr = if rule.host {
+                if self.build.flags.target.len() > 0 &&
+                   self.build.flags.host.len() == 0 {
+                    &hosts[..0]
+                } else {
+                    hosts
+                }
+            } else {
+                targets
+            };
+
+            hosts.iter().flat_map(move |host| {
+                arr.iter().map(move |target| {
+                    self.sbuild.name(rule.name).target(target).host(host)
+                })
+            })
+        }).collect()
+    }
+
+    /// Execute all top-level targets indicated by `steps`.
+    ///
+    /// This will take the list returned by `plan` and then execute each step
+    /// along with all required dependencies as it goes up the chain.
+    fn run(&self, steps: &[Step<'a>]) {
+        self.build.verbose("bootstrap top targets:");
+        for step in steps.iter() {
+            self.build.verbose(&format!("\t{:?}", step));
+        }
+
+        // Using `steps` as the top-level targets, make a topological ordering
+        // of what we need to do.
+        let mut order = Vec::new();
+        let mut added = HashSet::new();
+        for step in steps.iter().cloned() {
+            self.fill(step, &mut order, &mut added);
+        }
+
+        // Print out what we're doing for debugging
+        self.build.verbose("bootstrap build plan:");
+        for step in order.iter() {
+            self.build.verbose(&format!("\t{:?}", step));
+        }
+
+        // And finally, iterate over everything and execute it.
+        for step in order.iter() {
+            self.build.verbose(&format!("executing step {:?}", step));
+            (self.rules[step.name].run)(step);
+        }
+    }
+
+    /// Performs topological sort of dependencies rooted at the `step`
+    /// specified, pushing all results onto the `order` vector provided.
+    ///
+    /// In other words, when this method returns, the `order` vector will
+    /// contain a list of steps which if executed in order will eventually
+    /// complete the `step` specified as well.
+    ///
+    /// The `added` set specified here is the set of steps that are already
+    /// present in `order` (and hence don't need to be added again).
+    fn fill(&self,
+            step: Step<'a>,
+            order: &mut Vec<Step<'a>>,
+            added: &mut HashSet<Step<'a>>) {
+        if !added.insert(step.clone()) {
+            return
+        }
+        for dep in self.rules[step.name].deps.iter() {
+            let dep = dep(&step);
+            if dep.name.starts_with("default:") {
+                let kind = match &dep.name[8..] {
+                    "doc" => Kind::Doc,
+                    "dist" => Kind::Dist,
+                    kind => panic!("unknown kind: `{}`", kind),
+                };
+                let host = self.build.config.host.iter().any(|h| h == dep.target);
+                let rules = self.rules.values().filter(|r| r.default);
+                for rule in rules.filter(|r| r.kind == kind && (!r.host || host)) {
+                    self.fill(dep.name(rule.name), order, added);
+                }
+            } else {
+                self.fill(dep, order, added);
+            }
+        }
+        order.push(step);
     }
 }

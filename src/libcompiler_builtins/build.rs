@@ -73,6 +73,12 @@ impl Sources {
 
 fn main() {
     let target = env::var("TARGET").expect("TARGET was not set");
+
+    // Emscripten's runtime includes all the builtins
+    if target.contains("emscripten") {
+        return;
+    }
+
     let cfg = &mut gcc::Config::new();
 
     if target.contains("msvc") {
@@ -88,6 +94,7 @@ fn main() {
         cfg.flag("-fvisibility=hidden");
         cfg.flag("-fomit-frame-pointer");
         cfg.flag("-ffreestanding");
+        cfg.define("VISIBILITY_HIDDEN", None);
     }
 
     let mut sources = Sources::new();

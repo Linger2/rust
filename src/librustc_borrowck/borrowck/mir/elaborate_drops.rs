@@ -8,7 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use indexed_set::IdxSetBuf;
 use super::gather_moves::{MoveData, MovePathIndex, LookupResult};
 use super::dataflow::{MaybeInitializedLvals, MaybeUninitializedLvals};
 use super::dataflow::{DataflowResults};
@@ -18,11 +17,12 @@ use super::{DropFlagState, MoveDataParamEnv};
 use super::patch::MirPatch;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::subst::{Kind, Subst, Substs};
-use rustc::mir::repr::*;
+use rustc::mir::*;
 use rustc::mir::transform::{Pass, MirPass, MirSource};
 use rustc::middle::const_val::ConstVal;
 use rustc::middle::lang_items;
-use rustc::util::nodemap::FnvHashMap;
+use rustc::util::nodemap::FxHashMap;
+use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc_data_structures::indexed_vec::Idx;
 use syntax_pos::Span;
 
@@ -63,7 +63,7 @@ impl<'tcx> MirPass<'tcx> for ElaborateDrops {
                 env: &env,
                 flow_inits: flow_inits,
                 flow_uninits: flow_uninits,
-                drop_flags: FnvHashMap(),
+                drop_flags: FxHashMap(),
                 patch: MirPatch::new(mir),
             }.elaborate()
         };
@@ -118,7 +118,7 @@ struct ElaborateDropsCtxt<'a, 'tcx: 'a> {
     env: &'a MoveDataParamEnv<'tcx>,
     flow_inits: DataflowResults<MaybeInitializedLvals<'a, 'tcx>>,
     flow_uninits:  DataflowResults<MaybeUninitializedLvals<'a, 'tcx>>,
-    drop_flags: FnvHashMap<MovePathIndex, Local>,
+    drop_flags: FxHashMap<MovePathIndex, Local>,
     patch: MirPatch<'tcx>,
 }
 
@@ -442,7 +442,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     fn move_paths_for_fields(&self,
                              base_lv: &Lvalue<'tcx>,
                              variant_path: MovePathIndex,
-                             variant: ty::VariantDef<'tcx>,
+                             variant: &'tcx ty::VariantDef,
                              substs: &'tcx Substs<'tcx>)
                              -> Vec<(Lvalue<'tcx>, Option<MovePathIndex>)>
     {
@@ -619,7 +619,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     fn open_drop_for_variant<'a>(&mut self,
                                  c: &DropCtxt<'a, 'tcx>,
                                  drop_block: &mut Option<BasicBlock>,
-                                 adt: ty::AdtDef<'tcx>,
+                                 adt: &'tcx ty::AdtDef,
                                  substs: &'tcx Substs<'tcx>,
                                  variant_index: usize)
                                  -> BasicBlock
@@ -652,7 +652,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn open_drop_for_adt<'a>(&mut self, c: &DropCtxt<'a, 'tcx>,
-                             adt: ty::AdtDef<'tcx>, substs: &'tcx Substs<'tcx>)
+                             adt: &'tcx ty::AdtDef, substs: &'tcx Substs<'tcx>)
                              -> BasicBlock {
         debug!("open_drop_for_adt({:?}, {:?}, {:?})", c, adt, substs);
 
@@ -709,9 +709,11 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             ty::TyAdt(def, substs) => {
                 self.open_drop_for_adt(c, def, substs)
             }
-            ty::TyTuple(tys) | ty::TyClosure(_, ty::ClosureSubsts {
-                upvar_tys: tys, ..
-            }) => {
+            ty::TyClosure(def_id, substs) => {
+                let tys : Vec<_> = substs.upvar_tys(def_id, self.tcx).collect();
+                self.open_drop_for_tuple(c, &tys)
+            }
+            ty::TyTuple(tys) => {
                 self.open_drop_for_tuple(c, tys)
             }
             ty::TyBox(ty) => {
@@ -855,10 +857,9 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
 
         let tcx = self.tcx;
         let unit_temp = Lvalue::Local(self.patch.new_temp(tcx.mk_nil()));
-        let free_func = tcx.lang_items.require(lang_items::BoxFreeFnLangItem)
-            .unwrap_or_else(|e| tcx.sess.fatal(&e));
-        let substs = Substs::new(tcx, iter::once(Kind::from(ty)));
-        let fty = tcx.lookup_item_type(free_func).ty.subst(tcx, substs);
+        let free_func = tcx.require_lang_item(lang_items::BoxFreeFnLangItem);
+        let substs = tcx.mk_substs(iter::once(Kind::from(ty)));
+        let fty = tcx.item_type(free_func).subst(tcx, substs);
 
         self.patch.new_block(BasicBlockData {
             statements: statements,

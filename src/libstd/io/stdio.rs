@@ -125,13 +125,10 @@ impl<R: io::Read> io::Read for Maybe<R> {
 }
 
 fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
-    #[cfg(windows)]
-    const ERR: i32 = ::sys::c::ERROR_INVALID_HANDLE as i32;
-    #[cfg(not(windows))]
-    const ERR: i32 = ::libc::EBADF as i32;
+    use sys::stdio::EBADF_ERR;
 
     match r {
-        Err(ref e) if e.raw_os_error() == Some(ERR) => Ok(default),
+        Err(ref e) if e.raw_os_error() == Some(EBADF_ERR) => Ok(default),
         r => r
     }
 }
@@ -217,15 +214,7 @@ pub fn stdin() -> Stdin {
             _ => Maybe::Fake
         };
 
-        // The default buffer capacity is 64k, but apparently windows
-        // doesn't like 64k reads on stdin. See #13304 for details, but the
-        // idea is that on windows we use a slightly smaller buffer that's
-        // been seen to be acceptable.
-        Arc::new(Mutex::new(if cfg!(windows) {
-            BufReader::with_capacity(8 * 1024, stdin)
-        } else {
-            BufReader::new(stdin)
-        }))
+        Arc::new(Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, stdin)))
     }
 }
 
@@ -329,10 +318,11 @@ impl<'a> BufRead for StdinLock<'a> {
 ///
 /// Each handle shares a global buffer of data to be written to the standard
 /// output stream. Access is also synchronized via a lock and explicit control
-/// over locking is available via the `lock` method.
+/// over locking is available via the [`lock()`] method.
 ///
 /// Created by the [`io::stdout`] method.
 ///
+/// [`lock()`]: #method.lock
 /// [`io::stdout`]: fn.stdout.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdout {
@@ -593,11 +583,11 @@ impl<'a> Write for StderrLock<'a> {
                      with a more general mechanism",
            issue = "0")]
 #[doc(hidden)]
-pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
+pub fn set_panic(sink: Option<Box<Write + Send>>) -> Option<Box<Write + Send>> {
     use panicking::LOCAL_STDERR;
     use mem;
     LOCAL_STDERR.with(move |slot| {
-        mem::replace(&mut *slot.borrow_mut(), Some(sink))
+        mem::replace(&mut *slot.borrow_mut(), sink)
     }).and_then(|mut s| {
         let _ = s.flush();
         Some(s)
@@ -617,10 +607,10 @@ pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
                      with a more general mechanism",
            issue = "0")]
 #[doc(hidden)]
-pub fn set_print(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
+pub fn set_print(sink: Option<Box<Write + Send>>) -> Option<Box<Write + Send>> {
     use mem;
     LOCAL_STDOUT.with(move |slot| {
-        mem::replace(&mut *slot.borrow_mut(), Some(sink))
+        mem::replace(&mut *slot.borrow_mut(), sink)
     }).and_then(|mut s| {
         let _ = s.flush();
         Some(s)
@@ -668,6 +658,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(target_os = "emscripten", ignore)]
     fn panic_doesnt_poison() {
         thread::spawn(|| {
             let _a = stdin();

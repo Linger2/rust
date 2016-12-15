@@ -126,14 +126,15 @@ use rustc::hir::map::DefPathData;
 use rustc::session::config::NUMBERED_CODEGEN_UNIT_MARKER;
 use rustc::ty::TyCtxt;
 use rustc::ty::item_path::characteristic_def_id_of_type;
+use rustc_incremental::IchHasher;
 use std::cmp::Ordering;
-use std::hash::{Hash, Hasher, SipHasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use symbol_map::SymbolMap;
 use syntax::ast::NodeId;
-use syntax::parse::token::{self, InternedString};
+use syntax::symbol::{Symbol, InternedString};
 use trans_item::TransItem;
-use util::nodemap::{FnvHashMap, FnvHashSet};
+use util::nodemap::{FxHashMap, FxHashSet};
 
 pub enum PartitioningStrategy {
     /// Generate one codegen unit per source-level module.
@@ -150,12 +151,12 @@ pub struct CodegenUnit<'tcx> {
     /// as well as the crate name and disambiguator.
     name: InternedString,
 
-    items: FnvHashMap<TransItem<'tcx>, llvm::Linkage>,
+    items: FxHashMap<TransItem<'tcx>, llvm::Linkage>,
 }
 
 impl<'tcx> CodegenUnit<'tcx> {
     pub fn new(name: InternedString,
-               items: FnvHashMap<TransItem<'tcx>, llvm::Linkage>)
+               items: FxHashMap<TransItem<'tcx>, llvm::Linkage>)
                -> Self {
         CodegenUnit {
             name: name,
@@ -164,7 +165,7 @@ impl<'tcx> CodegenUnit<'tcx> {
     }
 
     pub fn empty(name: InternedString) -> Self {
-        Self::new(name, FnvHashMap())
+        Self::new(name, FxHashMap())
     }
 
     pub fn contains_item(&self, item: &TransItem<'tcx>) -> bool {
@@ -175,7 +176,7 @@ impl<'tcx> CodegenUnit<'tcx> {
         &self.name
     }
 
-    pub fn items(&self) -> &FnvHashMap<TransItem<'tcx>, llvm::Linkage> {
+    pub fn items(&self) -> &FxHashMap<TransItem<'tcx>, llvm::Linkage> {
         &self.items
     }
 
@@ -187,14 +188,30 @@ impl<'tcx> CodegenUnit<'tcx> {
         DepNode::WorkProduct(self.work_product_id())
     }
 
-    pub fn compute_symbol_name_hash(&self, tcx: TyCtxt, symbol_map: &SymbolMap) -> u64 {
-        let mut state = SipHasher::new();
-        let all_items = self.items_in_deterministic_order(tcx, symbol_map);
+    pub fn compute_symbol_name_hash(&self,
+                                    scx: &SharedCrateContext,
+                                    symbol_map: &SymbolMap) -> u64 {
+        let mut state = IchHasher::new();
+        let exported_symbols = scx.exported_symbols();
+        let all_items = self.items_in_deterministic_order(scx.tcx(), symbol_map);
         for (item, _) in all_items {
             let symbol_name = symbol_map.get(item).unwrap();
+            symbol_name.len().hash(&mut state);
             symbol_name.hash(&mut state);
+            let exported = match item {
+               TransItem::Fn(ref instance) => {
+                    let node_id = scx.tcx().map.as_local_node_id(instance.def);
+                    node_id.map(|node_id| exported_symbols.contains(&node_id))
+                           .unwrap_or(false)
+               }
+               TransItem::Static(node_id) => {
+                    exported_symbols.contains(&node_id)
+               }
+               TransItem::DropGlue(..) => false,
+            };
+            exported.hash(&mut state);
         }
-        state.finish()
+        state.finish().to_smaller_hash()
     }
 
     pub fn items_in_deterministic_order(&self,
@@ -266,14 +283,14 @@ pub fn partition<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
     let mut initial_partitioning = place_root_translation_items(scx,
                                                                 trans_items);
 
-    debug_dump(tcx, "INITIAL PARTITONING:", initial_partitioning.codegen_units.iter());
+    debug_dump(scx, "INITIAL PARTITONING:", initial_partitioning.codegen_units.iter());
 
     // If the partitioning should produce a fixed count of codegen units, merge
     // until that count is reached.
     if let PartitioningStrategy::FixedUnitCount(count) = strategy {
-        merge_codegen_units(&mut initial_partitioning, count, &tcx.crate_name[..]);
+        merge_codegen_units(&mut initial_partitioning, count, &tcx.crate_name.as_str());
 
-        debug_dump(tcx, "POST MERGING:", initial_partitioning.codegen_units.iter());
+        debug_dump(scx, "POST MERGING:", initial_partitioning.codegen_units.iter());
     }
 
     // In the next step, we use the inlining map to determine which addtional
@@ -283,7 +300,7 @@ pub fn partition<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
     let post_inlining = place_inlined_translation_items(initial_partitioning,
                                                         inlining_map);
 
-    debug_dump(tcx, "POST INLINING:", post_inlining.0.iter());
+    debug_dump(scx, "POST INLINING:", post_inlining.0.iter());
 
     // Finally, sort by codegen unit name, so that we get deterministic results
     let mut result = post_inlining.0;
@@ -296,7 +313,7 @@ pub fn partition<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
 
 struct PreInliningPartitioning<'tcx> {
     codegen_units: Vec<CodegenUnit<'tcx>>,
-    roots: FnvHashSet<TransItem<'tcx>>,
+    roots: FxHashSet<TransItem<'tcx>>,
 }
 
 struct PostInliningPartitioning<'tcx>(Vec<CodegenUnit<'tcx>>);
@@ -307,8 +324,8 @@ fn place_root_translation_items<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
     where I: Iterator<Item = TransItem<'tcx>>
 {
     let tcx = scx.tcx();
-    let mut roots = FnvHashSet();
-    let mut codegen_units = FnvHashMap();
+    let mut roots = FxHashSet();
+    let mut codegen_units = FxHashMap();
 
     for trans_item in trans_items {
         let is_root = !trans_item.is_instantiated_only_on_demand(tcx);
@@ -319,7 +336,7 @@ fn place_root_translation_items<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
 
             let codegen_unit_name = match characteristic_def_id {
                 Some(def_id) => compute_codegen_unit_name(tcx, def_id, is_volatile),
-                None => InternedString::new(FALLBACK_CODEGEN_UNIT),
+                None => Symbol::intern(FALLBACK_CODEGEN_UNIT).as_str(),
             };
 
             let make_codegen_unit = || {
@@ -364,7 +381,7 @@ fn place_root_translation_items<'a, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
     // always ensure we have at least one CGU; otherwise, if we have a
     // crate with just types (for example), we could wind up with no CGU
     if codegen_units.is_empty() {
-        let codegen_unit_name = InternedString::new(FALLBACK_CODEGEN_UNIT);
+        let codegen_unit_name = Symbol::intern(FALLBACK_CODEGEN_UNIT).as_str();
         codegen_units.entry(codegen_unit_name.clone())
                      .or_insert_with(|| CodegenUnit::empty(codegen_unit_name.clone()));
     }
@@ -418,7 +435,7 @@ fn place_inlined_translation_items<'tcx>(initial_partitioning: PreInliningPartit
 
     for codegen_unit in &initial_partitioning.codegen_units[..] {
         // Collect all items that need to be available in this codegen unit
-        let mut reachable = FnvHashSet();
+        let mut reachable = FxHashSet();
         for root in codegen_unit.items.keys() {
             follow_inlining(*root, inlining_map, &mut reachable);
         }
@@ -464,7 +481,7 @@ fn place_inlined_translation_items<'tcx>(initial_partitioning: PreInliningPartit
 
     fn follow_inlining<'tcx>(trans_item: TransItem<'tcx>,
                              inlining_map: &InliningMap<'tcx>,
-                             visited: &mut FnvHashSet<TransItem<'tcx>>) {
+                             visited: &mut FxHashSet<TransItem<'tcx>>) {
         if !visited.insert(trans_item) {
             return;
         }
@@ -494,7 +511,7 @@ fn characteristic_def_id_of_trans_item<'a, 'tcx>(scx: &SharedCrateContext<'a, 't
             if let Some(impl_def_id) = tcx.impl_of_method(instance.def) {
                 // This is a method within an inherent impl, find out what the
                 // self-type is:
-                let impl_self_ty = tcx.lookup_item_type(impl_def_id).ty;
+                let impl_self_ty = tcx.item_type(impl_def_id);
                 let impl_self_ty = tcx.erase_regions(&impl_self_ty);
                 let impl_self_ty = monomorphize::apply_param_substs(scx,
                                                                     instance.substs,
@@ -522,7 +539,7 @@ fn compute_codegen_unit_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mut mod_path = String::with_capacity(64);
 
     let def_path = tcx.def_path(def_id);
-    mod_path.push_str(&tcx.crate_name(def_path.krate));
+    mod_path.push_str(&tcx.crate_name(def_path.krate).as_str());
 
     for part in tcx.def_path(def_id)
                    .data
@@ -541,17 +558,14 @@ fn compute_codegen_unit_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         mod_path.push_str(".volatile");
     }
 
-    return token::intern_and_get_ident(&mod_path[..]);
+    return Symbol::intern(&mod_path[..]).as_str();
 }
 
 fn numbered_codegen_unit_name(crate_name: &str, index: usize) -> InternedString {
-    token::intern_and_get_ident(&format!("{}{}{}",
-        crate_name,
-        NUMBERED_CODEGEN_UNIT_MARKER,
-        index)[..])
+    Symbol::intern(&format!("{}{}{}", crate_name, NUMBERED_CODEGEN_UNIT_MARKER, index)).as_str()
 }
 
-fn debug_dump<'a, 'b, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+fn debug_dump<'a, 'b, 'tcx, I>(scx: &SharedCrateContext<'a, 'tcx>,
                                label: &str,
                                cgus: I)
     where I: Iterator<Item=&'b CodegenUnit<'tcx>>,
@@ -560,10 +574,21 @@ fn debug_dump<'a, 'b, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     if cfg!(debug_assertions) {
         debug!("{}", label);
         for cgu in cgus {
+            let symbol_map = SymbolMap::build(scx, cgu.items
+                                                      .iter()
+                                                      .map(|(&trans_item, _)| trans_item));
             debug!("CodegenUnit {}:", cgu.name);
 
             for (trans_item, linkage) in &cgu.items {
-                debug!(" - {} [{:?}]", trans_item.to_string(tcx), linkage);
+                let symbol_name = symbol_map.get_or_compute(scx, *trans_item);
+                let symbol_hash_start = symbol_name.rfind('h');
+                let symbol_hash = symbol_hash_start.map(|i| &symbol_name[i ..])
+                                                   .unwrap_or("<no hash>");
+
+                debug!(" - {} [{:?}] [{}]",
+                       trans_item.to_string(scx.tcx()),
+                       linkage,
+                       symbol_hash);
             }
 
             debug!("");

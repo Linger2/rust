@@ -8,23 +8,53 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! Implementation of the various `check-*` targets of the build system.
+//! Implementation of the test-related targets of the build system.
 //!
 //! This file implements the various regression test suites that we execute on
 //! our CI.
 
+use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File};
-use std::io::prelude::*;
+use std::fmt;
+use std::fs;
 use std::path::{PathBuf, Path};
 use std::process::Command;
 
 use build_helper::output;
 
 use {Build, Compiler, Mode};
+use dist;
 use util::{self, dylib_path, dylib_path_var};
 
 const ADB_TEST_DIR: &'static str = "/data/tmp";
+
+/// The two modes of the test runner; tests or benchmarks.
+#[derive(Copy, Clone)]
+pub enum TestKind {
+    /// Run `cargo test`
+    Test,
+    /// Run `cargo bench`
+    Bench,
+}
+
+impl TestKind {
+    // Return the cargo subcommand for this test kind
+    fn subcommand(self) -> &'static str {
+        match self {
+            TestKind::Test => "test",
+            TestKind::Bench => "bench",
+        }
+    }
+}
+
+impl fmt::Display for TestKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match *self {
+            TestKind::Test => "Testing",
+            TestKind::Bench => "Benchmarking",
+        })
+    }
+}
 
 /// Runs the `linkchecker` tool as compiled in `stage` by the `host` compiler.
 ///
@@ -33,6 +63,8 @@ const ADB_TEST_DIR: &'static str = "/data/tmp";
 pub fn linkcheck(build: &Build, stage: u32, host: &str) {
     println!("Linkcheck stage{} ({})", stage, host);
     let compiler = Compiler::new(stage, host);
+
+    let _time = util::timeit();
     build.run(build.tool_cmd(&compiler, "linkchecker")
                    .arg(build.out.join(host).join("doc")));
 }
@@ -58,6 +90,7 @@ pub fn cargotest(build: &Build, stage: u32, host: &str) {
     let out_dir = build.out.join("ct");
     t!(fs::create_dir_all(&out_dir));
 
+    let _time = util::timeit();
     build.run(build.tool_cmd(compiler, "cargotest")
                    .env("PATH", newpath)
                    .arg(&build.cargo)
@@ -90,7 +123,8 @@ pub fn compiletest(build: &Build,
                    target: &str,
                    mode: &str,
                    suite: &str) {
-    println!("Check compiletest {} ({} -> {})", suite, compiler.host, target);
+    println!("Check compiletest suite={} mode={} ({} -> {})",
+             suite, mode, compiler.host, target);
     let mut cmd = build.tool_cmd(compiler, "compiletest");
 
     // compiletest currently has... a lot of arguments, so let's just pass all
@@ -107,6 +141,10 @@ pub fn compiletest(build: &Build,
     cmd.arg("--target").arg(target);
     cmd.arg("--host").arg(compiler.host);
     cmd.arg("--llvm-filecheck").arg(build.llvm_filecheck(&build.config.build));
+
+    if let Some(nodejs) = build.config.nodejs.as_ref() {
+        cmd.arg("--nodejs").arg(nodejs);
+    }
 
     let mut flags = vec!["-Crpath".to_string()];
     if build.config.rust_optimize_tests {
@@ -126,9 +164,7 @@ pub fn compiletest(build: &Build,
                              build.test_helpers_out(target).display()));
     cmd.arg("--target-rustcflags").arg(targetflags.join(" "));
 
-    // FIXME: CFG_PYTHON should probably be detected more robustly elsewhere
-    let python_default = "python";
-    cmd.arg("--docck-python").arg(python_default);
+    cmd.arg("--docck-python").arg(build.python());
 
     if build.config.build.ends_with("apple-darwin") {
         // Force /usr/bin/python on OSX for LLDB tests because we're loading the
@@ -136,11 +172,11 @@ pub fn compiletest(build: &Build,
         // (namely not Homebrew-installed python)
         cmd.arg("--lldb-python").arg("/usr/bin/python");
     } else {
-        cmd.arg("--lldb-python").arg(python_default);
+        cmd.arg("--lldb-python").arg(build.python());
     }
 
-    if let Some(ref vers) = build.gdb_version {
-        cmd.arg("--gdb-version").arg(vers);
+    if let Some(ref gdb) = build.config.gdb {
+        cmd.arg("--gdb").arg(gdb);
     }
     if let Some(ref vers) = build.lldb_version {
         cmd.arg("--lldb-version").arg(vers);
@@ -152,10 +188,14 @@ pub fn compiletest(build: &Build,
     let llvm_version = output(Command::new(&llvm_config).arg("--version"));
     cmd.arg("--llvm-version").arg(llvm_version);
 
-    cmd.args(&build.flags.args);
+    cmd.args(&build.flags.cmd.test_args());
 
     if build.config.verbose || build.flags.verbose {
         cmd.arg("--verbose");
+    }
+
+    if build.config.quiet_tests {
+        cmd.arg("--quiet");
     }
 
     // Only pass correct values for these flags for the `run-make` suite as it
@@ -178,6 +218,9 @@ pub fn compiletest(build: &Build,
 
     // Running a C compiler on MSVC requires a few env vars to be set, to be
     // sure to set them here.
+    //
+    // Note that if we encounter `PATH` we make sure to append to our own `PATH`
+    // rather than stomp over it.
     if target.contains("msvc") {
         for &(ref k, ref v) in build.cc[target].0.env() {
             if k != "PATH" {
@@ -185,7 +228,8 @@ pub fn compiletest(build: &Build,
             }
         }
     }
-    build.add_bootstrap_key(compiler, &mut cmd);
+    cmd.env("RUSTC_BOOTSTRAP", "1");
+    build.add_rust_test_threads(&mut cmd);
 
     cmd.arg("--adb-path").arg("adb");
     cmd.arg("--adb-test-dir").arg(ADB_TEST_DIR);
@@ -197,6 +241,7 @@ pub fn compiletest(build: &Build,
         cmd.arg("--android-cross-path").arg("");
     }
 
+    let _time = util::timeit();
     build.run(&mut cmd);
 }
 
@@ -209,6 +254,7 @@ pub fn docs(build: &Build, compiler: &Compiler) {
     // Do a breadth-first traversal of the `src/doc` directory and just run
     // tests for all files that end in `*.md`
     let mut stack = vec![build.src.join("src/doc")];
+    let _time = util::timeit();
 
     while let Some(p) = stack.pop() {
         if p.is_dir() {
@@ -234,7 +280,11 @@ pub fn docs(build: &Build, compiler: &Compiler) {
 pub fn error_index(build: &Build, compiler: &Compiler) {
     println!("Testing error-index stage{}", compiler.stage);
 
-    let output = testdir(build, compiler.host).join("error-index.md");
+    let dir = testdir(build, compiler.host);
+    t!(fs::create_dir_all(&dir));
+    let output = dir.join("error-index.md");
+
+    let _time = util::timeit();
     build.run(build.tool_cmd(compiler, "error_index_generator")
                    .arg("markdown")
                    .arg(&output)
@@ -246,9 +296,17 @@ pub fn error_index(build: &Build, compiler: &Compiler) {
 fn markdown_test(build: &Build, compiler: &Compiler, markdown: &Path) {
     let mut cmd = Command::new(build.rustdoc(compiler));
     build.add_rustc_lib_path(compiler, &mut cmd);
+    build.add_rust_test_threads(&mut cmd);
     cmd.arg("--test");
     cmd.arg(markdown);
-    cmd.arg("--test-args").arg(build.flags.args.join(" "));
+    cmd.env("RUSTC_BOOTSTRAP", "1");
+
+    let mut test_args = build.flags.cmd.test_args().join(" ");
+    if build.config.quiet_tests {
+        test_args.push_str(" --quiet");
+    }
+    cmd.arg("--test-args").arg(test_args);
+
     build.run(&mut cmd);
 }
 
@@ -259,56 +317,59 @@ fn markdown_test(build: &Build, compiler: &Compiler, markdown: &Path) {
 /// It essentially is the driver for running `cargo test`.
 ///
 /// Currently this runs all tests for a DAG by passing a bunch of `-p foo`
-/// arguments, and those arguments are discovered from `Cargo.lock`.
+/// arguments, and those arguments are discovered from `cargo metadata`.
 pub fn krate(build: &Build,
              compiler: &Compiler,
              target: &str,
-             mode: Mode) {
-    let (name, path, features) = match mode {
-        Mode::Libstd => ("libstd", "src/rustc/std_shim", build.std_features()),
-        Mode::Libtest => ("libtest", "src/rustc/test_shim", String::new()),
-        Mode::Librustc => ("librustc", "src/rustc", build.rustc_features()),
+             mode: Mode,
+             test_kind: TestKind,
+             krate: Option<&str>) {
+    let (name, path, features, root) = match mode {
+        Mode::Libstd => {
+            ("libstd", "src/rustc/std_shim", build.std_features(), "std_shim")
+        }
+        Mode::Libtest => {
+            ("libtest", "src/rustc/test_shim", String::new(), "test_shim")
+        }
+        Mode::Librustc => {
+            ("librustc", "src/rustc", build.rustc_features(), "rustc-main")
+        }
         _ => panic!("can only test libraries"),
     };
-    println!("Testing {} stage{} ({} -> {})", name, compiler.stage,
+    println!("{} {} stage{} ({} -> {})", test_kind, name, compiler.stage,
              compiler.host, target);
 
     // Build up the base `cargo test` command.
-    let mut cargo = build.cargo(compiler, mode, target, "test");
+    //
+    // Pass in some standard flags then iterate over the graph we've discovered
+    // in `cargo metadata` with the maps above and figure out what `-p`
+    // arguments need to get passed.
+    let mut cargo = build.cargo(compiler, mode, target, test_kind.subcommand());
     cargo.arg("--manifest-path")
          .arg(build.src.join(path).join("Cargo.toml"))
          .arg("--features").arg(features);
 
-    // Generate a list of `-p` arguments to pass to the `cargo test` invocation
-    // by crawling the corresponding Cargo.lock file.
-    let lockfile = build.src.join(path).join("Cargo.lock");
-    let mut contents = String::new();
-    t!(t!(File::open(&lockfile)).read_to_string(&mut contents));
-    let mut lines = contents.lines();
-    while let Some(line) = lines.next() {
-        let prefix = "name = \"";
-        if !line.starts_with(prefix) {
-            continue
+    match krate {
+        Some(krate) => {
+            cargo.arg("-p").arg(krate);
         }
-        lines.next(); // skip `version = ...`
-
-        // skip crates.io or otherwise non-path crates
-        if let Some(line) = lines.next() {
-            if line.starts_with("source") {
-                continue
+        None => {
+            let mut visited = HashSet::new();
+            let mut next = vec![root];
+            while let Some(name) = next.pop() {
+                // Right now jemalloc is our only target-specific crate in the sense
+                // that it's not present on all platforms. Custom skip it here for now,
+                // but if we add more this probably wants to get more generalized.
+                if !name.contains("jemalloc") {
+                    cargo.arg("-p").arg(name);
+                }
+                for dep in build.crates[name].deps.iter() {
+                    if visited.insert(dep) {
+                        next.push(dep);
+                    }
+                }
             }
         }
-
-        let crate_name = &line[prefix.len()..line.len() - 1];
-
-        // Right now jemalloc is our only target-specific crate in the sense
-        // that it's not present on all platforms. Custom skip it here for now,
-        // but if we add more this probably wants to get more generalized.
-        if crate_name.contains("jemalloc") {
-            continue
-        }
-
-        cargo.arg("-p").arg(crate_name);
     }
 
     // The tests are going to run with the *target* libraries, so we need to
@@ -321,10 +382,27 @@ pub fn krate(build: &Build,
     cargo.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
     if target.contains("android") {
-        build.run(cargo.arg("--no-run"));
+        cargo.arg("--no-run");
+    } else if target.contains("emscripten") {
+        cargo.arg("--no-run");
+    }
+
+    cargo.arg("--");
+
+    if build.config.quiet_tests {
+        cargo.arg("--quiet");
+    }
+
+    let _time = util::timeit();
+
+    if target.contains("android") {
+        build.run(&mut cargo);
         krate_android(build, compiler, target, mode);
+    } else if target.contains("emscripten") {
+        build.run(&mut cargo);
+        krate_emscripten(build, compiler, target, mode);
     } else {
-        cargo.args(&build.flags.args);
+        cargo.args(&build.flags.cmd.test_args());
         build.run(&mut cargo);
     }
 }
@@ -348,15 +426,18 @@ fn krate_android(build: &Build,
                           target,
                           compiler.host,
                           test_file_name);
+        let quiet = if build.config.quiet_tests { "--quiet" } else { "" };
         let program = format!("(cd {dir}; \
                                 LD_LIBRARY_PATH=./{target} ./{test} \
                                     --logfile {log} \
+                                    {quiet} \
                                     {args})",
                               dir = ADB_TEST_DIR,
                               target = target,
                               test = test_file_name,
                               log = log,
-                              args = build.flags.args.join(" "));
+                              quiet = quiet,
+                              args = build.flags.cmd.test_args().join(" "));
 
         let output = output(Command::new("adb").arg("shell").arg(&program));
         println!("{}", output);
@@ -371,6 +452,29 @@ fn krate_android(build: &Build,
     }
 }
 
+fn krate_emscripten(build: &Build,
+                    compiler: &Compiler,
+                    target: &str,
+                    mode: Mode) {
+     let mut tests = Vec::new();
+     let out_dir = build.cargo_out(compiler, mode, target);
+     find_tests(&out_dir, target, &mut tests);
+     find_tests(&out_dir.join("deps"), target, &mut tests);
+
+     for test in tests {
+         let test_file_name = test.to_string_lossy().into_owned();
+         println!("running {}", test_file_name);
+         let nodejs = build.config.nodejs.as_ref().expect("nodejs not configured");
+         let mut cmd = Command::new(nodejs);
+         cmd.arg(&test_file_name);
+         if build.config.quiet_tests {
+             cmd.arg("--quiet");
+         }
+         build.run(&mut cmd);
+     }
+ }
+
+
 fn find_tests(dir: &Path,
               target: &str,
               dst: &mut Vec<PathBuf>) {
@@ -381,7 +485,8 @@ fn find_tests(dir: &Path,
         }
         let filename = e.file_name().into_string().unwrap();
         if (target.contains("windows") && filename.ends_with(".exe")) ||
-           (!target.contains("windows") && !filename.contains(".")) {
+           (!target.contains("windows") && !filename.contains(".")) ||
+           (target.contains("emscripten") && filename.contains(".js")){
             dst.push(e.path());
         }
     }
@@ -412,4 +517,33 @@ pub fn android_copy_libs(build: &Build,
                               .arg(&target_dir));
         }
     }
+}
+
+/// Run "distcheck", a 'make check' from a tarball
+pub fn distcheck(build: &Build) {
+    if build.config.build != "x86_64-unknown-linux-gnu" {
+        return
+    }
+    if !build.config.host.iter().any(|s| s == "x86_64-unknown-linux-gnu") {
+        return
+    }
+    if !build.config.target.iter().any(|s| s == "x86_64-unknown-linux-gnu") {
+        return
+    }
+
+    let dir = build.out.join("tmp").join("distcheck");
+    let _ = fs::remove_dir_all(&dir);
+    t!(fs::create_dir_all(&dir));
+
+    let mut cmd = Command::new("tar");
+    cmd.arg("-xzf")
+       .arg(dist::rust_src_location(build))
+       .arg("--strip-components=1")
+       .current_dir(&dir);
+    build.run(&mut cmd);
+    build.run(Command::new("./configure")
+                     .current_dir(&dir));
+    build.run(Command::new("make")
+                     .arg("check")
+                     .current_dir(&dir));
 }

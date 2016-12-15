@@ -27,13 +27,13 @@
 use rustc::dep_graph::DepNode;
 use rustc::ty::cast::CastKind;
 use rustc_const_eval::{ConstEvalErr, lookup_const_fn_by_id, compare_lit_exprs};
-use rustc_const_eval::{eval_const_expr_partial, lookup_const_by_id};
+use rustc_const_eval::{ConstFnNode, eval_const_expr_partial, lookup_const_by_id};
 use rustc_const_eval::ErrKind::{IndexOpFeatureGated, UnimplementedConstVal, MiscCatchAll, Math};
 use rustc_const_eval::ErrKind::{ErroneousReferencedConstant, MiscBinaryOp, NonConstPath};
 use rustc_const_eval::ErrKind::UnresolvedPath;
 use rustc_const_eval::EvalHint::ExprTypeChecked;
 use rustc_const_math::{ConstMathErr, Op};
-use rustc::hir::def::Def;
+use rustc::hir::def::{Def, CtorKind};
 use rustc::hir::def_id::DefId;
 use rustc::middle::expr_use_visitor as euv;
 use rustc::middle::mem_categorization as mc;
@@ -48,7 +48,7 @@ use rustc::lint::builtin::CONST_ERR;
 use rustc::hir::{self, PatKind};
 use syntax::ast;
 use syntax_pos::Span;
-use rustc::hir::intravisit::{self, FnKind, Visitor};
+use rustc::hir::intravisit::{self, FnKind, Visitor, NestedVisitorMap};
 
 use std::collections::hash_map::Entry;
 use std::cmp::Ordering;
@@ -100,7 +100,7 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
             .enter(|infcx| f(&mut euv::ExprUseVisitor::new(self, &infcx)))
     }
 
-    fn global_expr(&mut self, mode: Mode, expr: &hir::Expr) -> ConstQualif {
+    fn global_expr(&mut self, mode: Mode, expr: &'gcx hir::Expr) -> ConstQualif {
         assert!(mode != Mode::Var);
         match self.tcx.const_qualif_map.borrow_mut().entry(expr.id) {
             Entry::Occupied(entry) => return *entry.get(),
@@ -132,9 +132,9 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
     }
 
     fn fn_like(&mut self,
-               fk: FnKind,
-               fd: &hir::FnDecl,
-               b: &hir::Block,
+               fk: FnKind<'gcx>,
+               fd: &'gcx hir::FnDecl,
+               b: hir::ExprId,
                s: Span,
                fn_id: ast::NodeId)
                -> ConstQualif {
@@ -160,7 +160,8 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
         };
 
         let qualif = self.with_mode(mode, |this| {
-            this.with_euv(Some(fn_id), |euv| euv.walk_fn(fd, b));
+            let body = this.tcx.map.expr(b);
+            this.with_euv(Some(fn_id), |euv| euv.walk_fn(fd, body));
             intravisit::walk_fn(this, fk, fd, b, s, fn_id);
             this.qualif
         });
@@ -179,21 +180,39 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
 
     /// Returns true if the call is to a const fn or method.
     fn handle_const_fn_call(&mut self, _expr: &hir::Expr, def_id: DefId, ret_ty: Ty<'gcx>) -> bool {
-        if let Some(fn_like) = lookup_const_fn_by_id(self.tcx, def_id) {
-            let qualif = self.fn_like(fn_like.kind(),
-                                      fn_like.decl(),
-                                      fn_like.body(),
-                                      fn_like.span(),
-                                      fn_like.id());
-            self.add_qualif(qualif);
+        match lookup_const_fn_by_id(self.tcx, def_id) {
+            Some(ConstFnNode::Local(fn_like)) => {
+                let qualif = self.fn_like(fn_like.kind(),
+                                          fn_like.decl(),
+                                          fn_like.body(),
+                                          fn_like.span(),
+                                          fn_like.id());
 
-            if ret_ty.type_contents(self.tcx).interior_unsafe() {
-                self.add_qualif(ConstQualif::MUTABLE_MEM);
-            }
+                self.add_qualif(qualif);
 
-            true
-        } else {
-            false
+                if ret_ty.type_contents(self.tcx).interior_unsafe() {
+                    self.add_qualif(ConstQualif::MUTABLE_MEM);
+                }
+
+                true
+            },
+            Some(ConstFnNode::Inlined(ii)) => {
+                let node_id = ii.body.id;
+
+                let qualif = match self.tcx.const_qualif_map.borrow_mut().entry(node_id) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    _ => bug!("const qualif entry missing for inlined item")
+                };
+
+                self.add_qualif(qualif);
+
+                if ret_ty.type_contents(self.tcx).interior_unsafe() {
+                    self.add_qualif(ConstQualif::MUTABLE_MEM);
+                }
+
+                true
+            },
+            None => false
         }
     }
 
@@ -213,8 +232,12 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
     }
 }
 
-impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
-    fn visit_item(&mut self, i: &hir::Item) {
+impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::OnlyBodies(&self.tcx.map)
+    }
+
+    fn visit_item(&mut self, i: &'tcx hir::Item) {
         debug!("visit_item(item={})", self.tcx.map.node_to_string(i.id));
         assert_eq!(self.mode, Mode::Var);
         match i.node {
@@ -240,7 +263,7 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
         }
     }
 
-    fn visit_trait_item(&mut self, t: &'v hir::TraitItem) {
+    fn visit_trait_item(&mut self, t: &'tcx hir::TraitItem) {
         match t.node {
             hir::ConstTraitItem(_, ref default) => {
                 if let Some(ref expr) = *default {
@@ -253,7 +276,7 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
         }
     }
 
-    fn visit_impl_item(&mut self, i: &'v hir::ImplItem) {
+    fn visit_impl_item(&mut self, i: &'tcx hir::ImplItem) {
         match i.node {
             hir::ImplItemKind::Const(_, ref expr) => {
                 self.global_expr(Mode::Const, &expr);
@@ -263,15 +286,15 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
     }
 
     fn visit_fn(&mut self,
-                fk: FnKind<'v>,
-                fd: &'v hir::FnDecl,
-                b: &'v hir::Block,
+                fk: FnKind<'tcx>,
+                fd: &'tcx hir::FnDecl,
+                b: hir::ExprId,
                 s: Span,
                 fn_id: ast::NodeId) {
         self.fn_like(fk, fd, b, s, fn_id);
     }
 
-    fn visit_pat(&mut self, p: &hir::Pat) {
+    fn visit_pat(&mut self, p: &'tcx hir::Pat) {
         match p.node {
             PatKind::Lit(ref lit) => {
                 self.global_expr(Mode::Const, &lit);
@@ -296,7 +319,7 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
         }
     }
 
-    fn visit_block(&mut self, block: &hir::Block) {
+    fn visit_block(&mut self, block: &'tcx hir::Block) {
         // Check all statements in the block
         for stmt in &block.stmts {
             match stmt.node {
@@ -315,11 +338,11 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
         intravisit::walk_block(self, block);
     }
 
-    fn visit_expr(&mut self, ex: &hir::Expr) {
+    fn visit_expr(&mut self, ex: &'tcx hir::Expr) {
         let mut outer = self.qualif;
         self.qualif = ConstQualif::empty();
 
-        let node_ty = self.tcx.node_id_to_type(ex.id);
+        let node_ty = self.tcx.tables().node_id_to_type(ex.id);
         check_expr(self, ex, node_ty);
         check_adjustments(self, ex);
 
@@ -449,14 +472,14 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
     match e.node {
         hir::ExprUnary(..) |
         hir::ExprBinary(..) |
-        hir::ExprIndex(..) if v.tcx.tables.borrow().method_map.contains_key(&method_call) => {
+        hir::ExprIndex(..) if v.tcx.tables().method_map.contains_key(&method_call) => {
             v.add_qualif(ConstQualif::NOT_CONST);
         }
         hir::ExprBox(_) => {
             v.add_qualif(ConstQualif::NOT_CONST);
         }
         hir::ExprUnary(op, ref inner) => {
-            match v.tcx.node_id_to_type(inner.id).sty {
+            match v.tcx.tables().node_id_to_type(inner.id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op == hir::UnDeref);
 
@@ -466,7 +489,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprBinary(op, ref lhs, _) => {
-            match v.tcx.node_id_to_type(lhs.id).sty {
+            match v.tcx.tables().node_id_to_type(lhs.id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op.node == hir::BiEq || op.node == hir::BiNe ||
                             op.node == hir::BiLe || op.node == hir::BiLt ||
@@ -487,22 +510,15 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
                 _ => {}
             }
         }
-        hir::ExprPath(..) => {
-            match v.tcx.expect_def(e.id) {
-                Def::Variant(..) => {
-                    // Count the discriminator or function pointer.
+        hir::ExprPath(ref qpath) => {
+            let def = v.tcx.tables().qpath_def(qpath, e.id);
+            match def {
+                Def::VariantCtor(_, CtorKind::Const) => {
+                    // Size is determined by the whole enum, may be non-zero.
                     v.add_qualif(ConstQualif::NON_ZERO_SIZED);
                 }
-                Def::Struct(..) => {
-                    if let ty::TyFnDef(..) = node_ty.sty {
-                        // Count the function pointer.
-                        v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                    }
-                }
-                Def::Fn(..) | Def::Method(..) => {
-                    // Count the function pointer.
-                    v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                }
+                Def::VariantCtor(..) | Def::StructCtor(..) |
+                Def::Fn(..) | Def::Method(..) => {}
                 Def::Static(..) => {
                     match v.mode {
                         Mode::Static | Mode::StaticMut => {}
@@ -511,7 +527,8 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
                     }
                 }
                 Def::Const(did) | Def::AssociatedConst(did) => {
-                    let substs = Some(v.tcx.node_id_item_substs(e.id).substs);
+                    let substs = Some(v.tcx.tables().node_id_item_substs(e.id)
+                        .unwrap_or_else(|| v.tcx.intern_substs(&[])));
                     if let Some((expr, _)) = lookup_const_by_id(v.tcx, did, substs) {
                         let inner = v.global_expr(Mode::Const, expr);
                         v.add_qualif(inner);
@@ -538,18 +555,23 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
                 };
             }
             // The callee is an arbitrary expression, it doesn't necessarily have a definition.
-            let is_const = match v.tcx.expect_def_or_none(callee.id) {
-                Some(Def::Struct(..)) => true,
-                Some(Def::Variant(..)) => {
-                    // Count the discriminator.
+            let def = if let hir::ExprPath(ref qpath) = callee.node {
+                v.tcx.tables().qpath_def(qpath, callee.id)
+            } else {
+                Def::Err
+            };
+            let is_const = match def {
+                Def::StructCtor(_, CtorKind::Fn) |
+                Def::VariantCtor(_, CtorKind::Fn) => {
+                    // `NON_ZERO_SIZED` is about the call result, not about the ctor itself.
                     v.add_qualif(ConstQualif::NON_ZERO_SIZED);
                     true
                 }
-                Some(Def::Fn(did)) => {
+                Def::Fn(did) => {
                     v.handle_const_fn_call(e, did, node_ty)
                 }
-                Some(Def::Method(did)) => {
-                    match v.tcx.impl_or_trait_item(did).container() {
+                Def::Method(did) => {
+                    match v.tcx.associated_item(did).container {
                         ty::ImplContainer(_) => {
                             v.handle_const_fn_call(e, did, node_ty)
                         }
@@ -563,8 +585,8 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprMethodCall(..) => {
-            let method = v.tcx.tables.borrow().method_map[&method_call];
-            let is_const = match v.tcx.impl_or_trait_item(method.def_id).container() {
+            let method = v.tcx.tables().method_map[&method_call];
+            let is_const = match v.tcx.associated_item(method.def_id).container {
                 ty::ImplContainer(_) => v.handle_const_fn_call(e, method.def_id, node_ty),
                 ty::TraitContainer(_) => false
             };
@@ -573,9 +595,11 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprStruct(..) => {
-            // unsafe_cell_type doesn't necessarily exist with no_core
-            if Some(v.tcx.expect_def(e.id).def_id()) == v.tcx.lang_items.unsafe_cell_type() {
-                v.add_qualif(ConstQualif::MUTABLE_MEM);
+            if let ty::TyAdt(adt, ..) = v.tcx.tables().expr_ty(e).sty {
+                // unsafe_cell_type doesn't necessarily exist with no_core
+                if Some(adt.did) == v.tcx.lang_items.unsafe_cell_type() {
+                    v.add_qualif(ConstQualif::MUTABLE_MEM);
+                }
             }
         }
 
@@ -602,7 +626,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprIndex(..) |
         hir::ExprField(..) |
         hir::ExprTupField(..) |
-        hir::ExprVec(_) |
+        hir::ExprArray(_) |
         hir::ExprType(..) |
         hir::ExprTup(..) => {}
 
@@ -615,7 +639,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprLoop(..) |
 
         // More control flow (also not very meaningful).
-        hir::ExprBreak(_) |
+        hir::ExprBreak(..) |
         hir::ExprAgain(_) |
         hir::ExprRet(_) |
 
@@ -630,16 +654,18 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
 
 /// Check the adjustments of an expression
 fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr) {
-    match v.tcx.tables.borrow().adjustments.get(&e.id) {
-        None |
-        Some(&ty::adjustment::AdjustNeverToAny(..)) |
-        Some(&ty::adjustment::AdjustReifyFnPointer) |
-        Some(&ty::adjustment::AdjustUnsafeFnPointer) |
-        Some(&ty::adjustment::AdjustMutToConstPointer) => {}
+    use rustc::ty::adjustment::*;
 
-        Some(&ty::adjustment::AdjustDerefRef(ty::adjustment::AutoDerefRef { autoderefs, .. })) => {
+    match v.tcx.tables().adjustments.get(&e.id).map(|adj| adj.kind) {
+        None |
+        Some(Adjust::NeverToAny) |
+        Some(Adjust::ReifyFnPointer) |
+        Some(Adjust::UnsafeFnPointer) |
+        Some(Adjust::MutToConstPointer) => {}
+
+        Some(Adjust::DerefRef { autoderefs, .. }) => {
             if (0..autoderefs as u32)
-                .any(|autoderef| v.tcx.is_overloaded_autoderef(e.id, autoderef)) {
+                .any(|autoderef| v.tcx.tables().is_overloaded_autoderef(e.id, autoderef)) {
                 v.add_qualif(ConstQualif::NOT_CONST);
             }
         }
@@ -647,13 +673,13 @@ fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Exp
 }
 
 pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    tcx.visit_all_items_in_krate(DepNode::CheckConst,
-                                 &mut CheckCrateVisitor {
-                                     tcx: tcx,
-                                     mode: Mode::Var,
-                                     qualif: ConstQualif::NOT_CONST,
-                                     rvalue_borrows: NodeMap(),
-                                 });
+    tcx.visit_all_item_likes_in_krate(DepNode::CheckConst,
+                                      &mut CheckCrateVisitor {
+                                          tcx: tcx,
+                                          mode: Mode::Var,
+                                          qualif: ConstQualif::NOT_CONST,
+                                          rvalue_borrows: NodeMap(),
+                                      }.as_deep_visitor());
     tcx.sess.abort_if_errors();
 }
 

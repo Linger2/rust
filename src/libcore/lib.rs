@@ -89,7 +89,6 @@
 #![feature(specialization)]
 #![feature(staged_api)]
 #![feature(unboxed_closures)]
-#![feature(question_mark)]
 #![feature(never_type)]
 #![feature(prelude_import)]
 
@@ -99,6 +98,9 @@ use prelude::v1::*;
 
 #[macro_use]
 mod macros;
+
+#[macro_use]
+mod internal_macros;
 
 #[path = "num/float_macros.rs"]
 #[macro_use]

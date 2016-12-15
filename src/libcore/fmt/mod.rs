@@ -166,7 +166,9 @@ pub struct Formatter<'a> {
 // NB. Argument is essentially an optimized partially applied formatting function,
 // equivalent to `exists T.(&T, fn(&T, &mut Formatter) -> Result`.
 
-enum Void {}
+struct Void {
+    _priv: (),
+}
 
 /// This struct represents the generic "argument" which is taken by the Xprintf
 /// family of functions. It contains a function to format the given value. At
@@ -794,7 +796,7 @@ pub trait UpperExp {
 /// assert_eq!(output, "Hello world!");
 /// ```
 ///
-/// Please note that using [`write!`][write_macro] might be preferrable. Example:
+/// Please note that using [`write!`] might be preferrable. Example:
 ///
 /// ```
 /// use std::fmt::Write;
@@ -805,7 +807,7 @@ pub trait UpperExp {
 /// assert_eq!(output, "Hello world!");
 /// ```
 ///
-/// [write_macro]: ../../std/macro.write!.html
+/// [`write!`]: ../../std/macro.write.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn write(output: &mut Write, args: Arguments) -> Result {
     let mut formatter = Formatter {
@@ -1356,14 +1358,14 @@ macro_rules! fmt_refs {
 
 fmt_refs! { Debug, Display, Octal, Binary, LowerHex, UpperHex, LowerExp, UpperExp }
 
-#[unstable(feature = "never_type", issue = "35121")]
+#[unstable(feature = "never_type_impls", issue = "35121")]
 impl Debug for ! {
     fn fmt(&self, _: &mut Formatter) -> Result {
         *self
     }
 }
 
-#[unstable(feature = "never_type", issue = "35121")]
+#[unstable(feature = "never_type_impls", issue = "35121")]
 impl Display for ! {
     fn fmt(&self, _: &mut Formatter) -> Result {
         *self
@@ -1566,11 +1568,11 @@ floating! { f64 }
 // Implementation of Display/Debug for various core types
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Debug for *const T {
+impl<T: ?Sized> Debug for *const T {
     fn fmt(&self, f: &mut Formatter) -> Result { Pointer::fmt(self, f) }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Debug for *mut T {
+impl<T: ?Sized> Debug for *mut T {
     fn fmt(&self, f: &mut Formatter) -> Result { Pointer::fmt(self, f) }
 }
 

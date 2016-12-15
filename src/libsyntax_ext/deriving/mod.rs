@@ -11,12 +11,13 @@
 //! The compiler code necessary to implement the `#[derive]` extensions.
 
 use syntax::ast::{self, MetaItem};
-use syntax::ext::base::{Annotatable, ExtCtxt};
-use syntax::ext::build::AstBuilder;
-use syntax::feature_gate;
+use syntax::attr::HasAttrs;
 use syntax::codemap;
-use syntax::parse::token::{intern, intern_and_get_ident};
+use syntax::ext::base::{Annotatable, ExtCtxt, SyntaxExtension};
+use syntax::ext::build::AstBuilder;
+use syntax::feature_gate::{self, emit_feature_err};
 use syntax::ptr::P;
+use syntax::symbol::Symbol;
 use syntax_pos::Span;
 
 macro_rules! pathvec {
@@ -27,7 +28,7 @@ macro_rules! pathvec {
 
 macro_rules! path {
     ($($x:tt)*) => (
-        ::ext::deriving::generic::ty::Path::new( pathvec!( $($x)* ) )
+        ::ext::deriving::generic::ty::Path::new( pathvec![ $($x)* ] )
     )
 }
 
@@ -39,7 +40,7 @@ macro_rules! path_local {
 
 macro_rules! pathvec_std {
     ($cx:expr, $first:ident :: $($rest:ident)::+) => ({
-        let mut v = pathvec!($($rest)::+);
+        let mut v = pathvec![$($rest)::+];
         if let Some(s) = $cx.crate_root {
             v.insert(0, s);
         }
@@ -79,7 +80,7 @@ fn allow_unstable(cx: &mut ExtCtxt, span: Span, attr_name: &str) -> Span {
         expn_id: cx.codemap().record_expansion(codemap::ExpnInfo {
             call_site: span,
             callee: codemap::NameAndSpan {
-                format: codemap::MacroAttribute(intern(attr_name)),
+                format: codemap::MacroAttribute(Symbol::intern(attr_name)),
                 span: Some(span),
                 allow_internal_unstable: true,
             },
@@ -104,13 +105,38 @@ pub fn expand_derive(cx: &mut ExtCtxt,
         }
     };
 
-    if mitem.value_str().is_some() {
-        cx.span_err(mitem.span, "unexpected value in `derive`");
+    let derive = Symbol::intern("derive");
+    let mut derive_attrs = Vec::new();
+    item = item.map_attrs(|attrs| {
+        let partition = attrs.into_iter().partition(|attr| attr.name() == derive);
+        derive_attrs = partition.0;
+        partition.1
+    });
+
+    // Expand `#[derive]`s after other attribute macro invocations.
+    if cx.resolver.find_attr_invoc(&mut item.attrs.clone()).is_some() {
+        return vec![Annotatable::Item(item.map_attrs(|mut attrs| {
+            attrs.push(cx.attribute(span, mitem.clone()));
+            attrs.extend(derive_attrs);
+            attrs
+        }))];
     }
 
-    let mut traits = mitem.meta_item_list().unwrap_or(&[]).to_owned();
-    if traits.is_empty() {
-        cx.span_warn(mitem.span, "empty trait list in `derive`");
+    let get_traits = |mitem: &MetaItem, cx: &ExtCtxt| {
+        if mitem.value_str().is_some() {
+            cx.span_err(mitem.span, "unexpected value in `derive`");
+        }
+
+        let traits = mitem.meta_item_list().unwrap_or(&[]).to_owned();
+        if traits.is_empty() {
+            cx.span_warn(mitem.span, "empty trait list in `derive`");
+        }
+        traits
+    };
+
+    let mut traits = get_traits(mitem, cx);
+    for derive_attr in derive_attrs {
+        traits.extend(get_traits(&derive_attr.value, cx));
     }
 
     // First, weed out malformed #[derive]
@@ -133,10 +159,13 @@ pub fn expand_derive(cx: &mut ExtCtxt,
         let tword = titem.word().unwrap();
         let tname = tword.name();
 
-        let derive_mode = ast::Ident::with_empty_ctxt(intern(&tname));
-        let derive_mode = cx.resolver.resolve_derive_mode(derive_mode);
-        if is_builtin_trait(&tname) || derive_mode.is_some() {
-            return true
+        if is_builtin_trait(tname) || {
+            let derive_mode = ast::Path::from_ident(titem.span, ast::Ident::with_empty_ctxt(tname));
+            cx.resolver.resolve_macro(cx.current_expansion.mark, &derive_mode, false).map(|ext| {
+                if let SyntaxExtension::CustomDerive(_) = *ext { true } else { false }
+            }).unwrap_or(false)
+        } {
+            return true;
         }
 
         if !cx.ecfg.enable_custom_derive() {
@@ -146,7 +175,8 @@ pub fn expand_derive(cx: &mut ExtCtxt,
                                            feature_gate::GateIssue::Language,
                                            feature_gate::EXPLAIN_CUSTOM_DERIVE);
         } else {
-            let name = intern_and_get_ident(&format!("derive_{}", tname));
+            cx.span_warn(titem.span, feature_gate::EXPLAIN_DEPR_CUSTOM_DERIVE);
+            let name = Symbol::intern(&format!("derive_{}", tname));
             let mitem = cx.meta_word(titem.span, name);
             new_attributes.push(cx.attribute(mitem.span, mitem));
         }
@@ -154,11 +184,11 @@ pub fn expand_derive(cx: &mut ExtCtxt,
     });
     if new_attributes.len() > 0 {
         item = item.map(|mut i| {
-            let list = cx.meta_list(mitem.span,
-                                    intern_and_get_ident("derive"),
-                                    traits);
             i.attrs.extend(new_attributes);
-            i.attrs.push(cx.attribute(mitem.span, list));
+            if traits.len() > 0 {
+                let list = cx.meta_list(mitem.span, derive, traits);
+                i.attrs.push(cx.attribute(mitem.span, list));
+            }
             i
         });
         return vec![Annotatable::Item(item)]
@@ -185,27 +215,35 @@ pub fn expand_derive(cx: &mut ExtCtxt,
     let macros_11_derive = traits.iter()
                                  .cloned()
                                  .enumerate()
-                                 .filter(|&(_, ref name)| !is_builtin_trait(&name.name().unwrap()))
+                                 .filter(|&(_, ref name)| !is_builtin_trait(name.name().unwrap()))
                                  .next();
     if let Some((i, titem)) = macros_11_derive {
-        let tname = ast::Ident::with_empty_ctxt(intern(&titem.name().unwrap()));
-        let ext = cx.resolver.resolve_derive_mode(tname).unwrap();
+        if !cx.ecfg.features.unwrap().proc_macro {
+            let issue = feature_gate::GateIssue::Language;
+            let msg = "custom derive macros are experimentally supported";
+            emit_feature_err(cx.parse_sess, "proc_macro", titem.span, issue, msg);
+        }
+
+        let tname = ast::Ident::with_empty_ctxt(titem.name().unwrap());
+        let path = ast::Path::from_ident(titem.span, tname);
+        let ext = cx.resolver.resolve_macro(cx.current_expansion.mark, &path, false).unwrap();
+
         traits.remove(i);
         if traits.len() > 0 {
             item = item.map(|mut i| {
-                let list = cx.meta_list(mitem.span,
-                                        intern_and_get_ident("derive"),
-                                        traits);
+                let list = cx.meta_list(mitem.span, derive, traits);
                 i.attrs.push(cx.attribute(mitem.span, list));
                 i
             });
         }
         let titem = cx.meta_list_item_word(titem.span, titem.name().unwrap());
-        let mitem = cx.meta_list(titem.span,
-                                 intern_and_get_ident("derive"),
-                                 vec![titem]);
+        let mitem = cx.meta_list(titem.span, derive, vec![titem]);
         let item = Annotatable::Item(item);
-        return ext.expand(cx, mitem.span, &mitem, item)
+        if let SyntaxExtension::CustomDerive(ref ext) = *ext {
+            return ext.expand(cx, mitem.span, &mitem, item);
+        } else {
+            unreachable!()
+        }
     }
 
     // Ok, at this point we know that there are no old-style `#[derive_Foo]` nor
@@ -213,9 +251,10 @@ pub fn expand_derive(cx: &mut ExtCtxt,
 
     // RFC #1445. `#[derive(PartialEq, Eq)]` adds a (trusted)
     // `#[structural_match]` attribute.
-    if traits.iter().filter_map(|t| t.name()).any(|t| t == "PartialEq") &&
-       traits.iter().filter_map(|t| t.name()).any(|t| t == "Eq") {
-        let structural_match = intern_and_get_ident("structural_match");
+    let (partial_eq, eq) = (Symbol::intern("PartialEq"), Symbol::intern("Eq"));
+    if traits.iter().any(|t| t.name() == Some(partial_eq)) &&
+       traits.iter().any(|t| t.name() == Some(eq)) {
+        let structural_match = Symbol::intern("structural_match");
         let span = allow_unstable(cx, span, "derive(PartialEq, Eq)");
         let meta = cx.meta_word(span, structural_match);
         item = item.map(|mut i| {
@@ -228,9 +267,10 @@ pub fn expand_derive(cx: &mut ExtCtxt,
     // the same as the copy implementation.
     //
     // Add a marker attribute here picked up during #[derive(Clone)]
-    if traits.iter().filter_map(|t| t.name()).any(|t| t == "Clone") &&
-       traits.iter().filter_map(|t| t.name()).any(|t| t == "Copy") {
-        let marker = intern_and_get_ident("rustc_copy_clone_marker");
+    let (copy, clone) = (Symbol::intern("Copy"), Symbol::intern("Clone"));
+    if traits.iter().any(|t| t.name() == Some(clone)) &&
+       traits.iter().any(|t| t.name() == Some(copy)) {
+        let marker = Symbol::intern("rustc_copy_clone_marker");
         let span = allow_unstable(cx, span, "derive(Copy, Clone)");
         let meta = cx.meta_word(span, marker);
         item = item.map(|mut i| {
@@ -242,14 +282,14 @@ pub fn expand_derive(cx: &mut ExtCtxt,
     let mut items = Vec::new();
     for titem in traits.iter() {
         let tname = titem.word().unwrap().name();
-        let name = intern_and_get_ident(&format!("derive({})", tname));
+        let name = Symbol::intern(&format!("derive({})", tname));
         let mitem = cx.meta_word(titem.span, name);
 
         let span = Span {
             expn_id: cx.codemap().record_expansion(codemap::ExpnInfo {
                 call_site: titem.span,
                 callee: codemap::NameAndSpan {
-                    format: codemap::MacroAttribute(intern(&format!("derive({})", tname))),
+                    format: codemap::MacroAttribute(Symbol::intern(&format!("derive({})", tname))),
                     span: Some(titem.span),
                     allow_internal_unstable: true,
                 },
@@ -258,7 +298,7 @@ pub fn expand_derive(cx: &mut ExtCtxt,
         };
 
         let my_item = Annotatable::Item(item);
-        expand_builtin(&tname, cx, span, &mitem, &my_item, &mut |a| {
+        expand_builtin(&tname.as_str(), cx, span, &mitem, &my_item, &mut |a| {
             items.push(a);
         });
         item = my_item.expect_item();
@@ -270,8 +310,8 @@ pub fn expand_derive(cx: &mut ExtCtxt,
 
 macro_rules! derive_traits {
     ($( $name:expr => $func:path, )+) => {
-        pub fn is_builtin_trait(name: &str) -> bool {
-            match name {
+        pub fn is_builtin_trait(name: ast::Name) -> bool {
+            match &*name.as_str() {
                 $( $name )|+ => true,
                 _ => false,
             }
@@ -368,7 +408,7 @@ fn call_intrinsic(cx: &ExtCtxt,
     span.expn_id = cx.codemap().record_expansion(codemap::ExpnInfo {
         call_site: span,
         callee: codemap::NameAndSpan {
-            format: codemap::MacroAttribute(intern("derive")),
+            format: codemap::MacroAttribute(Symbol::intern("derive")),
             span: Some(span),
             allow_internal_unstable: true,
         },

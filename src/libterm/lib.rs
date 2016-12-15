@@ -59,7 +59,6 @@
 #![cfg_attr(windows, feature(libc))]
 // Handle rustfmt skips
 #![feature(custom_attribute)]
-#![feature(question_mark)]
 #![allow(unused_attributes)]
 
 use std::io::prelude::*;

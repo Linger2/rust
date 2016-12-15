@@ -16,7 +16,7 @@ use rustc::ty::Visibility;
 
 use std::cell::RefMut;
 
-use clean::{Attributes, Clean};
+use clean::{AttributesExt, NestedAttributesExt};
 
 // FIXME: this may not be exhaustive, but is sufficient for rustdocs current uses
 
@@ -49,10 +49,7 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
 
     // Updates node level and returns the updated level
     fn update(&mut self, did: DefId, level: Option<AccessLevel>) -> Option<AccessLevel> {
-        let attrs: Vec<_> = self.cx.tcx().get_attrs(did).iter()
-                                                        .map(|a| a.clean(self.cx))
-                                                        .collect();
-        let is_hidden = attrs.list("doc").has_word("hidden");
+        let is_hidden = self.cx.tcx.get_attrs(did).lists("doc").has_word("hidden");
 
         let old_level = self.access_levels.map.get(&did).cloned();
         // Accessibility levels can only grow
@@ -66,11 +63,12 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
 
     pub fn visit_mod(&mut self, def_id: DefId) {
         for item in self.cstore.item_children(def_id) {
-            self.visit_item(item.def_id);
+            self.visit_item(item.def);
         }
     }
 
-    fn visit_item(&mut self, def_id: DefId) {
+    fn visit_item(&mut self, def: Def) {
+        let def_id = def.def_id();
         let vis = self.cstore.visibility(def_id);
         let inherited_item_level = if vis == Visibility::Public {
             self.prev_level
@@ -80,7 +78,7 @@ impl<'a, 'b, 'tcx> LibEmbargoVisitor<'a, 'b, 'tcx> {
 
         let item_level = self.update(def_id, inherited_item_level);
 
-        if let Some(Def::Mod(_)) = self.cstore.describe_def(def_id) {
+        if let Def::Mod(..) = def {
             let orig_level = self.prev_level;
 
             self.prev_level = item_level;

@@ -23,11 +23,10 @@ use std::io::Write;
 use std::path::{PathBuf, Path};
 use std::process::Command;
 
-use {Build, Compiler};
+use {Build, Compiler, Mode};
 use util::{cp_r, libdir, is_dylib, cp_filtered, copy};
-use regex::{RegexSet, quote};
 
-fn package_vers(build: &Build) -> &str {
+pub fn package_vers(build: &Build) -> &str {
     match &build.config.channel[..] {
         "stable" => &build.release,
         "beta" => "beta",
@@ -40,7 +39,7 @@ fn distdir(build: &Build) -> PathBuf {
     build.out.join("dist")
 }
 
-fn tmpdir(build: &Build) -> PathBuf {
+pub fn tmpdir(build: &Build) -> PathBuf {
     build.out.join("tmp/dist")
 }
 
@@ -49,6 +48,11 @@ fn tmpdir(build: &Build) -> PathBuf {
 /// Slurps up documentation from the `stage`'s `host`.
 pub fn docs(build: &Build, stage: u32, host: &str) {
     println!("Dist docs stage{} ({})", stage, host);
+    if !build.config.docs {
+        println!("\tskipping - docs disabled");
+        return
+    }
+
     let name = format!("rust-docs-{}", package_vers(build));
     let image = tmpdir(build).join(format!("{}-{}-image", name, name));
     let _ = fs::remove_dir_all(&image);
@@ -100,7 +104,7 @@ pub fn mingw(build: &Build, host: &str) {
     // (which is what we want).
     //
     // FIXME: this script should be rewritten into Rust
-    let mut cmd = Command::new("python");
+    let mut cmd = Command::new(build.python());
     cmd.arg(build.src.join("src/etc/make-win-dist.py"))
        .arg(tmpdir(build))
        .arg(&image)
@@ -160,7 +164,7 @@ pub fn rustc(build: &Build, stage: u32, host: &str) {
     //
     // FIXME: this script should be rewritten into Rust
     if host.contains("pc-windows-gnu") {
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(build.python());
         cmd.arg(build.src.join("src/etc/make-win-dist.py"))
            .arg(&image)
            .arg(tmpdir(build))
@@ -261,6 +265,14 @@ pub fn debugger_scripts(build: &Build,
 pub fn std(build: &Build, compiler: &Compiler, target: &str) {
     println!("Dist std stage{} ({} -> {})", compiler.stage, compiler.host,
              target);
+
+    // The only true set of target libraries came from the build triple, so
+    // let's reduce redundant work by only producing archives from that host.
+    if compiler.host != build.config.build {
+        println!("\tskipping, not a build host");
+        return
+    }
+
     let name = format!("rust-std-{}", package_vers(build));
     let image = tmpdir(build).join(format!("{}-{}-image", name, target));
     let _ = fs::remove_dir_all(&image);
@@ -280,6 +292,53 @@ pub fn std(build: &Build, compiler: &Compiler, target: &str) {
        .arg(format!("--output-dir={}", sanitize_sh(&distdir(build))))
        .arg(format!("--package-name={}-{}", name, target))
        .arg(format!("--component-name=rust-std-{}", target))
+       .arg("--legacy-manifest-dirs=rustlib,cargo");
+    build.run(&mut cmd);
+    t!(fs::remove_dir_all(&image));
+}
+
+pub fn rust_src_location(build: &Build) -> PathBuf {
+    let plain_name = format!("rustc-{}-src", package_vers(build));
+    distdir(build).join(&format!("{}.tar.gz", plain_name))
+}
+
+/// Creates a tarball of save-analysis metadata, if available.
+pub fn analysis(build: &Build, compiler: &Compiler, target: &str) {
+    println!("Dist analysis");
+
+    if build.config.channel != "nightly" {
+        println!("\tskipping - not on nightly channel");
+        return;
+    }
+    if compiler.host != build.config.build {
+        println!("\tskipping - not a build host");
+        return
+    }
+    if compiler.stage != 2 {
+        println!("\tskipping - not stage2");
+        return
+    }
+
+    let name = format!("rust-analysis-{}", package_vers(build));
+    let image = tmpdir(build).join(format!("{}-{}-image", name, target));
+
+    let src = build.stage_out(compiler, Mode::Libstd).join(target).join("release").join("deps");
+
+    let image_src = src.join("save-analysis");
+    let dst = image.join("lib/rustlib").join(target).join("analysis");
+    t!(fs::create_dir_all(&dst));
+    cp_r(&image_src, &dst);
+
+    let mut cmd = Command::new("sh");
+    cmd.arg(sanitize_sh(&build.src.join("src/rust-installer/gen-installer.sh")))
+       .arg("--product-name=Rust")
+       .arg("--rel-manifest-dir=rustlib")
+       .arg("--success-message=save-analysis-saved.")
+       .arg(format!("--image-dir={}", sanitize_sh(&image)))
+       .arg(format!("--work-dir={}", sanitize_sh(&tmpdir(build))))
+       .arg(format!("--output-dir={}", sanitize_sh(&distdir(build))))
+       .arg(format!("--package-name={}-{}", name, target))
+       .arg(format!("--component-name=rust-analysis-{}", target))
        .arg("--legacy-manifest-dirs=rustlib,cargo");
     build.run(&mut cmd);
     t!(fs::remove_dir_all(&image));
@@ -315,49 +374,31 @@ pub fn rust_src(build: &Build) {
         "mk"
     ];
 
-    // Exclude paths matching these wildcard expressions
-    let excludes = [
-        // exclude-vcs
-        "CVS", "RCS", "SCCS", ".git", ".gitignore", ".gitmodules", ".gitattributes", ".cvsignore",
-        ".svn", ".arch-ids", "{arch}", "=RELEASE-ID", "=meta-update", "=update", ".bzr",
-        ".bzrignore", ".bzrtags", ".hg", ".hgignore", ".hgrags", "_darcs",
-        // extensions
-        "*~", "*.pyc",
-        // misc
-        "llvm/test/*/*.ll",
-        "llvm/test/*/*.td",
-        "llvm/test/*/*.s",
-        "llvm/test/*/*/*.ll",
-        "llvm/test/*/*/*.td",
-        "llvm/test/*/*/*.s"
-    ];
-
-    // Construct a set of regexes for efficiently testing whether paths match one of the above
-    // expressions.
-    let regex_set = t!(RegexSet::new(
-        // This converts a wildcard expression to a regex
-        excludes.iter().map(|&s| {
-            // Prefix ensures that matching starts on a path separator boundary
-            r"^(.*[\\/])?".to_owned() + (
-                // Escape the expression to produce a regex matching exactly that string
-                &quote(s)
-                // Replace slashes with a pattern matching either forward or backslash
-                .replace(r"/", r"[\\/]")
-                // Replace wildcards with a pattern matching a single path segment, ie. containing
-                // no slashes.
-                .replace(r"\*", r"[^\\/]*")
-            // Suffix anchors to the end of the path
-            ) + "$"
-        })
-    ));
-
-    // Create a filter which skips files which match the regex set or contain invalid unicode
     let filter_fn = move |path: &Path| {
-        if let Some(path) = path.to_str() {
-            !regex_set.is_match(path)
-        } else {
-            false
+        let spath = match path.to_str() {
+            Some(path) => path,
+            None => return false,
+        };
+        if spath.ends_with("~") || spath.ends_with(".pyc") {
+            return false
         }
+        if spath.contains("llvm/test") || spath.contains("llvm\\test") {
+            if spath.ends_with(".ll") ||
+               spath.ends_with(".td") ||
+               spath.ends_with(".s") {
+                return false
+            }
+        }
+
+        let excludes = [
+            "CVS", "RCS", "SCCS", ".git", ".gitignore", ".gitmodules",
+            ".gitattributes", ".cvsignore", ".svn", ".arch-ids", "{arch}",
+            "=RELEASE-ID", "=meta-update", "=update", ".bzr", ".bzrignore",
+            ".bzrtags", ".hg", ".hgignore", ".hgrags", "_darcs",
+        ];
+        !path.iter()
+             .map(|s| s.to_str().unwrap())
+             .any(|s| excludes.contains(&s))
     };
 
     // Copy the directories using our filter
@@ -393,7 +434,7 @@ pub fn rust_src(build: &Build) {
 
     // Create plain source tarball
     let mut cmd = Command::new("tar");
-    cmd.arg("-czf").arg(sanitize_sh(&distdir(build).join(&format!("{}.tar.gz", plain_name))))
+    cmd.arg("-czf").arg(sanitize_sh(&rust_src_location(build)))
        .arg(&plain_name)
        .current_dir(&dst);
     build.run(&mut cmd);
@@ -418,7 +459,7 @@ fn chmod(_path: &Path, _perms: u32) {}
 
 // We have to run a few shell scripts, which choke quite a bit on both `\`
 // characters and on `C:\` paths, so normalize both of them away.
-fn sanitize_sh(path: &Path) -> String {
+pub fn sanitize_sh(path: &Path) -> String {
     let path = path.to_str().unwrap().replace("\\", "/");
     return change_drive(&path).unwrap_or(path);
 

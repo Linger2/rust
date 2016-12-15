@@ -77,6 +77,13 @@ unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 
 /// RAII structure used to release the shared read access of a lock when
 /// dropped.
+///
+/// This structure is created by the [`read()`] and [`try_read()`] methods on
+/// [`RwLock`].
+///
+/// [`read()`]: struct.RwLock.html#method.read
+/// [`try_read()`]: struct.RwLock.html#method.try_read
+/// [`RwLock`]: struct.RwLock.html
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
@@ -88,6 +95,13 @@ impl<'a, T: ?Sized> !marker::Send for RwLockReadGuard<'a, T> {}
 
 /// RAII structure used to release the exclusive write access of a lock when
 /// dropped.
+///
+/// This structure is created by the [`write()`] and [`try_write()`] methods
+/// on [`RwLock`].
+///
+/// [`write()`]: struct.RwLock.html#method.write
+/// [`try_write()`]: struct.RwLock.html#method.try_write
+/// [`RwLock`]: struct.RwLock.html
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
@@ -136,6 +150,10 @@ impl<T: ?Sized> RwLock<T> {
     /// This function will return an error if the RwLock is poisoned. An RwLock
     /// is poisoned whenever a writer panics while holding an exclusive lock.
     /// The failure will occur immediately after the lock has been acquired.
+    ///
+    /// # Panics
+    ///
+    /// This function might panic when called if the lock is already held by the current thread.
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn read(&self) -> LockResult<RwLockReadGuard<T>> {
@@ -188,6 +206,10 @@ impl<T: ?Sized> RwLock<T> {
     /// This function will return an error if the RwLock is poisoned. An RwLock
     /// is poisoned whenever a writer panics while holding an exclusive lock.
     /// An error will be returned when the lock is acquired.
+    ///
+    /// # Panics
+    ///
+    /// This function might panic when called if the lock is already held by the current thread.
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn write(&self) -> LockResult<RwLockWriteGuard<T>> {
@@ -380,7 +402,7 @@ impl<'a, T: ?Sized> Drop for RwLockWriteGuard<'a, T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "emscripten")))]
 mod tests {
     #![allow(deprecated)] // rand
 

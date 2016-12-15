@@ -14,7 +14,7 @@ use dep_graph::{DepGraph, DepTrackingMap};
 use session::Session;
 use middle;
 use hir::TraitMap;
-use hir::def::DefMap;
+use hir::def::Def;
 use hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE};
 use hir::map as ast_map;
 use hir::map::{DefKey, DefPathData, DisambiguatedDefPathData};
@@ -22,31 +22,35 @@ use middle::free_region::FreeRegionMap;
 use middle::region::RegionMaps;
 use middle::resolve_lifetime;
 use middle::stability;
-use ty::subst::Substs;
+use mir::Mir;
+use ty::subst::{Kind, Substs};
 use traits;
 use ty::{self, TraitRef, Ty, TypeAndMut};
 use ty::{TyS, TypeVariants, Slice};
 use ty::{AdtKind, AdtDef, ClosureSubsts, Region};
 use hir::FreevarMap;
-use ty::{BareFnTy, InferTy, ParamTy, ProjectionTy, TraitObject};
+use ty::{BareFnTy, InferTy, ParamTy, ProjectionTy, ExistentialPredicate};
 use ty::{TyVar, TyVid, IntVar, IntVid, FloatVar, FloatVid};
 use ty::TypeVariants::*;
 use ty::layout::{Layout, TargetDataLayout};
 use ty::maps;
 use util::common::MemoizationMap;
 use util::nodemap::{NodeMap, NodeSet, DefIdMap, DefIdSet};
-use util::nodemap::{FnvHashMap, FnvHashSet};
+use util::nodemap::{FxHashMap, FxHashSet};
+use rustc_data_structures::accumulate_vec::AccumulateVec;
 
 use arena::TypedArena;
 use std::borrow::Borrow;
-use std::cell::{Cell, RefCell, Ref};
+use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::iter;
+use std::cmp::Ordering;
 use syntax::ast::{self, Name, NodeId};
 use syntax::attr;
-use syntax::parse::token::{self, keywords};
+use syntax::symbol::{Symbol, keywords};
 
 use hir;
 
@@ -54,17 +58,19 @@ use hir;
 pub struct CtxtArenas<'tcx> {
     // internings
     type_: TypedArena<TyS<'tcx>>,
-    type_list: TypedArena<Vec<Ty<'tcx>>>,
-    substs: TypedArena<Substs<'tcx>>,
+    type_list: TypedArena<Ty<'tcx>>,
+    substs: TypedArena<Kind<'tcx>>,
     bare_fn: TypedArena<BareFnTy<'tcx>>,
     region: TypedArena<Region>,
     stability: TypedArena<attr::Stability>,
     layout: TypedArena<Layout>,
+    existential_predicates: TypedArena<ExistentialPredicate<'tcx>>,
 
     // references
     generics: TypedArena<ty::Generics<'tcx>>,
-    trait_defs: TypedArena<ty::TraitDef<'tcx>>,
-    adt_defs: TypedArena<ty::AdtDefData<'tcx, 'tcx>>,
+    trait_def: TypedArena<ty::TraitDef>,
+    adt_def: TypedArena<ty::AdtDef>,
+    mir: TypedArena<RefCell<Mir<'tcx>>>,
 }
 
 impl<'tcx> CtxtArenas<'tcx> {
@@ -77,10 +83,12 @@ impl<'tcx> CtxtArenas<'tcx> {
             region: TypedArena::new(),
             stability: TypedArena::new(),
             layout: TypedArena::new(),
+            existential_predicates: TypedArena::new(),
 
             generics: TypedArena::new(),
-            trait_defs: TypedArena::new(),
-            adt_defs: TypedArena::new()
+            trait_def: TypedArena::new(),
+            adt_def: TypedArena::new(),
+            mir: TypedArena::new()
         }
     }
 }
@@ -91,26 +99,28 @@ pub struct CtxtInterners<'tcx> {
 
     /// Specifically use a speedy hash algorithm for these hash sets,
     /// they're accessed quite often.
-    type_: RefCell<FnvHashSet<Interned<'tcx, TyS<'tcx>>>>,
-    type_list: RefCell<FnvHashSet<Interned<'tcx, Slice<Ty<'tcx>>>>>,
-    substs: RefCell<FnvHashSet<Interned<'tcx, Substs<'tcx>>>>,
-    bare_fn: RefCell<FnvHashSet<Interned<'tcx, BareFnTy<'tcx>>>>,
-    region: RefCell<FnvHashSet<Interned<'tcx, Region>>>,
-    stability: RefCell<FnvHashSet<&'tcx attr::Stability>>,
-    layout: RefCell<FnvHashSet<&'tcx Layout>>,
+    type_: RefCell<FxHashSet<Interned<'tcx, TyS<'tcx>>>>,
+    type_list: RefCell<FxHashSet<Interned<'tcx, Slice<Ty<'tcx>>>>>,
+    substs: RefCell<FxHashSet<Interned<'tcx, Substs<'tcx>>>>,
+    bare_fn: RefCell<FxHashSet<Interned<'tcx, BareFnTy<'tcx>>>>,
+    region: RefCell<FxHashSet<Interned<'tcx, Region>>>,
+    stability: RefCell<FxHashSet<&'tcx attr::Stability>>,
+    layout: RefCell<FxHashSet<&'tcx Layout>>,
+    existential_predicates: RefCell<FxHashSet<Interned<'tcx, Slice<ExistentialPredicate<'tcx>>>>>,
 }
 
 impl<'gcx: 'tcx, 'tcx> CtxtInterners<'tcx> {
     fn new(arenas: &'tcx CtxtArenas<'tcx>) -> CtxtInterners<'tcx> {
         CtxtInterners {
             arenas: arenas,
-            type_: RefCell::new(FnvHashSet()),
-            type_list: RefCell::new(FnvHashSet()),
-            substs: RefCell::new(FnvHashSet()),
-            bare_fn: RefCell::new(FnvHashSet()),
-            region: RefCell::new(FnvHashSet()),
-            stability: RefCell::new(FnvHashSet()),
-            layout: RefCell::new(FnvHashSet())
+            type_: RefCell::new(FxHashSet()),
+            type_list: RefCell::new(FxHashSet()),
+            substs: RefCell::new(FxHashSet()),
+            bare_fn: RefCell::new(FxHashSet()),
+            region: RefCell::new(FxHashSet()),
+            stability: RefCell::new(FxHashSet()),
+            layout: RefCell::new(FxHashSet()),
+            existential_predicates: RefCell::new(FxHashSet()),
         }
     }
 
@@ -196,6 +206,9 @@ pub struct CommonTypes<'tcx> {
 }
 
 pub struct Tables<'tcx> {
+    /// Resolved definitions for `<T>::X` associated paths.
+    pub type_relative_path_defs: NodeMap<Def>,
+
     /// Stores the types for various nodes in the AST.  Note that this table
     /// is not guaranteed to be populated until after typeck.  See
     /// typeck::check::fn_ctxt for details.
@@ -207,7 +220,7 @@ pub struct Tables<'tcx> {
     /// other items.
     pub item_substs: NodeMap<ty::ItemSubsts<'tcx>>,
 
-    pub adjustments: NodeMap<ty::adjustment::AutoAdjustment<'tcx>>,
+    pub adjustments: NodeMap<ty::adjustment::Adjustment<'tcx>>,
 
     pub method_map: ty::MethodMap<'tcx>,
 
@@ -239,16 +252,97 @@ pub struct Tables<'tcx> {
 impl<'a, 'gcx, 'tcx> Tables<'tcx> {
     pub fn empty() -> Tables<'tcx> {
         Tables {
-            node_types: FnvHashMap(),
+            type_relative_path_defs: NodeMap(),
+            node_types: FxHashMap(),
             item_substs: NodeMap(),
             adjustments: NodeMap(),
-            method_map: FnvHashMap(),
-            upvar_capture_map: FnvHashMap(),
+            method_map: FxHashMap(),
+            upvar_capture_map: FxHashMap(),
             closure_tys: DefIdMap(),
             closure_kinds: DefIdMap(),
             liberated_fn_sigs: NodeMap(),
             fru_field_types: NodeMap()
         }
+    }
+
+    /// Returns the final resolution of a `QPath` in an `Expr` or `Pat` node.
+    pub fn qpath_def(&self, qpath: &hir::QPath, id: NodeId) -> Def {
+        match *qpath {
+            hir::QPath::Resolved(_, ref path) => path.def,
+            hir::QPath::TypeRelative(..) => {
+                self.type_relative_path_defs.get(&id).cloned().unwrap_or(Def::Err)
+            }
+        }
+    }
+
+    pub fn node_id_to_type(&self, id: NodeId) -> Ty<'tcx> {
+        match self.node_id_to_type_opt(id) {
+            Some(ty) => ty,
+            None => {
+                bug!("node_id_to_type: no type for node `{}`",
+                     tls::with(|tcx| tcx.map.node_to_string(id)))
+            }
+        }
+    }
+
+    pub fn node_id_to_type_opt(&self, id: NodeId) -> Option<Ty<'tcx>> {
+        self.node_types.get(&id).cloned()
+    }
+
+    pub fn node_id_item_substs(&self, id: NodeId) -> Option<&'tcx Substs<'tcx>> {
+        self.item_substs.get(&id).map(|ts| ts.substs)
+    }
+
+    // Returns the type of a pattern as a monotype. Like @expr_ty, this function
+    // doesn't provide type parameter substitutions.
+    pub fn pat_ty(&self, pat: &hir::Pat) -> Ty<'tcx> {
+        self.node_id_to_type(pat.id)
+    }
+
+    pub fn pat_ty_opt(&self, pat: &hir::Pat) -> Option<Ty<'tcx>> {
+        self.node_id_to_type_opt(pat.id)
+    }
+
+    // Returns the type of an expression as a monotype.
+    //
+    // NB (1): This is the PRE-ADJUSTMENT TYPE for the expression.  That is, in
+    // some cases, we insert `Adjustment` annotations such as auto-deref or
+    // auto-ref.  The type returned by this function does not consider such
+    // adjustments.  See `expr_ty_adjusted()` instead.
+    //
+    // NB (2): This type doesn't provide type parameter substitutions; e.g. if you
+    // ask for the type of "id" in "id(3)", it will return "fn(&isize) -> isize"
+    // instead of "fn(ty) -> T with T = isize".
+    pub fn expr_ty(&self, expr: &hir::Expr) -> Ty<'tcx> {
+        self.node_id_to_type(expr.id)
+    }
+
+    pub fn expr_ty_opt(&self, expr: &hir::Expr) -> Option<Ty<'tcx>> {
+        self.node_id_to_type_opt(expr.id)
+    }
+
+    /// Returns the type of `expr`, considering any `Adjustment`
+    /// entry recorded for that expression.
+    pub fn expr_ty_adjusted(&self, expr: &hir::Expr) -> Ty<'tcx> {
+        self.adjustments.get(&expr.id)
+            .map_or_else(|| self.expr_ty(expr), |adj| adj.target)
+    }
+
+    pub fn expr_ty_adjusted_opt(&self, expr: &hir::Expr) -> Option<Ty<'tcx>> {
+        self.adjustments.get(&expr.id)
+            .map(|adj| adj.target).or_else(|| self.expr_ty_opt(expr))
+    }
+
+    pub fn is_method_call(&self, expr_id: NodeId) -> bool {
+        self.method_map.contains_key(&ty::MethodCall::expr(expr_id))
+    }
+
+    pub fn is_overloaded_autoderef(&self, expr_id: NodeId, autoderefs: u32) -> bool {
+        self.method_map.contains_key(&ty::MethodCall::autoderef(expr_id, autoderefs))
+    }
+
+    pub fn upvar_capture(&self, upvar_id: ty::UpvarId) -> Option<ty::UpvarCapture<'tcx>> {
+        Some(self.upvar_capture_map.get(&upvar_id).unwrap().clone())
     }
 }
 
@@ -304,11 +398,6 @@ pub struct GlobalCtxt<'tcx> {
 
     pub sess: &'tcx Session,
 
-    /// Map from path id to the results from resolve; generated
-    /// initially by resolve and updated during typeck in some cases
-    /// (e.g., UFCS paths)
-    pub def_map: RefCell<DefMap>,
-
     /// Map indicating what traits are in scope for places where this
     /// is relevant; generated by resolve.
     pub trait_map: TraitMap,
@@ -328,18 +417,15 @@ pub struct GlobalCtxt<'tcx> {
     pub tables: RefCell<Tables<'tcx>>,
 
     /// Maps from a trait item to the trait item "descriptor"
-    pub impl_or_trait_items: RefCell<DepTrackingMap<maps::ImplOrTraitItems<'tcx>>>,
+    pub associated_items: RefCell<DepTrackingMap<maps::AssociatedItems<'tcx>>>,
 
     /// Maps from an impl/trait def-id to a list of the def-ids of its items
-    pub impl_or_trait_item_def_ids: RefCell<DepTrackingMap<maps::ImplOrTraitItemDefIds<'tcx>>>,
-
-    /// A cache for the trait_items() routine; note that the routine
-    /// itself pushes the `TraitItems` dependency node.
-    trait_items_cache: RefCell<DepTrackingMap<maps::TraitItems<'tcx>>>,
+    pub associated_item_def_ids: RefCell<DepTrackingMap<maps::AssociatedItemDefIds<'tcx>>>,
 
     pub impl_trait_refs: RefCell<DepTrackingMap<maps::ImplTraitRefs<'tcx>>>,
     pub trait_defs: RefCell<DepTrackingMap<maps::TraitDefs<'tcx>>>,
     pub adt_defs: RefCell<DepTrackingMap<maps::AdtDefs<'tcx>>>,
+    pub adt_sized_constraint: RefCell<DepTrackingMap<maps::AdtSizedConstraint<'tcx>>>,
 
     /// Maps from the def-id of an item (trait/struct/enum/fn) to its
     /// associated generics and predicates.
@@ -356,6 +442,15 @@ pub struct GlobalCtxt<'tcx> {
 
     pub map: ast_map::Map<'tcx>,
 
+    /// Maps from the def-id of a function/method or const/static
+    /// to its MIR. Mutation is done at an item granularity to
+    /// allow MIR optimization passes to function and still
+    /// access cross-crate MIR (e.g. inlining or const eval).
+    ///
+    /// Note that cross-crate MIR appears to be always borrowed
+    /// (in the `RefCell` sense) to prevent accidental mutation.
+    pub mir_map: RefCell<DepTrackingMap<maps::Mir<'tcx>>>,
+
     // Records the free variables refrenced by every closure
     // expression. Do not track deps for this, just recompute it from
     // scratch every time.
@@ -364,19 +459,19 @@ pub struct GlobalCtxt<'tcx> {
     pub maybe_unused_trait_imports: NodeSet,
 
     // Records the type of every item.
-    pub tcache: RefCell<DepTrackingMap<maps::Tcache<'tcx>>>,
+    pub item_types: RefCell<DepTrackingMap<maps::Types<'tcx>>>,
 
     // Internal cache for metadata decoding. No need to track deps on this.
-    pub rcache: RefCell<FnvHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
+    pub rcache: RefCell<FxHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
 
     // Cache for the type-contents routine. FIXME -- track deps?
-    pub tc_cache: RefCell<FnvHashMap<Ty<'tcx>, ty::contents::TypeContents>>,
+    pub tc_cache: RefCell<FxHashMap<Ty<'tcx>, ty::contents::TypeContents>>,
 
     // FIXME no dep tracking, but we should be able to remove this
     pub ty_param_defs: RefCell<NodeMap<ty::TypeParameterDef<'tcx>>>,
 
     // FIXME dep tracking -- should be harmless enough
-    pub normalized_cache: RefCell<FnvHashMap<Ty<'tcx>, Ty<'tcx>>>,
+    pub normalized_cache: RefCell<FxHashMap<Ty<'tcx>, Ty<'tcx>>>,
 
     pub lang_items: middle::lang_items::LanguageItems,
 
@@ -481,20 +576,20 @@ pub struct GlobalCtxt<'tcx> {
 
     /// The definite name of the current crate after taking into account
     /// attributes, commandline parameters, etc.
-    pub crate_name: token::InternedString,
+    pub crate_name: Symbol,
 
     /// Data layout specification for the current target.
     pub data_layout: TargetDataLayout,
 
     /// Cache for layouts computed from types.
-    pub layout_cache: RefCell<FnvHashMap<Ty<'tcx>, &'tcx Layout>>,
+    pub layout_cache: RefCell<FxHashMap<Ty<'tcx>, &'tcx Layout>>,
 
     /// Used to prevent layout from recursing too deeply.
     pub layout_depth: Cell<usize>,
 
     /// Map from function to the `#[derive]` mode that it's defining. Only used
-    /// by `rustc-macro` crates.
-    pub derive_macros: RefCell<NodeMap<token::InternedString>>,
+    /// by `proc-macro` crates.
+    pub derive_macros: RefCell<NodeMap<Symbol>>,
 }
 
 impl<'tcx> GlobalCtxt<'tcx> {
@@ -508,15 +603,15 @@ impl<'tcx> GlobalCtxt<'tcx> {
 }
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
-    pub fn crate_name(self, cnum: CrateNum) -> token::InternedString {
+    pub fn crate_name(self, cnum: CrateNum) -> Symbol {
         if cnum == LOCAL_CRATE {
-            self.crate_name.clone()
+            self.crate_name
         } else {
             self.sess.cstore.crate_name(cnum)
         }
     }
 
-    pub fn original_crate_name(self, cnum: CrateNum) -> token::InternedString {
+    pub fn original_crate_name(self, cnum: CrateNum) -> Symbol {
         if cnum == LOCAL_CRATE {
             self.crate_name.clone()
         } else {
@@ -524,7 +619,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    pub fn crate_disambiguator(self, cnum: CrateNum) -> token::InternedString {
+    pub fn crate_disambiguator(self, cnum: CrateNum) -> Symbol {
         if cnum == LOCAL_CRATE {
             self.sess.local_crate_disambiguator()
         } else {
@@ -585,55 +680,26 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.ty_param_defs.borrow().get(&node_id).unwrap().clone()
     }
 
-    pub fn node_types(self) -> Ref<'a, NodeMap<Ty<'tcx>>> {
-        fn projection<'a, 'tcx>(tables: &'a Tables<'tcx>) -> &'a NodeMap<Ty<'tcx>> {
-            &tables.node_types
-        }
-
-        Ref::map(self.tables.borrow(), projection)
-    }
-
-    pub fn node_type_insert(self, id: NodeId, ty: Ty<'gcx>) {
-        self.tables.borrow_mut().node_types.insert(id, ty);
-    }
-
     pub fn alloc_generics(self, generics: ty::Generics<'gcx>)
                           -> &'gcx ty::Generics<'gcx> {
         self.global_interners.arenas.generics.alloc(generics)
     }
 
-    pub fn intern_trait_def(self, def: ty::TraitDef<'gcx>)
-                            -> &'gcx ty::TraitDef<'gcx> {
-        let did = def.trait_ref.def_id;
-        let interned = self.alloc_trait_def(def);
-        if let Some(prev) = self.trait_defs.borrow_mut().insert(did, interned) {
-            bug!("Tried to overwrite interned TraitDef: {:?}", prev)
-        }
-        self.generics.borrow_mut().insert(did, interned.generics);
-        interned
+    pub fn alloc_mir(self, mir: Mir<'gcx>) -> &'gcx RefCell<Mir<'gcx>> {
+        self.global_interners.arenas.mir.alloc(RefCell::new(mir))
     }
 
-    pub fn alloc_trait_def(self, def: ty::TraitDef<'gcx>)
-                           -> &'gcx ty::TraitDef<'gcx> {
-        self.global_interners.arenas.trait_defs.alloc(def)
+    pub fn alloc_trait_def(self, def: ty::TraitDef) -> &'gcx ty::TraitDef {
+        self.global_interners.arenas.trait_def.alloc(def)
     }
 
-    pub fn insert_adt_def(self, did: DefId, adt_def: ty::AdtDefMaster<'gcx>) {
-        // this will need a transmute when reverse-variance is removed
-        if let Some(prev) = self.adt_defs.borrow_mut().insert(did, adt_def) {
-            bug!("Tried to overwrite interned AdtDef: {:?}", prev)
-        }
-    }
-
-    pub fn intern_adt_def(self,
-                          did: DefId,
-                          kind: AdtKind,
-                          variants: Vec<ty::VariantDefData<'gcx, 'gcx>>)
-                          -> ty::AdtDefMaster<'gcx> {
-        let def = ty::AdtDefData::new(self, did, kind, variants);
-        let interned = self.global_interners.arenas.adt_defs.alloc(def);
-        self.insert_adt_def(did, interned);
-        interned
+    pub fn alloc_adt_def(self,
+                         did: DefId,
+                         kind: AdtKind,
+                         variants: Vec<ty::VariantDef>)
+                         -> &'gcx ty::AdtDef {
+        let def = ty::AdtDef::new(self, did, kind, variants);
+        self.global_interners.arenas.adt_def.alloc(def)
     }
 
     pub fn intern_stability(self, stab: attr::Stability) -> &'gcx attr::Stability {
@@ -696,7 +762,6 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// reference to the context, to allow formatting values that need it.
     pub fn create_and_enter<F, R>(s: &'tcx Session,
                                   arenas: &'tcx CtxtArenas<'tcx>,
-                                  def_map: DefMap,
                                   trait_map: TraitMap,
                                   named_region_map: resolve_lifetime::NamedRegionMap,
                                   map: ast_map::Map<'tcx>,
@@ -721,31 +786,31 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             types: common_types,
             named_region_map: named_region_map,
             region_maps: region_maps,
-            free_region_maps: RefCell::new(FnvHashMap()),
+            free_region_maps: RefCell::new(FxHashMap()),
             item_variance_map: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             variance_computed: Cell::new(false),
             sess: s,
-            def_map: RefCell::new(def_map),
             trait_map: trait_map,
             tables: RefCell::new(Tables::empty()),
             impl_trait_refs: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             trait_defs: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             adt_defs: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
+            adt_sized_constraint: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             generics: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             predicates: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             super_predicates: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             fulfilled_predicates: RefCell::new(fulfilled_predicates),
             map: map,
+            mir_map: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             freevars: RefCell::new(freevars),
             maybe_unused_trait_imports: maybe_unused_trait_imports,
-            tcache: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
-            rcache: RefCell::new(FnvHashMap()),
-            tc_cache: RefCell::new(FnvHashMap()),
-            impl_or_trait_items: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
-            impl_or_trait_item_def_ids: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
-            trait_items_cache: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
+            item_types: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
+            rcache: RefCell::new(FxHashMap()),
+            tc_cache: RefCell::new(FxHashMap()),
+            associated_items: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
+            associated_item_def_ids: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             ty_param_defs: RefCell::new(NodeMap()),
-            normalized_cache: RefCell::new(FnvHashMap()),
+            normalized_cache: RefCell::new(FxHashMap()),
             lang_items: lang_items,
             inherent_impls: RefCell::new(DepTrackingMap::new(dep_graph.clone())),
             used_unsafe: RefCell::new(NodeSet()),
@@ -763,9 +828,9 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             custom_coerce_unsized_kinds: RefCell::new(DefIdMap()),
             cast_kinds: RefCell::new(NodeMap()),
             fragment_infos: RefCell::new(DefIdMap()),
-            crate_name: token::intern_and_get_ident(crate_name),
+            crate_name: Symbol::intern(crate_name),
             data_layout: data_layout,
-            layout_cache: RefCell::new(FnvHashMap()),
+            layout_cache: RefCell::new(FxHashMap()),
             layout_depth: Cell::new(0),
             derive_macros: RefCell::new(NodeMap()),
        }, f)
@@ -824,7 +889,10 @@ impl<'a, 'tcx> Lift<'tcx> for Ty<'a> {
 impl<'a, 'tcx> Lift<'tcx> for &'a Substs<'a> {
     type Lifted = &'tcx Substs<'tcx>;
     fn lift_to_tcx<'b, 'gcx>(&self, tcx: TyCtxt<'b, 'gcx, 'tcx>) -> Option<&'tcx Substs<'tcx>> {
-        if let Some(&Interned(substs)) = tcx.interners.substs.borrow().get(*self) {
+        if self.len() == 0 {
+            return Some(Slice::empty());
+        }
+        if let Some(&Interned(substs)) = tcx.interners.substs.borrow().get(&self[..]) {
             if *self as *const _ == substs as *const _ {
                 return Some(substs);
             }
@@ -859,9 +927,33 @@ impl<'a, 'tcx> Lift<'tcx> for &'a Slice<Ty<'a>> {
     type Lifted = &'tcx Slice<Ty<'tcx>>;
     fn lift_to_tcx<'b, 'gcx>(&self, tcx: TyCtxt<'b, 'gcx, 'tcx>)
                              -> Option<&'tcx Slice<Ty<'tcx>>> {
+        if self.len() == 0 {
+            return Some(Slice::empty());
+        }
         if let Some(&Interned(list)) = tcx.interners.type_list.borrow().get(&self[..]) {
             if *self as *const _ == list as *const _ {
                 return Some(list);
+            }
+        }
+        // Also try in the global tcx if we're not that.
+        if !tcx.is_global() {
+            self.lift_to_tcx(tcx.global_tcx())
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, 'tcx> Lift<'tcx> for &'a Slice<ExistentialPredicate<'a>> {
+    type Lifted = &'tcx Slice<ExistentialPredicate<'tcx>>;
+    fn lift_to_tcx<'b, 'gcx>(&self, tcx: TyCtxt<'b, 'gcx, 'tcx>)
+        -> Option<&'tcx Slice<ExistentialPredicate<'tcx>>> {
+        if self.is_empty() {
+            return Some(Slice::empty());
+        }
+        if let Some(&Interned(eps)) = tcx.interners.existential_predicates.borrow().get(&self[..]) {
+            if *self as *const _ == eps as *const _ {
+                return Some(eps);
             }
         }
         // Also try in the global tcx if we're not that.
@@ -1041,7 +1133,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
         sty_debug_print!(
             self,
             TyAdt, TyBox, TyArray, TySlice, TyRawPtr, TyRef, TyFnDef, TyFnPtr,
-            TyTrait, TyClosure, TyTuple, TyParam, TyInfer, TyProjection, TyAnon);
+            TyDynamic, TyClosure, TyTuple, TyParam, TyInfer, TyProjection, TyAnon);
 
         println!("Substs interner: #{}", self.interners.substs.borrow().len());
         println!("BareFnTy interner: #{}", self.interners.bare_fn.borrow().len());
@@ -1097,9 +1189,9 @@ impl<'tcx: 'lcx, 'lcx> Borrow<[Ty<'lcx>]> for Interned<'tcx, Slice<Ty<'tcx>>> {
     }
 }
 
-impl<'tcx: 'lcx, 'lcx> Borrow<Substs<'lcx>> for Interned<'tcx, Substs<'tcx>> {
-    fn borrow<'a>(&'a self) -> &'a Substs<'lcx> {
-        self.0
+impl<'tcx: 'lcx, 'lcx> Borrow<[Kind<'lcx>]> for Interned<'tcx, Substs<'tcx>> {
+    fn borrow<'a>(&'a self) -> &'a [Kind<'lcx>] {
+        &self.0[..]
     }
 }
 
@@ -1115,8 +1207,16 @@ impl<'tcx> Borrow<Region> for Interned<'tcx, Region> {
     }
 }
 
+impl<'tcx: 'lcx, 'lcx> Borrow<[ExistentialPredicate<'lcx>]>
+    for Interned<'tcx, Slice<ExistentialPredicate<'tcx>>> {
+    fn borrow<'a>(&'a self) -> &'a [ExistentialPredicate<'lcx>] {
+        &self.0[..]
+    }
+}
+
 macro_rules! intern_method {
     ($lt_tcx:tt, $name:ident: $method:ident($alloc:ty,
+                                            $alloc_method:ident,
                                             $alloc_to_key:expr,
                                             $alloc_to_ret:expr,
                                             $needs_infer:expr) -> $ty:ty) => {
@@ -1142,7 +1242,8 @@ macro_rules! intern_method {
                         let v = unsafe {
                             mem::transmute(v)
                         };
-                        let i = ($alloc_to_ret)(self.global_interners.arenas.$name.alloc(v));
+                        let i = ($alloc_to_ret)(self.global_interners.arenas.$name
+                                                    .$alloc_method(v));
                         self.global_interners.$name.borrow_mut().insert(Interned(i));
                         return i;
                     }
@@ -1156,7 +1257,7 @@ macro_rules! intern_method {
                     }
                 }
 
-                let i = ($alloc_to_ret)(self.interners.arenas.$name.alloc(v));
+                let i = ($alloc_to_ret)(self.interners.arenas.$name.$alloc_method(v));
                 self.interners.$name.borrow_mut().insert(Interned(i));
                 i
             }
@@ -1180,7 +1281,7 @@ macro_rules! direct_interners {
             }
         }
 
-        intern_method!($lt_tcx, $name: $method($ty, |x| x, |x| x, $needs_infer) -> $ty);)+
+        intern_method!($lt_tcx, $name: $method($ty, alloc, |x| x, |x| x, $needs_infer) -> $ty);)+
     }
 }
 
@@ -1189,9 +1290,6 @@ fn keep_local<'tcx, T: ty::TypeFoldable<'tcx>>(x: &T) -> bool {
 }
 
 direct_interners!('tcx,
-    substs: mk_substs(|substs: &Substs| {
-        substs.params().iter().any(keep_local)
-    }) -> Substs<'tcx>,
     bare_fn: mk_bare_fn(|fty: &BareFnTy| {
         keep_local(&fty.sig)
     }) -> BareFnTy<'tcx>,
@@ -1203,10 +1301,19 @@ direct_interners!('tcx,
     }) -> Region
 );
 
-intern_method!('tcx,
-    type_list: mk_type_list(Vec<Ty<'tcx>>, Deref::deref, |xs: &[Ty]| -> &Slice<Ty> {
-        unsafe { mem::transmute(xs) }
-    }, keep_local) -> Slice<Ty<'tcx>>
+macro_rules! slice_interners {
+    ($($field:ident: $method:ident($ty:ident)),+) => (
+        $(intern_method!('tcx, $field: $method(&[$ty<'tcx>], alloc_slice, Deref::deref,
+                                               |xs: &[$ty]| -> &Slice<$ty> {
+            unsafe { mem::transmute(xs) }
+        }, |xs: &[$ty]| xs.iter().any(keep_local)) -> Slice<$ty<'tcx>>);)+
+    )
+}
+
+slice_interners!(
+    existential_predicates: _intern_existential_predicates(ExistentialPredicate),
+    type_list: _intern_type_list(Ty),
+    substs: _intern_substs(Kind)
 );
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
@@ -1266,7 +1373,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.mk_imm_ref(self.mk_region(ty::ReStatic), self.mk_str())
     }
 
-    pub fn mk_adt(self, def: AdtDef<'tcx>, substs: &'tcx Substs<'tcx>) -> Ty<'tcx> {
+    pub fn mk_adt(self, def: &'tcx AdtDef, substs: &'tcx Substs<'tcx>) -> Ty<'tcx> {
         // take a copy of substs so that we own the vectors inside
         self.mk_ty(TyAdt(def, substs))
     }
@@ -1311,12 +1418,16 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.mk_ty(TySlice(ty))
     }
 
-    pub fn mk_tup(self, ts: Vec<Ty<'tcx>>) -> Ty<'tcx> {
-        self.mk_ty(TyTuple(self.mk_type_list(ts)))
+    pub fn intern_tup(self, ts: &[Ty<'tcx>]) -> Ty<'tcx> {
+        self.mk_ty(TyTuple(self.intern_type_list(ts)))
+    }
+
+    pub fn mk_tup<I: InternAs<[Ty<'tcx>], Ty<'tcx>>>(self, iter: I) -> I::Output {
+        iter.intern_with(|ts| self.mk_ty(TyTuple(self.intern_type_list(ts))))
     }
 
     pub fn mk_nil(self) -> Ty<'tcx> {
-        self.mk_tup(Vec::new())
+        self.intern_tup(&[])
     }
 
     pub fn mk_diverging_default(self) -> Ty<'tcx> {
@@ -1341,28 +1452,29 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.mk_ty(TyFnPtr(fty))
     }
 
-    pub fn mk_trait(self, mut obj: TraitObject<'tcx>) -> Ty<'tcx> {
-        obj.projection_bounds.sort_by_key(|b| b.sort_key(self));
-        self.mk_ty(TyTrait(box obj))
+    pub fn mk_dynamic(
+        self,
+        obj: ty::Binder<&'tcx Slice<ExistentialPredicate<'tcx>>>,
+        reg: &'tcx ty::Region
+    ) -> Ty<'tcx> {
+        self.mk_ty(TyDynamic(obj, reg))
     }
 
     pub fn mk_projection(self,
                          trait_ref: TraitRef<'tcx>,
                          item_name: Name)
-                         -> Ty<'tcx> {
-        // take a copy of substs so that we own the vectors inside
-        let inner = ProjectionTy { trait_ref: trait_ref, item_name: item_name };
-        self.mk_ty(TyProjection(inner))
-    }
+        -> Ty<'tcx> {
+            // take a copy of substs so that we own the vectors inside
+            let inner = ProjectionTy { trait_ref: trait_ref, item_name: item_name };
+            self.mk_ty(TyProjection(inner))
+        }
 
     pub fn mk_closure(self,
                       closure_id: DefId,
-                      substs: &'tcx Substs<'tcx>,
-                      tys: Vec<Ty<'tcx>>)
-                      -> Ty<'tcx> {
+                      substs: &'tcx Substs<'tcx>)
+        -> Ty<'tcx> {
         self.mk_closure_from_closure_substs(closure_id, ClosureSubsts {
-            func_substs: substs,
-            upvar_tys: self.mk_type_list(tys)
+            substs: substs
         })
     }
 
@@ -1407,13 +1519,62 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.mk_ty(TyAnon(def_id, substs))
     }
 
-    pub fn trait_items(self, trait_did: DefId) -> Rc<Vec<ty::ImplOrTraitItem<'gcx>>> {
-        self.trait_items_cache.memoize(trait_did, || {
-            let def_ids = self.impl_or_trait_items(trait_did);
-            Rc::new(def_ids.iter()
-                           .map(|&def_id| self.impl_or_trait_item(def_id))
-                           .collect())
+    pub fn intern_existential_predicates(self, eps: &[ExistentialPredicate<'tcx>])
+        -> &'tcx Slice<ExistentialPredicate<'tcx>> {
+        assert!(!eps.is_empty());
+        assert!(eps.windows(2).all(|w| w[0].cmp(self, &w[1]) != Ordering::Greater));
+        self._intern_existential_predicates(eps)
+    }
+
+    pub fn intern_type_list(self, ts: &[Ty<'tcx>]) -> &'tcx Slice<Ty<'tcx>> {
+        if ts.len() == 0 {
+            Slice::empty()
+        } else {
+            self._intern_type_list(ts)
+        }
+    }
+
+    pub fn intern_substs(self, ts: &[Kind<'tcx>]) -> &'tcx Slice<Kind<'tcx>> {
+        if ts.len() == 0 {
+            Slice::empty()
+        } else {
+            self._intern_substs(ts)
+        }
+    }
+
+    pub fn mk_fn_sig<I>(self, inputs: I, output: I::Item, variadic: bool)
+        -> <I::Item as InternIteratorElement<Ty<'tcx>, ty::FnSig<'tcx>>>::Output
+        where I: Iterator,
+              I::Item: InternIteratorElement<Ty<'tcx>, ty::FnSig<'tcx>>
+    {
+        inputs.chain(iter::once(output)).intern_with(|xs| ty::FnSig {
+            inputs_and_output: self.intern_type_list(xs),
+            variadic: variadic
         })
+    }
+
+    pub fn mk_existential_predicates<I: InternAs<[ExistentialPredicate<'tcx>],
+                                     &'tcx Slice<ExistentialPredicate<'tcx>>>>(self, iter: I)
+                                     -> I::Output {
+        iter.intern_with(|xs| self.intern_existential_predicates(xs))
+    }
+
+    pub fn mk_type_list<I: InternAs<[Ty<'tcx>],
+                        &'tcx Slice<Ty<'tcx>>>>(self, iter: I) -> I::Output {
+        iter.intern_with(|xs| self.intern_type_list(xs))
+    }
+
+    pub fn mk_substs<I: InternAs<[Kind<'tcx>],
+                     &'tcx Slice<Kind<'tcx>>>>(self, iter: I) -> I::Output {
+        iter.intern_with(|xs| self.intern_substs(xs))
+    }
+
+    pub fn mk_substs_trait(self,
+                     s: Ty<'tcx>,
+                     t: &[Ty<'tcx>])
+                    -> &'tcx Substs<'tcx>
+    {
+        self.mk_substs(iter::once(s).chain(t.into_iter().cloned()).map(Kind::from))
     }
 
     /// Obtain the representation annotation for a struct definition.
@@ -1423,5 +1584,40 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 attr::find_repr_attrs(self.sess.diagnostic(), meta).into_iter()
             }).collect())
         })
+    }
+}
+
+pub trait InternAs<T: ?Sized, R> {
+    type Output;
+    fn intern_with<F>(self, F) -> Self::Output
+        where F: FnOnce(&T) -> R;
+}
+
+impl<I, T, R, E> InternAs<[T], R> for I
+    where E: InternIteratorElement<T, R>,
+          I: Iterator<Item=E> {
+    type Output = E::Output;
+    fn intern_with<F>(self, f: F) -> Self::Output
+        where F: FnOnce(&[T]) -> R {
+        E::intern_with(self, f)
+    }
+}
+
+pub trait InternIteratorElement<T, R>: Sized {
+    type Output;
+    fn intern_with<I: Iterator<Item=Self>, F: FnOnce(&[T]) -> R>(iter: I, f: F) -> Self::Output;
+}
+
+impl<T, R> InternIteratorElement<T, R> for T {
+    type Output = R;
+    fn intern_with<I: Iterator<Item=Self>, F: FnOnce(&[T]) -> R>(iter: I, f: F) -> Self::Output {
+        f(&iter.collect::<AccumulateVec<[_; 8]>>())
+    }
+}
+
+impl<T, R, E> InternIteratorElement<T, R> for Result<T, E> {
+    type Output = Result<R, E>;
+    fn intern_with<I: Iterator<Item=Self>, F: FnOnce(&[T]) -> R>(iter: I, f: F) -> Self::Output {
+        Ok(f(&iter.collect::<Result<AccumulateVec<[_; 8]>, _>>()?))
     }
 }

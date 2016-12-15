@@ -43,7 +43,8 @@ use str::FromStr;
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, Hash)]
-pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")] pub T);
+pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")]
+                       pub T);
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: fmt::Debug> fmt::Debug for Wrapping<T> {
@@ -516,11 +517,10 @@ macro_rules! int_impl {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub fn checked_div(self, other: Self) -> Option<Self> {
-            if other == 0 {
+            if other == 0 || (self == Self::min_value() && other == -1) {
                 None
             } else {
-                let (a, b) = self.overflowing_div(other);
-                if b {None} else {Some(a)}
+                Some(unsafe { intrinsics::unchecked_div(self, other) })
             }
         }
 
@@ -541,11 +541,10 @@ macro_rules! int_impl {
         #[stable(feature = "wrapping", since = "1.7.0")]
         #[inline]
         pub fn checked_rem(self, other: Self) -> Option<Self> {
-            if other == 0 {
+            if other == 0 || (self == Self::min_value() && other == -1) {
                 None
             } else {
-                let (a, b) = self.overflowing_rem(other);
-                if b {None} else {Some(a)}
+                Some(unsafe { intrinsics::unchecked_rem(self, other) })
             }
         }
 
@@ -613,14 +612,12 @@ macro_rules! int_impl {
         /// Basic usage:
         ///
         /// ```
-        /// # #![feature(no_panic_abs)]
-        ///
         /// use std::i32;
         ///
         /// assert_eq!((-5i32).checked_abs(), Some(5));
         /// assert_eq!(i32::MIN.checked_abs(), None);
         /// ```
-        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[stable(feature = "no_panic_abs", since = "1.13.0")]
         #[inline]
         pub fn checked_abs(self) -> Option<Self> {
             if self.is_negative() {
@@ -895,14 +892,12 @@ macro_rules! int_impl {
         /// Basic usage:
         ///
         /// ```
-        /// # #![feature(no_panic_abs)]
-        ///
         /// assert_eq!(100i8.wrapping_abs(), 100);
         /// assert_eq!((-100i8).wrapping_abs(), 100);
         /// assert_eq!((-128i8).wrapping_abs(), -128);
         /// assert_eq!((-128i8).wrapping_abs() as u8, 128);
         /// ```
-        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[stable(feature = "no_panic_abs", since = "1.13.0")]
         #[inline(always)]
         pub fn wrapping_abs(self) -> Self {
             if self.is_negative() {
@@ -1133,13 +1128,11 @@ macro_rules! int_impl {
         /// Basic usage:
         ///
         /// ```
-        /// # #![feature(no_panic_abs)]
-        ///
         /// assert_eq!(10i8.overflowing_abs(), (10,false));
         /// assert_eq!((-10i8).overflowing_abs(), (10,false));
         /// assert_eq!((-128i8).overflowing_abs(), (-128,true));
         /// ```
-        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[stable(feature = "no_panic_abs", since = "1.13.0")]
         #[inline]
         pub fn overflowing_abs(self) -> (Self, bool) {
             if self.is_negative() {
@@ -1694,7 +1687,7 @@ macro_rules! uint_impl {
         pub fn checked_div(self, other: Self) -> Option<Self> {
             match other {
                 0 => None,
-                other => Some(self / other),
+                other => Some(unsafe { intrinsics::unchecked_div(self, other) }),
             }
         }
 
@@ -1715,7 +1708,7 @@ macro_rules! uint_impl {
             if other == 0 {
                 None
             } else {
-                Some(self % other)
+                Some(unsafe { intrinsics::unchecked_rem(self, other) })
             }
         }
 
@@ -2410,7 +2403,7 @@ pub enum FpCategory {
 
     /// Positive or negative infinity.
     #[stable(feature = "rust1", since = "1.0.0")]
-    Infinite ,
+    Infinite,
 
     /// Positive or negative zero.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -2576,7 +2569,7 @@ impl fmt::Display for TryFromIntError {
 
 macro_rules! same_sign_from_int_impl {
     ($storage:ty, $target:ty, $($source:ty),*) => {$(
-        #[stable(feature = "rust1", since = "1.0.0")]
+        #[unstable(feature = "try_from", issue = "33417")]
         impl TryFrom<$source> for $target {
             type Err = TryFromIntError;
 
@@ -2606,7 +2599,7 @@ same_sign_from_int_impl!(i64, isize, i8, i16, i32, i64, isize);
 
 macro_rules! cross_sign_from_int_impl {
     ($unsigned:ty, $($signed:ty),*) => {$(
-        #[stable(feature = "rust1", since = "1.0.0")]
+        #[unstable(feature = "try_from", issue = "33417")]
         impl TryFrom<$unsigned> for $signed {
             type Err = TryFromIntError;
 
@@ -2620,7 +2613,7 @@ macro_rules! cross_sign_from_int_impl {
             }
         }
 
-        #[stable(feature = "rust1", since = "1.0.0")]
+        #[unstable(feature = "try_from", issue = "33417")]
         impl TryFrom<$signed> for $unsigned {
             type Err = TryFromIntError;
 
@@ -2670,8 +2663,7 @@ macro_rules! doit {
 }
 doit! { i8 i16 i32 i64 isize u8 u16 u32 u64 usize }
 
-fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32)
-                                         -> Result<T, ParseIntError> {
+fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32) -> Result<T, ParseIntError> {
     use self::IntErrorKind::*;
     use self::ParseIntError as PIE;
 
@@ -2694,7 +2686,7 @@ fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32)
     let (is_positive, digits) = match src[0] {
         b'+' => (true, &src[1..]),
         b'-' if is_signed_ty => (false, &src[1..]),
-        _ => (true, src)
+        _ => (true, src),
     };
 
     if digits.is_empty() {
@@ -2746,7 +2738,9 @@ fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32)
 /// [`i8::from_str_radix()`]: ../../std/primitive.i8.html#method.from_str_radix
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[stable(feature = "rust1", since = "1.0.0")]
-pub struct ParseIntError { kind: IntErrorKind }
+pub struct ParseIntError {
+    kind: IntErrorKind,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IntErrorKind {

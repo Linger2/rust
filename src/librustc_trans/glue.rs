@@ -48,7 +48,7 @@ pub fn trans_exchange_free_dyn<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     let def_id = langcall(bcx.tcx(), None, "", ExchangeFreeFnLangItem);
     let args = [PointerCast(bcx, v, Type::i8p(bcx.ccx())), size, align];
-    Callee::def(bcx.ccx(), def_id, Substs::empty(bcx.tcx()))
+    Callee::def(bcx.ccx(), def_id, bcx.tcx().intern_substs(&[]))
         .call(bcx, debug_loc, &args, None).bcx
 }
 
@@ -292,7 +292,7 @@ fn trans_custom_dtor<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     let trait_ref = ty::Binder(ty::TraitRef {
         def_id: tcx.lang_items.drop_trait().unwrap(),
-        substs: Substs::new_trait(tcx, t, &[])
+        substs: tcx.mk_substs_trait(t, &[])
     });
     let vtbl = match fulfill_obligation(bcx.ccx().shared(), DUMMY_SP, trait_ref) {
         traits::VtableImpl(data) => data,
@@ -335,20 +335,9 @@ pub fn size_and_align_of_dst<'blk, 'tcx>(bcx: &BlockAndBuilder<'blk, 'tcx>,
             let layout = ccx.layout_of(t);
             debug!("DST {} layout: {:?}", t, layout);
 
-            // Returns size in bytes of all fields except the last one
-            // (we will be recursing on the last one).
-            fn local_prefix_bytes(variant: &ty::layout::Struct) -> u64 {
-                let fields = variant.offset_after_field.len();
-                if fields > 1 {
-                    variant.offset_after_field[fields - 2].bytes()
-                } else {
-                    0
-                }
-            }
-
             let (sized_size, sized_align) = match *layout {
                 ty::layout::Layout::Univariant { ref variant, .. } => {
-                    (local_prefix_bytes(variant), variant.align.abi())
+                    (variant.offsets.last().map_or(0, |o| o.bytes()), variant.align.abi())
                 }
                 _ => {
                     bug!("size_and_align_of_dst: expcted Univariant for `{}`, found {:#?}",
@@ -405,7 +394,7 @@ pub fn size_and_align_of_dst<'blk, 'tcx>(bcx: &BlockAndBuilder<'blk, 'tcx>,
 
             (size, align)
         }
-        ty::TyTrait(..) => {
+        ty::TyDynamic(..) => {
             // info points to the vtable and the second entry in the vtable is the
             // dynamic size of the object.
             let info = bcx.pointercast(info, Type::int(bcx.ccx()).ptr_to());
@@ -474,7 +463,7 @@ fn make_drop_glue<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                 trans_exchange_free_ty(bcx, llbox, content_ty, DebugLoc::None)
             }
         }
-        ty::TyTrait(..) => {
+        ty::TyDynamic(..) => {
             // No support in vtable for distinguishing destroying with
             // versus without calling Drop::drop. Assert caller is
             // okay with always calling the Drop impl, if any.
@@ -515,7 +504,7 @@ fn drop_structural_ty<'blk, 'tcx>(cx: Block<'blk, 'tcx>,
     fn iter_variant<'blk, 'tcx>(cx: Block<'blk, 'tcx>,
                                 t: Ty<'tcx>,
                                 av: adt::MaybeSizedValue,
-                                variant: ty::VariantDef<'tcx>,
+                                variant: &'tcx ty::VariantDef,
                                 substs: &Substs<'tcx>)
                                 -> Block<'blk, 'tcx> {
         let _icx = push_ctxt("iter_variant");
@@ -542,8 +531,8 @@ fn drop_structural_ty<'blk, 'tcx>(cx: Block<'blk, 'tcx>,
 
     let mut cx = cx;
     match t.sty {
-        ty::TyClosure(_, ref substs) => {
-            for (i, upvar_ty) in substs.upvar_tys.iter().enumerate() {
+        ty::TyClosure(def_id, substs) => {
+            for (i, upvar_ty) in substs.upvar_tys(def_id, cx.tcx()).enumerate() {
                 let llupvar = adt::trans_field_ptr(cx, t, value, Disr(0), i);
                 cx = drop_ty(cx, llupvar, upvar_ty, DebugLoc::None);
             }

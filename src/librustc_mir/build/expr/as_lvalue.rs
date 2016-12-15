@@ -13,7 +13,7 @@
 use build::{BlockAnd, BlockAndExtension, Builder};
 use build::expr::category::Category;
 use hair::*;
-use rustc::mir::repr::*;
+use rustc::mir::*;
 
 use rustc_data_structures::indexed_vec::Idx;
 
@@ -96,6 +96,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             ExprKind::LogicalOp { .. } |
             ExprKind::Box { .. } |
             ExprKind::Cast { .. } |
+            ExprKind::Use { .. } |
             ExprKind::NeverToAny { .. } |
             ExprKind::ReifyFnPointer { .. } |
             ExprKind::UnsafeFnPointer { .. } |

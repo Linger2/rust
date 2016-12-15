@@ -17,27 +17,55 @@ use std::path::{PathBuf, Path};
 
 use build_helper::output;
 
+fn detect_llvm_link(llvm_config: &Path) -> (&'static str, Option<&'static str>) {
+    let mut version_cmd = Command::new(llvm_config);
+    version_cmd.arg("--version");
+    let version_output = output(&mut version_cmd);
+    let mut parts = version_output.split('.').take(2)
+        .filter_map(|s| s.parse::<u32>().ok());
+    if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+        if major > 3 || (major == 3 && minor >= 9) {
+            // Force the link mode we want, preferring static by default, but
+            // possibly overridden by `configure --enable-llvm-link-shared`.
+            if env::var_os("LLVM_LINK_SHARED").is_some() {
+                return ("dylib", Some("--link-shared"));
+            } else {
+                return ("static", Some("--link-static"));
+            }
+        } else if major == 3 && minor == 8 {
+            // Find out LLVM's default linking mode.
+            let mut mode_cmd = Command::new(llvm_config);
+            mode_cmd.arg("--shared-mode");
+            if output(&mut mode_cmd).trim() == "shared" {
+                return ("dylib", None);
+            } else {
+                return ("static", None);
+            }
+        }
+    }
+    ("static", None)
+}
+
 fn main() {
     println!("cargo:rustc-cfg=cargobuild");
 
     let target = env::var("TARGET").expect("TARGET was not set");
     let llvm_config = env::var_os("LLVM_CONFIG")
-                          .map(PathBuf::from)
-                          .unwrap_or_else(|| {
-                              if let Some(dir) = env::var_os("CARGO_TARGET_DIR")
-                                      .map(PathBuf::from) {
-                                  let to_test = dir.parent()
-                                                   .unwrap()
-                                                   .parent()
-                                                   .unwrap()
-                                                   .join(&target)
-                                                   .join("llvm/bin/llvm-config");
-                                  if Command::new(&to_test).output().is_ok() {
-                                      return to_test;
-                                  }
-                              }
-                              PathBuf::from("llvm-config")
-                          });
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if let Some(dir) = env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+                let to_test = dir.parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join(&target)
+                    .join("llvm/bin/llvm-config");
+                if Command::new(&to_test).output().is_ok() {
+                    return to_test;
+                }
+            }
+            PathBuf::from("llvm-config")
+        });
 
     println!("cargo:rerun-if-changed={}", llvm_config.display());
 
@@ -66,7 +94,8 @@ fn main() {
     let host = env::var("HOST").expect("HOST was not set");
     let is_crossed = target != host;
 
-    let optional_components = ["x86", "arm", "aarch64", "mips", "powerpc", "pnacl", "systemz"];
+    let optional_components =
+        ["x86", "arm", "aarch64", "mips", "powerpc", "pnacl", "systemz", "jsbackend", "msp430"];
 
     // FIXME: surely we don't need all these components, right? Stuff like mcjit
     //        or interpreter the compiler itself never uses.
@@ -116,6 +145,9 @@ fn main() {
         cfg.flag("-DLLVM_RUSTLLVM");
     }
 
+    println!("cargo:rerun-if-changed=../rustllvm/PassWrapper.cpp");
+    println!("cargo:rerun-if-changed=../rustllvm/RustWrapper.cpp");
+    println!("cargo:rerun-if-changed=../rustllvm/ArchiveWrapper.cpp");
     cfg.file("../rustllvm/PassWrapper.cpp")
        .file("../rustllvm/RustWrapper.cpp")
        .file("../rustllvm/ArchiveWrapper.cpp")
@@ -123,11 +155,18 @@ fn main() {
        .cpp_link_stdlib(None) // we handle this below
        .compile("librustllvm.a");
 
+    let (llvm_kind, llvm_link_arg) = detect_llvm_link(&llvm_config);
+
     // Link in all LLVM libraries, if we're uwring the "wrong" llvm-config then
     // we don't pick up system libs because unfortunately they're for the host
     // of llvm-config, not the target that we're attempting to link.
     let mut cmd = Command::new(&llvm_config);
     cmd.arg("--libs");
+
+    if let Some(link_arg) = llvm_link_arg {
+        cmd.arg(link_arg);
+    }
+
     if !is_crossed {
         cmd.arg("--system-libs");
     }
@@ -148,7 +187,7 @@ fn main() {
             // that off
             lib.trim_right_matches(".lib")
         } else {
-            continue
+            continue;
         };
 
         // Don't need or want this library, but LLVM's CMake build system
@@ -157,11 +196,11 @@ fn main() {
         // library and it otherwise may just pull in extra dependencies on
         // libedit which we don't want
         if name == "LLVMLineEditor" {
-            continue
+            continue;
         }
 
         let kind = if name.starts_with("LLVM") {
-            "static"
+            llvm_kind
         } else {
             "dylib"
         };
@@ -178,7 +217,7 @@ fn main() {
     cmd.arg("--ldflags");
     for lib in output(&mut cmd).split_whitespace() {
         if lib.starts_with("-LIBPATH:") {
-                println!("cargo:rustc-link-search=native={}", &lib[9..]);
+            println!("cargo:rustc-link-search=native={}", &lib[9..]);
         } else if is_crossed {
             if lib.starts_with("-L") {
                 println!("cargo:rustc-link-search=native={}",

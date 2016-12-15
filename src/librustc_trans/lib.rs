@@ -23,11 +23,12 @@
       html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![cfg_attr(not(stage0), deny(warnings))]
 
+#![feature(associated_consts)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
+#![feature(cell_extras)]
 #![feature(const_fn)]
 #![feature(custom_attribute)]
-#![feature(dotdot_in_tuple_patterns)]
 #![allow(unused_attributes)]
 #![feature(libc)]
 #![feature(quote)]
@@ -36,7 +37,6 @@
 #![feature(slice_patterns)]
 #![feature(staged_api)]
 #![feature(unicode)]
-#![feature(question_mark)]
 
 use rustc::dep_graph::WorkProduct;
 
@@ -54,6 +54,9 @@ extern crate rustc_platform_intrinsics as intrinsics;
 extern crate serialize;
 extern crate rustc_const_math;
 extern crate rustc_const_eval;
+#[macro_use]
+#[no_link]
+extern crate rustc_bitflags;
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
@@ -75,6 +78,7 @@ pub mod back {
     pub mod linker;
     pub mod link;
     pub mod lto;
+    pub mod symbol_export;
     pub mod symbol_names;
     pub mod write;
     pub mod msvc;
@@ -100,6 +104,7 @@ mod cabi_arm;
 mod cabi_asmjs;
 mod cabi_mips;
 mod cabi_mips64;
+mod cabi_msp430;
 mod cabi_powerpc;
 mod cabi_powerpc64;
 mod cabi_s390x;
@@ -108,7 +113,6 @@ mod cabi_x86_64;
 mod cabi_x86_win64;
 mod callee;
 mod cleanup;
-mod closure;
 mod collector;
 mod common;
 mod consts;
@@ -166,8 +170,9 @@ pub struct CrateTranslation {
     pub metadata_module: ModuleTranslation,
     pub link: middle::cstore::LinkMeta,
     pub metadata: Vec<u8>,
-    pub reachable: Vec<String>,
+    pub exported_symbols: back::symbol_export::ExportedSymbols,
     pub no_builtins: bool,
+    pub windows_subsystem: Option<String>,
     pub linker_info: back::linker::LinkerInfo
 }
 

@@ -11,6 +11,7 @@
 use hir::def_id::DefId;
 use ty::{self, Ty, TyCtxt};
 use syntax::ast;
+use middle::lang_items::OwnedBoxLangItem;
 
 use self::SimplifiedType::*;
 
@@ -24,7 +25,7 @@ pub enum SimplifiedType {
     FloatSimplifiedType(ast::FloatTy),
     AdtSimplifiedType(DefId),
     StrSimplifiedType,
-    VecSimplifiedType,
+    ArraySimplifiedType,
     PtrSimplifiedType,
     NeverSimplifiedType,
     TupleSimplifiedType(usize),
@@ -57,10 +58,10 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         ty::TyFloat(float_type) => Some(FloatSimplifiedType(float_type)),
         ty::TyAdt(def, _) => Some(AdtSimplifiedType(def.did)),
         ty::TyStr => Some(StrSimplifiedType),
-        ty::TyArray(..) | ty::TySlice(_) => Some(VecSimplifiedType),
+        ty::TyArray(..) | ty::TySlice(_) => Some(ArraySimplifiedType),
         ty::TyRawPtr(_) => Some(PtrSimplifiedType),
-        ty::TyTrait(ref trait_info) => {
-            Some(TraitSimplifiedType(trait_info.principal.def_id()))
+        ty::TyDynamic(ref trait_info, ..) => {
+            trait_info.principal().map(|p| TraitSimplifiedType(p.def_id()))
         }
         ty::TyRef(_, mt) => {
             // since we introduce auto-refs during method lookup, we
@@ -70,10 +71,7 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         }
         ty::TyBox(_) => {
             // treat like we would treat `Box`
-            match tcx.lang_items.require_owned_box() {
-                Ok(def_id) => Some(AdtSimplifiedType(def_id)),
-                Err(msg) => tcx.sess.fatal(&msg),
-            }
+            Some(AdtSimplifiedType(tcx.require_lang_item(OwnedBoxLangItem)))
         }
         ty::TyClosure(def_id, _) => {
             Some(ClosureSimplifiedType(def_id))
@@ -83,7 +81,7 @@ pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
             Some(TupleSimplifiedType(tys.len()))
         }
         ty::TyFnDef(.., ref f) | ty::TyFnPtr(ref f) => {
-            Some(FunctionSimplifiedType(f.sig.0.inputs.len()))
+            Some(FunctionSimplifiedType(f.sig.skip_binder().inputs().len()))
         }
         ty::TyProjection(_) | ty::TyParam(_) => {
             if can_simplify_params {

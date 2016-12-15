@@ -244,11 +244,13 @@ impl<T: ?Sized> Box<T> {
     /// the destructor of `T` and free the allocated memory. Since the
     /// way `Box` allocates and releases memory is unspecified, the
     /// only valid pointer to pass to this function is the one taken
-    /// from another `Box` via the `Box::into_raw` function.
+    /// from another `Box` via the [`Box::into_raw`] function.
     ///
     /// This function is unsafe because improper use may lead to
     /// memory problems. For example, a double-free may occur if the
     /// function is called twice on the same raw pointer.
+    ///
+    /// [`Box::into_raw`]: struct.Box.html#method.into_raw
     ///
     /// # Examples
     ///
@@ -269,11 +271,13 @@ impl<T: ?Sized> Box<T> {
     /// memory previously managed by the `Box`. In particular, the
     /// caller should properly destroy `T` and release the memory. The
     /// proper way to do so is to convert the raw pointer back into a
-    /// `Box` with the `Box::from_raw` function.
+    /// `Box` with the [`Box::from_raw`] function.
     ///
     /// Note: this is an associated function, which means that you have
     /// to call it as `Box::into_raw(b)` instead of `b.into_raw()`. This
     /// is so that there is no conflict with a method on the inner type.
+    ///
+    /// [`Box::from_raw`]: struct.Box.html#method.from_raw
     ///
     /// # Examples
     ///
@@ -520,6 +524,9 @@ impl<I: Iterator + ?Sized> Iterator for Box<I> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (**self).size_hint()
     }
+    fn nth(&mut self, n: usize) -> Option<I::Item> {
+        (**self).nth(n)
+    }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for Box<I> {
@@ -528,7 +535,14 @@ impl<I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for Box<I> {
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<I: ExactSizeIterator + ?Sized> ExactSizeIterator for Box<I> {}
+impl<I: ExactSizeIterator + ?Sized> ExactSizeIterator for Box<I> {
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn is_empty(&self) -> bool {
+        (**self).is_empty()
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<I: FusedIterator + ?Sized> FusedIterator for Box<I> {}

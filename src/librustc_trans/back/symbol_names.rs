@@ -99,7 +99,8 @@
 
 use common::SharedCrateContext;
 use monomorphize::Instance;
-use util::sha2::{Digest, Sha256};
+use rustc_data_structures::fmt_wrap::FmtWrap;
+use rustc_data_structures::blake2b::Blake2bHasher;
 
 use rustc::middle::weak_lang_items;
 use rustc::hir::def_id::LOCAL_CRATE;
@@ -112,22 +113,7 @@ use rustc::hir::map::definitions::{DefPath, DefPathData};
 use rustc::util::common::record_time;
 
 use syntax::attr;
-use syntax::parse::token::{self, InternedString};
-use serialize::hex::ToHex;
-
-use std::hash::Hasher;
-
-struct Sha256Hasher<'a>(&'a mut Sha256);
-
-impl<'a> Hasher for Sha256Hasher<'a> {
-    fn write(&mut self, msg: &[u8]) {
-        self.0.input(msg)
-    }
-
-    fn finish(&self) -> u64 {
-        bug!("Sha256Hasher::finish should not be called");
-    }
-}
+use syntax::symbol::{Symbol, InternedString};
 
 fn get_symbol_hash<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>,
 
@@ -149,20 +135,17 @@ fn get_symbol_hash<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>,
 
     let tcx = scx.tcx();
 
-    let mut hash_state = scx.symbol_hasher().borrow_mut();
-    record_time(&tcx.sess.perf_stats.symbol_hash_time, || {
-        hash_state.reset();
-        let mut hasher = Sha256Hasher(&mut hash_state);
+    let mut hasher = ty::util::TypeIdHasher::new(tcx, Blake2bHasher::new(8, &[]));
 
+    record_time(&tcx.sess.perf_stats.symbol_hash_time, || {
         // the main symbol name is not necessarily unique; hash in the
         // compiler's internal def-path, guaranteeing each symbol has a
         // truly unique path
-        def_path.deterministic_hash_to(tcx, &mut hasher);
+        hasher.def_path(def_path);
 
         // Include the main item-type. Note that, in this case, the
         // assertions about `needs_subst` may not hold, but this item-type
         // ought to be the same for every reference anyway.
-        let mut hasher = ty::util::TypeIdHasher::new(tcx, hasher);
         assert!(!item_type.has_erasable_regions());
         hasher.visit_ty(item_type);
 
@@ -175,8 +158,9 @@ fn get_symbol_hash<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>,
     });
 
     // 64 bits should be enough to avoid collisions.
-    let output = hash_state.result_bytes();
-    format!("h{}", output[..8].to_hex())
+    let mut hasher = hasher.into_inner();
+    let hash_bytes = hasher.finalize();
+    format!("h{:x}", FmtWrap(hash_bytes))
 }
 
 impl<'a, 'tcx> Instance<'tcx> {
@@ -247,7 +231,7 @@ impl<'a, 'tcx> Instance<'tcx> {
             match key.disambiguated_data.data {
                 DefPathData::TypeNs(_) |
                 DefPathData::ValueNs(_) => {
-                    instance_ty = scx.tcx().lookup_item_type(ty_def_id);
+                    instance_ty = scx.tcx().item_type(ty_def_id);
                     break;
                 }
                 _ => {
@@ -264,7 +248,7 @@ impl<'a, 'tcx> Instance<'tcx> {
 
         // Erase regions because they may not be deterministic when hashed
         // and should not matter anyhow.
-        let instance_ty = scx.tcx().erase_regions(&instance_ty.ty);
+        let instance_ty = scx.tcx().erase_regions(&instance_ty);
 
         let hash = get_symbol_hash(scx, &def_path, instance_ty, Some(substs));
 
@@ -291,7 +275,7 @@ impl ItemPathBuffer for SymbolPathBuffer {
     }
 
     fn push(&mut self, text: &str) {
-        self.names.push(token::intern(text).as_str());
+        self.names.push(Symbol::intern(text).as_str());
     }
 }
 
@@ -304,7 +288,7 @@ pub fn exported_name_from_type_and_prefix<'a, 'tcx>(scx: &SharedCrateContext<'a,
         krate: LOCAL_CRATE,
     };
     let hash = get_symbol_hash(scx, &empty_def_path, t, None);
-    let path = [token::intern_and_get_ident(prefix)];
+    let path = [Symbol::intern(prefix).as_str()];
     mangle(path.iter().cloned(), &hash)
 }
 

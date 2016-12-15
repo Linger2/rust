@@ -743,16 +743,8 @@ impl<T> VecDeque<T> {
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
     pub fn as_slices(&self) -> (&[T], &[T]) {
         unsafe {
-            let contiguous = self.is_contiguous();
             let buf = self.buffer_as_slice();
-            if contiguous {
-                let (empty, buf) = buf.split_at(0);
-                (&buf[self.tail..self.head], empty)
-            } else {
-                let (mid, right) = buf.split_at(self.tail);
-                let (left, _) = mid.split_at(self.head);
-                (right, left)
-            }
+            RingSlices::ring_slices(buf, self.head, self.tail)
         }
     }
 
@@ -780,20 +772,10 @@ impl<T> VecDeque<T> {
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
     pub fn as_mut_slices(&mut self) -> (&mut [T], &mut [T]) {
         unsafe {
-            let contiguous = self.is_contiguous();
             let head = self.head;
             let tail = self.tail;
             let buf = self.buffer_as_mut_slice();
-
-            if contiguous {
-                let (empty, buf) = buf.split_at_mut(0);
-                (&mut buf[tail..head], empty)
-            } else {
-                let (mid, right) = buf.split_at_mut(tail);
-                let (left, _) = mid.split_at_mut(head);
-
-                (right, left)
-            }
+            RingSlices::ring_slices(buf, head, tail)
         }
     }
 
@@ -828,7 +810,7 @@ impl<T> VecDeque<T> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.tail == self.head
     }
 
     /// Create a draining iterator that removes the specified range in the
@@ -1829,6 +1811,42 @@ fn wrap_index(index: usize, size: usize) -> usize {
     index & (size - 1)
 }
 
+/// Returns the two slices that cover the VecDeque's valid range
+trait RingSlices : Sized {
+    fn slice(self, from: usize, to: usize) -> Self;
+    fn split_at(self, i: usize) -> (Self, Self);
+
+    fn ring_slices(buf: Self, head: usize, tail: usize) -> (Self, Self) {
+        let contiguous = tail <= head;
+        if contiguous {
+            let (empty, buf) = buf.split_at(0);
+            (buf.slice(tail, head), empty)
+        } else {
+            let (mid, right) = buf.split_at(tail);
+            let (left, _) = mid.split_at(head);
+            (right, left)
+        }
+    }
+}
+
+impl<'a, T> RingSlices for &'a [T] {
+    fn slice(self, from: usize, to: usize) -> Self {
+        &self[from..to]
+    }
+    fn split_at(self, i: usize) -> (Self, Self) {
+        (*self).split_at(i)
+    }
+}
+
+impl<'a, T> RingSlices for &'a mut [T] {
+    fn slice(self, from: usize, to: usize) -> Self {
+        &mut self[from..to]
+    }
+    fn split_at(self, i: usize) -> (Self, Self) {
+        (*self).split_at_mut(i)
+    }
+}
+
 /// Calculate the number of elements left to be read in the buffer
 #[inline]
 fn count(tail: usize, head: usize, size: usize) -> usize {
@@ -1875,6 +1893,14 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let len = count(self.tail, self.head, self.ring.len());
         (len, Some(len))
     }
+
+    fn fold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc,
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = front.iter().fold(accum, &mut f);
+        back.iter().fold(accum, &mut f)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1890,7 +1916,11 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
+impl<'a, T> ExactSizeIterator for Iter<'a, T> {
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T> FusedIterator for Iter<'a, T> {}
@@ -1927,6 +1957,14 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         let len = count(self.tail, self.head, self.ring.len());
         (len, Some(len))
     }
+
+    fn fold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc,
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = front.iter_mut().fold(accum, &mut f);
+        back.iter_mut().fold(accum, &mut f)
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1946,7 +1984,11 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
+impl<'a, T> ExactSizeIterator for IterMut<'a, T> {
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<'a, T> FusedIterator for IterMut<'a, T> {}
@@ -1983,7 +2025,11 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> ExactSizeIterator for IntoIter<T> {}
+impl<T> ExactSizeIterator for IntoIter<T> {
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
 
 #[unstable(feature = "fused", issue = "35602")]
 impl<T> FusedIterator for IntoIter<T> {}
@@ -2002,7 +2048,7 @@ unsafe impl<'a, T: Sync> Sync for Drain<'a, T> {}
 #[stable(feature = "drain", since = "1.6.0")]
 unsafe impl<'a, T: Send> Send for Drain<'a, T> {}
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> Drop for Drain<'a, T> {
     fn drop(&mut self) {
         for _ in self.by_ref() {}
@@ -2051,7 +2097,7 @@ impl<'a, T: 'a> Drop for Drain<'a, T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> Iterator for Drain<'a, T> {
     type Item = T;
 
@@ -2066,7 +2112,7 @@ impl<'a, T: 'a> Iterator for Drain<'a, T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> DoubleEndedIterator for Drain<'a, T> {
     #[inline]
     fn next_back(&mut self) -> Option<T> {
@@ -2074,7 +2120,7 @@ impl<'a, T: 'a> DoubleEndedIterator for Drain<'a, T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "drain", since = "1.6.0")]
 impl<'a, T: 'a> ExactSizeIterator for Drain<'a, T> {}
 
 #[unstable(feature = "fused", issue = "35602")]

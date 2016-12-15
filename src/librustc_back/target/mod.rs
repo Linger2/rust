@@ -48,13 +48,14 @@ use serialize::json::{Json, ToJson};
 use std::collections::BTreeMap;
 use std::default::Default;
 use std::io::prelude::*;
-use syntax::abi::Abi;
+use syntax::abi::{Abi, lookup as lookup_abi};
 
 use PanicStrategy;
 
 mod android_base;
 mod apple_base;
 mod apple_ios_base;
+mod arm_base;
 mod bitrig_base;
 mod dragonfly_base;
 mod freebsd_base;
@@ -66,11 +67,13 @@ mod netbsd_base;
 mod solaris_base;
 mod windows_base;
 mod windows_msvc_base;
+mod thumb_base;
+mod fuchsia_base;
 
 pub type TargetResult = Result<Target, String>;
 
 macro_rules! supported_targets {
-    ( $(($triple:expr, $module:ident)),+ ) => (
+    ( $(($triple:expr, $module:ident),)+ ) => (
         $(mod $module;)*
 
         /// List of supported targets
@@ -142,6 +145,7 @@ supported_targets! {
     ("arm-unknown-linux-gnueabihf", arm_unknown_linux_gnueabihf),
     ("arm-unknown-linux-musleabi", arm_unknown_linux_musleabi),
     ("arm-unknown-linux-musleabihf", arm_unknown_linux_musleabihf),
+    ("armv5te-unknown-linux-gnueabi", armv5te_unknown_linux_gnueabi),
     ("armv7-unknown-linux-gnueabihf", armv7_unknown_linux_gnueabihf),
     ("armv7-unknown-linux-musleabihf", armv7_unknown_linux_musleabihf),
     ("aarch64-unknown-linux-gnu", aarch64_unknown_linux_gnu),
@@ -164,15 +168,21 @@ supported_targets! {
     ("x86_64-unknown-dragonfly", x86_64_unknown_dragonfly),
 
     ("x86_64-unknown-bitrig", x86_64_unknown_bitrig),
+
+    ("i686-unknown-openbsd", i686_unknown_openbsd),
     ("x86_64-unknown-openbsd", x86_64_unknown_openbsd),
+
     ("x86_64-unknown-netbsd", x86_64_unknown_netbsd),
     ("x86_64-rumprun-netbsd", x86_64_rumprun_netbsd),
 
-    ("i686_unknown_haiku", i686_unknown_haiku),
-    ("x86_64_unknown_haiku", x86_64_unknown_haiku),
+    ("i686-unknown-haiku", i686_unknown_haiku),
+    ("x86_64-unknown-haiku", x86_64_unknown_haiku),
 
     ("x86_64-apple-darwin", x86_64_apple_darwin),
     ("i686-apple-darwin", i686_apple_darwin),
+
+    ("aarch64-unknown-fuchsia", aarch64_unknown_fuchsia),
+    ("x86_64-unknown-fuchsia", x86_64_unknown_fuchsia),
 
     ("i386-apple-ios", i386_apple_ios),
     ("x86_64-apple-ios", x86_64_apple_ios),
@@ -190,7 +200,13 @@ supported_targets! {
     ("i586-pc-windows-msvc", i586_pc_windows_msvc),
 
     ("le32-unknown-nacl", le32_unknown_nacl),
-    ("asmjs-unknown-emscripten", asmjs_unknown_emscripten)
+    ("asmjs-unknown-emscripten", asmjs_unknown_emscripten),
+    ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
+
+    ("thumbv6m-none-eabi", thumbv6m_none_eabi),
+    ("thumbv7m-none-eabi", thumbv7m_none_eabi),
+    ("thumbv7em-none-eabi", thumbv7em_none_eabi),
+    ("thumbv7em-none-eabihf", thumbv7em_none_eabihf),
 }
 
 /// Everything `rustc` knows about how to compile for a specific target.
@@ -286,6 +302,9 @@ pub struct TargetOptions {
     pub staticlib_suffix: String,
     /// OS family to use for conditional compilation. Valid options: "unix", "windows".
     pub target_family: Option<String>,
+    /// Whether the target toolchain is like OpenBSD's.
+    /// Only useful for compiling against OpenBSD, for configuring abi when returning a struct.
+    pub is_like_openbsd: bool,
     /// Whether the target toolchain is like OSX's. Only useful for compiling against iOS/OS X, in
     /// particular running dsymutil and some other stuff like `-dead_strip`. Defaults to false.
     pub is_like_osx: bool,
@@ -346,12 +365,23 @@ pub struct TargetOptions {
     // will 'just work'.
     pub obj_is_bitcode: bool,
 
-    /// Maximum integer size in bits that this target can perform atomic
-    /// operations on.
-    pub max_atomic_width: u64,
+    // LLVM can't produce object files for this target. Instead, we'll make LLVM
+    // emit assembly and then use `gcc` to turn that assembly into an object
+    // file
+    pub no_integrated_as: bool,
+
+    /// Don't use this field; instead use the `.max_atomic_width()` method.
+    pub max_atomic_width: Option<u64>,
 
     /// Panic strategy: "unwind" or "abort"
     pub panic_strategy: PanicStrategy,
+
+    /// A blacklist of ABIs unsupported by the current target. Note that generic
+    /// ABIs are considered to be supported on all platforms and cannot be blacklisted.
+    pub abi_blacklist: Vec<Abi>,
+
+    /// Whether or not the CRT is statically linked by default.
+    pub crt_static_default: bool,
 }
 
 impl Default for TargetOptions {
@@ -379,6 +409,7 @@ impl Default for TargetOptions {
             staticlib_prefix: "lib".to_string(),
             staticlib_suffix: ".a".to_string(),
             target_family: None,
+            is_like_openbsd: false,
             is_like_osx: false,
             is_like_solaris: false,
             is_like_windows: false,
@@ -400,8 +431,11 @@ impl Default for TargetOptions {
             allow_asm: true,
             has_elf_tls: false,
             obj_is_bitcode: false,
-            max_atomic_width: 0,
+            no_integrated_as: false,
+            max_atomic_width: None,
             panic_strategy: PanicStrategy::Unwind,
+            abi_blacklist: vec![],
+            crt_static_default: false,
         }
     }
 }
@@ -419,6 +453,16 @@ impl Target {
             },
             abi => abi
         }
+    }
+
+    /// Maximum integer size in bits that this target can perform atomic
+    /// operations on.
+    pub fn max_atomic_width(&self) -> u64 {
+        self.options.max_atomic_width.unwrap_or(self.target_pointer_width.parse().unwrap())
+    }
+
+    pub fn is_abi_supported(&self, abi: Abi) -> bool {
+        abi.generic() || !self.options.abi_blacklist.contains(&abi)
     }
 
     /// Load a target descriptor from a JSON object.
@@ -459,9 +503,6 @@ impl Target {
             options: Default::default(),
         };
 
-        // Default max-atomic-width to target-pointer-width
-        base.options.max_atomic_width = base.target_pointer_width.parse().unwrap();
-
         macro_rules! key {
             ($key_name:ident) => ( {
                 let name = (stringify!($key_name)).replace("_", "-");
@@ -474,11 +515,11 @@ impl Target {
                     .map(|o| o.as_boolean()
                          .map(|s| base.options.$key_name = s));
             } );
-            ($key_name:ident, u64) => ( {
+            ($key_name:ident, Option<u64>) => ( {
                 let name = (stringify!($key_name)).replace("_", "-");
                 obj.find(&name[..])
                     .map(|o| o.as_u64()
-                         .map(|s| base.options.$key_name = s));
+                         .map(|s| base.options.$key_name = Some(s)));
             } );
             ($key_name:ident, PanicStrategy) => ( {
                 let name = (stringify!($key_name)).replace("_", "-");
@@ -535,6 +576,7 @@ impl Target {
         key!(staticlib_prefix);
         key!(staticlib_suffix);
         key!(target_family, optional);
+        key!(is_like_openbsd, bool);
         key!(is_like_osx, bool);
         key!(is_like_solaris, bool);
         key!(is_like_windows, bool);
@@ -552,8 +594,26 @@ impl Target {
         key!(exe_allocation_crate);
         key!(has_elf_tls, bool);
         key!(obj_is_bitcode, bool);
-        key!(max_atomic_width, u64);
+        key!(no_integrated_as, bool);
+        key!(max_atomic_width, Option<u64>);
         try!(key!(panic_strategy, PanicStrategy));
+        key!(crt_static_default, bool);
+
+        if let Some(array) = obj.find("abi-blacklist").and_then(Json::as_array) {
+            for name in array.iter().filter_map(|abi| abi.as_string()) {
+                match lookup_abi(name) {
+                    Some(abi) => {
+                        if abi.generic() {
+                            return Err(format!("The ABI \"{}\" is considered to be supported on \
+                                                all targets and cannot be blacklisted", abi))
+                        }
+
+                        base.options.abi_blacklist.push(abi)
+                    }
+                    None => return Err(format!("Unknown ABI \"{}\" in target specification", name))
+                }
+            }
+        }
 
         Ok(base)
     }
@@ -678,6 +738,7 @@ impl ToJson for Target {
         target_option_val!(staticlib_prefix);
         target_option_val!(staticlib_suffix);
         target_option_val!(target_family);
+        target_option_val!(is_like_openbsd);
         target_option_val!(is_like_osx);
         target_option_val!(is_like_solaris);
         target_option_val!(is_like_windows);
@@ -695,8 +756,16 @@ impl ToJson for Target {
         target_option_val!(exe_allocation_crate);
         target_option_val!(has_elf_tls);
         target_option_val!(obj_is_bitcode);
+        target_option_val!(no_integrated_as);
         target_option_val!(max_atomic_width);
         target_option_val!(panic_strategy);
+        target_option_val!(crt_static_default);
+
+        if default.abi_blacklist != self.options.abi_blacklist {
+            d.insert("abi-blacklist".to_string(), self.options.abi_blacklist.iter()
+                .map(Abi::name).map(|name| name.to_json())
+                .collect::<Vec<_>>().to_json());
+        }
 
         Json::Object(d)
     }

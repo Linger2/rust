@@ -13,7 +13,7 @@
  * building is complete.
  */
 
-use mir::repr::*;
+use mir::*;
 use ty::subst::{Subst, Substs};
 use ty::{self, AdtDef, Ty, TyCtxt};
 use ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
@@ -25,7 +25,7 @@ pub enum LvalueTy<'tcx> {
     Ty { ty: Ty<'tcx> },
 
     /// Downcast to a particular variant of an enum.
-    Downcast { adt_def: AdtDef<'tcx>,
+    Downcast { adt_def: &'tcx AdtDef,
                substs: &'tcx Substs<'tcx>,
                variant_index: usize },
 }
@@ -125,7 +125,7 @@ impl<'tcx> Lvalue<'tcx> {
             Lvalue::Local(index) =>
                 LvalueTy::Ty { ty: mir.local_decls[index].ty },
             Lvalue::Static(def_id) =>
-                LvalueTy::Ty { ty: tcx.lookup_item_type(def_id).ty },
+                LvalueTy::Ty { ty: tcx.item_type(def_id) },
             Lvalue::Projection(ref proj) =>
                 proj.base.ty(mir, tcx).projection_ty(tcx, &proj.elem),
         }
@@ -163,7 +163,7 @@ impl<'tcx> Rvalue<'tcx> {
                 let lhs_ty = lhs.ty(mir, tcx);
                 let rhs_ty = rhs.ty(mir, tcx);
                 let ty = op.ty(tcx, lhs_ty, rhs_ty);
-                let ty = tcx.mk_tup(vec![ty, tcx.types.bool]);
+                let ty = tcx.intern_tup(&[ty, tcx.types.bool]);
                 Some(ty)
             }
             &Rvalue::UnaryOp(_, ref operand) => {
@@ -174,7 +174,7 @@ impl<'tcx> Rvalue<'tcx> {
             }
             &Rvalue::Aggregate(ref ak, ref ops) => {
                 match *ak {
-                    AggregateKind::Vec => {
+                    AggregateKind::Array => {
                         if let Some(operand) = ops.get(0) {
                             let ty = operand.ty(mir, tcx);
                             Some(tcx.mk_array(ty, ops.len()))
@@ -184,11 +184,11 @@ impl<'tcx> Rvalue<'tcx> {
                     }
                     AggregateKind::Tuple => {
                         Some(tcx.mk_tup(
-                            ops.iter().map(|op| op.ty(mir, tcx)).collect()
+                            ops.iter().map(|op| op.ty(mir, tcx))
                         ))
                     }
                     AggregateKind::Adt(def, _, substs, _) => {
-                        Some(tcx.lookup_item_type(def.did).ty.subst(tcx, substs))
+                        Some(tcx.item_type(def.did).subst(tcx, substs))
                     }
                     AggregateKind::Closure(did, substs) => {
                         Some(tcx.mk_closure_from_closure_substs(did, substs))

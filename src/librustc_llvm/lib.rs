@@ -24,14 +24,17 @@
 
 #![feature(associated_consts)]
 #![feature(box_syntax)]
+#![feature(concat_idents)]
 #![feature(libc)]
 #![feature(link_args)]
+#![cfg_attr(stage0, feature(linked_from))]
 #![feature(staged_api)]
-#![feature(linked_from)]
-#![feature(concat_idents)]
+#![cfg_attr(not(stage0), feature(rustc_private))]
 
 extern crate libc;
-#[macro_use] #[no_link] extern crate rustc_bitflags;
+#[macro_use]
+#[no_link]
+extern crate rustc_bitflags;
 
 pub use self::IntPredicate::*;
 pub use self::RealPredicate::*;
@@ -65,70 +68,15 @@ impl LLVMRustResult {
     }
 }
 
-#[derive(Copy, Clone, Default, Debug)]
-pub struct Attributes {
-    regular: Attribute,
-    dereferenceable_bytes: u64
-}
-
-impl Attributes {
-    pub fn set(&mut self, attr: Attribute) -> &mut Self {
-        self.regular = self.regular | attr;
-        self
-    }
-
-    pub fn unset(&mut self, attr: Attribute) -> &mut Self {
-        self.regular = self.regular - attr;
-        self
-    }
-
-    pub fn set_dereferenceable(&mut self, bytes: u64) -> &mut Self {
-        self.dereferenceable_bytes = bytes;
-        self
-    }
-
-    pub fn unset_dereferenceable(&mut self) -> &mut Self {
-        self.dereferenceable_bytes = 0;
-        self
-    }
-
-    pub fn apply_llfn(&self, idx: AttributePlace, llfn: ValueRef) {
-        unsafe {
-            self.regular.apply_llfn(idx, llfn);
-            if self.dereferenceable_bytes != 0 {
-                LLVMRustAddDereferenceableAttr(
-                    llfn,
-                    idx.as_uint(),
-                    self.dereferenceable_bytes);
-            }
-        }
-    }
-
-    pub fn apply_callsite(&self, idx: AttributePlace, callsite: ValueRef) {
-        unsafe {
-            self.regular.apply_callsite(idx, callsite);
-            if self.dereferenceable_bytes != 0 {
-                LLVMRustAddDereferenceableCallSiteAttr(
-                    callsite,
-                    idx.as_uint(),
-                    self.dereferenceable_bytes);
-            }
-        }
-    }
-}
-
-pub fn AddFunctionAttrStringValue(
-    llfn: ValueRef,
-    idx: AttributePlace,
-    attr: &'static str,
-    value: &'static str
-) {
+pub fn AddFunctionAttrStringValue(llfn: ValueRef,
+                                  idx: AttributePlace,
+                                  attr: &CStr,
+                                  value: &CStr) {
     unsafe {
-        LLVMRustAddFunctionAttrStringValue(
-            llfn,
-            idx.as_uint(),
-            attr.as_ptr() as *const _,
-            value.as_ptr() as *const _)
+        LLVMRustAddFunctionAttrStringValue(llfn,
+                                           idx.as_uint(),
+                                           attr.as_ptr(),
+                                           value.as_ptr())
     }
 }
 
@@ -144,7 +92,7 @@ impl AttributePlace {
         AttributePlace::Argument(0)
     }
 
-    fn as_uint(self) -> c_uint {
+    pub fn as_uint(self) -> c_uint {
         match self {
             AttributePlace::Function => !0,
             AttributePlace::Argument(i) => i,
@@ -233,44 +181,30 @@ pub fn set_thread_local(global: ValueRef, is_thread_local: bool) {
 
 impl Attribute {
     pub fn apply_llfn(&self, idx: AttributePlace, llfn: ValueRef) {
-        unsafe {
-            LLVMRustAddFunctionAttribute(
-                llfn, idx.as_uint(), self.bits())
-        }
+        unsafe { LLVMRustAddFunctionAttribute(llfn, idx.as_uint(), *self) }
     }
 
     pub fn apply_callsite(&self, idx: AttributePlace, callsite: ValueRef) {
-        unsafe {
-            LLVMRustAddCallSiteAttribute(
-                callsite, idx.as_uint(), self.bits())
-        }
+        unsafe { LLVMRustAddCallSiteAttribute(callsite, idx.as_uint(), *self) }
     }
 
     pub fn unapply_llfn(&self, idx: AttributePlace, llfn: ValueRef) {
-        unsafe {
-            LLVMRustRemoveFunctionAttributes(
-                llfn, idx.as_uint(), self.bits())
-        }
+        unsafe { LLVMRustRemoveFunctionAttributes(llfn, idx.as_uint(), *self) }
     }
 
-    pub fn toggle_llfn(&self,
-                       idx: AttributePlace,
-                       llfn: ValueRef,
-                       set: bool)
-    {
+    pub fn toggle_llfn(&self, idx: AttributePlace, llfn: ValueRef, set: bool) {
         if set {
             self.apply_llfn(idx, llfn);
         } else {
             self.unapply_llfn(idx, llfn);
         }
     }
-
 }
 
-/* Memory-managed interface to target data. */
+// Memory-managed interface to target data.
 
 pub struct TargetData {
-    pub lltd: TargetDataRef
+    pub lltd: TargetDataRef,
 }
 
 impl Drop for TargetData {
@@ -283,12 +217,10 @@ impl Drop for TargetData {
 
 pub fn mk_target_data(string_rep: &str) -> TargetData {
     let string_rep = CString::new(string_rep).unwrap();
-    TargetData {
-        lltd: unsafe { LLVMCreateTargetData(string_rep.as_ptr()) }
-    }
+    TargetData { lltd: unsafe { LLVMCreateTargetData(string_rep.as_ptr()) } }
 }
 
-/* Memory-managed interface to object files. */
+// Memory-managed interface to object files.
 
 pub struct ObjectFile {
     pub llof: ObjectFileRef,
@@ -301,12 +233,10 @@ impl ObjectFile {
             let llof = LLVMCreateObjectFile(llmb);
             if llof as isize == 0 {
                 // LLVMCreateObjectFile took ownership of llmb
-                return None
+                return None;
             }
 
-            Some(ObjectFile {
-                llof: llof,
-            })
+            Some(ObjectFile { llof: llof })
         }
     }
 }
@@ -319,10 +249,10 @@ impl Drop for ObjectFile {
     }
 }
 
-/* Memory-managed interface to section iterators. */
+// Memory-managed interface to section iterators.
 
 pub struct SectionIter {
-    pub llsi: SectionIteratorRef
+    pub llsi: SectionIteratorRef,
 }
 
 impl Drop for SectionIter {
@@ -334,11 +264,7 @@ impl Drop for SectionIter {
 }
 
 pub fn mk_section_iter(llof: ObjectFileRef) -> SectionIter {
-    unsafe {
-        SectionIter {
-            llsi: LLVMGetSections(llof)
-        }
-    }
+    unsafe { SectionIter { llsi: LLVMGetSections(llof) } }
 }
 
 /// Safe wrapper around `LLVMGetParam`, because segfaults are no fun.
@@ -361,15 +287,16 @@ pub fn get_params(llfn: ValueRef) -> Vec<ValueRef> {
     }
 }
 
-pub fn build_string<F>(f: F) -> Option<String> where F: FnOnce(RustStringRef){
+pub fn build_string<F>(f: F) -> Option<String>
+    where F: FnOnce(RustStringRef)
+{
     let mut buf = RefCell::new(Vec::new());
     f(&mut buf as RustStringRepr as RustStringRef);
     String::from_utf8(buf.into_inner()).ok()
 }
 
 pub unsafe fn twine_to_string(tr: TwineRef) -> String {
-    build_string(|s| LLVMRustWriteTwineToString(tr, s))
-        .expect("got a non-UTF8 Twine from LLVM")
+    build_string(|s| LLVMRustWriteTwineToString(tr, s)).expect("got a non-UTF8 Twine from LLVM")
 }
 
 pub unsafe fn debug_loc_to_string(c: ContextRef, tr: DebugLocRef) -> String {
@@ -434,6 +361,15 @@ pub fn initialize_available_targets() {
                  LLVMInitializeSystemZTargetMC,
                  LLVMInitializeSystemZAsmPrinter,
                  LLVMInitializeSystemZAsmParser);
+    init_target!(llvm_component = "jsbackend",
+                 LLVMInitializeJSBackendTargetInfo,
+                 LLVMInitializeJSBackendTarget,
+                 LLVMInitializeJSBackendTargetMC);
+    init_target!(llvm_component = "msp430",
+                 LLVMInitializeMSP430TargetInfo,
+                 LLVMInitializeMSP430Target,
+                 LLVMInitializeMSP430TargetMC,
+                 LLVMInitializeMSP430AsmPrinter);
 }
 
 pub fn last_error() -> Option<String> {
@@ -458,9 +394,7 @@ impl OperandBundleDef {
     pub fn new(name: &str, vals: &[ValueRef]) -> OperandBundleDef {
         let name = CString::new(name).unwrap();
         let def = unsafe {
-            LLVMRustBuildOperandBundleDef(name.as_ptr(),
-                                          vals.as_ptr(),
-                                          vals.len() as c_uint)
+            LLVMRustBuildOperandBundleDef(name.as_ptr(), vals.as_ptr(), vals.len() as c_uint)
         };
         OperandBundleDef { inner: def }
     }

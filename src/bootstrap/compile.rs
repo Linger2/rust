@@ -64,8 +64,8 @@ pub fn std<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
     }
 
     build.run(&mut cargo);
-    update_mtime(&libstd_stamp(build, compiler, target));
-    std_link(build, target, compiler, compiler.host);
+    update_mtime(&libstd_stamp(build, &compiler, target));
+    std_link(build, target, compiler.stage, compiler.host);
 }
 
 /// Link all libstd rlibs/dylibs into the sysroot location.
@@ -74,11 +74,12 @@ pub fn std<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
 /// by `compiler` into `host`'s sysroot.
 pub fn std_link(build: &Build,
                 target: &str,
-                compiler: &Compiler,
+                stage: u32,
                 host: &str) {
+    let compiler = Compiler::new(stage, &build.config.build);
     let target_compiler = Compiler::new(compiler.stage, host);
     let libdir = build.sysroot_libdir(&target_compiler, target);
-    let out_dir = build.cargo_out(compiler, Mode::Libstd, target);
+    let out_dir = build.cargo_out(&compiler, Mode::Libstd, target);
 
     // If we're linking one compiler host's output into another, then we weren't
     // called from the `std` method above. In that case we clean out what's
@@ -90,16 +91,16 @@ pub fn std_link(build: &Build,
     add_to_sysroot(&out_dir, &libdir);
 
     if target.contains("musl") && !target.contains("mips") {
-        copy_musl_third_party_objects(build, &libdir);
+        copy_musl_third_party_objects(build, target, &libdir);
     }
 }
 
 /// Copies the crt(1,i,n).o startup objects
 ///
 /// Only required for musl targets that statically link to libc
-fn copy_musl_third_party_objects(build: &Build, into: &Path) {
+fn copy_musl_third_party_objects(build: &Build, target: &str, into: &Path) {
     for &obj in &["crt1.o", "crti.o", "crtn.o"] {
-        copy(&build.config.musl_root.as_ref().unwrap().join("lib").join(obj), &into.join(obj));
+        copy(&build.musl_root(target).unwrap().join("lib").join(obj), &into.join(obj));
     }
 }
 
@@ -119,8 +120,8 @@ fn build_startup_objects(build: &Build, target: &str, into: &Path) {
     for file in t!(fs::read_dir(build.src.join("src/rtstartup"))) {
         let file = t!(file);
         let mut cmd = Command::new(&compiler_path);
-        build.add_bootstrap_key(&compiler, &mut cmd);
-        build.run(cmd.arg("--target").arg(target)
+        build.run(cmd.env("RUSTC_BOOTSTRAP", "1")
+                     .arg("--target").arg(target)
                      .arg("--emit=obj")
                      .arg("--out-dir").arg(into)
                      .arg(file.path()));
@@ -146,7 +147,7 @@ pub fn test<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
          .arg(build.src.join("src/rustc/test_shim/Cargo.toml"));
     build.run(&mut cargo);
     update_mtime(&libtest_stamp(build, compiler, target));
-    test_link(build, target, compiler, compiler.host);
+    test_link(build, target, compiler.stage, compiler.host);
 }
 
 /// Link all libtest rlibs/dylibs into the sysroot location.
@@ -155,11 +156,12 @@ pub fn test<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
 /// by `compiler` into `host`'s sysroot.
 pub fn test_link(build: &Build,
                  target: &str,
-                 compiler: &Compiler,
+                 stage: u32,
                  host: &str) {
+    let compiler = Compiler::new(stage, &build.config.build);
     let target_compiler = Compiler::new(compiler.stage, host);
     let libdir = build.sysroot_libdir(&target_compiler, target);
-    let out_dir = build.cargo_out(compiler, Mode::Libtest, target);
+    let out_dir = build.cargo_out(&compiler, Mode::Libtest, target);
     add_to_sysroot(&out_dir, &libdir);
 }
 
@@ -185,7 +187,6 @@ pub fn rustc<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
     cargo.env("CFG_RELEASE", &build.release)
          .env("CFG_RELEASE_CHANNEL", &build.config.channel)
          .env("CFG_VERSION", &build.version)
-         .env("CFG_BOOTSTRAP_KEY", &build.bootstrap_key)
          .env("CFG_PREFIX", build.config.prefix.clone().unwrap_or(String::new()))
          .env("CFG_LIBDIR_RELATIVE", "lib");
 
@@ -211,6 +212,9 @@ pub fn rustc<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
         cargo.env("LLVM_STATIC_STDCPP",
                   compiler_file(build.cxx(target), "libstdc++.a"));
     }
+    if build.config.llvm_link_shared {
+        cargo.env("LLVM_LINK_SHARED", "1");
+    }
     if let Some(ref s) = build.config.rustc_default_linker {
         cargo.env("CFG_DEFAULT_LINKER", s);
     }
@@ -219,7 +223,7 @@ pub fn rustc<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
     }
     build.run(&mut cargo);
 
-    rustc_link(build, target, compiler, compiler.host);
+    rustc_link(build, target, compiler.stage, compiler.host);
 }
 
 /// Link all librustc rlibs/dylibs into the sysroot location.
@@ -228,11 +232,12 @@ pub fn rustc<'a>(build: &'a Build, target: &str, compiler: &Compiler<'a>) {
 /// by `compiler` into `host`'s sysroot.
 pub fn rustc_link(build: &Build,
                   target: &str,
-                  compiler: &Compiler,
+                  stage: u32,
                   host: &str) {
+    let compiler = Compiler::new(stage, &build.config.build);
     let target_compiler = Compiler::new(compiler.stage, host);
     let libdir = build.sysroot_libdir(&target_compiler, target);
-    let out_dir = build.cargo_out(compiler, Mode::Librustc, target);
+    let out_dir = build.cargo_out(&compiler, Mode::Librustc, target);
     add_to_sysroot(&out_dir, &libdir);
 }
 
@@ -260,7 +265,10 @@ fn compiler_file(compiler: &Path, file: &str) -> PathBuf {
 /// must have been previously produced by the `stage - 1` build.config.build
 /// compiler.
 pub fn assemble_rustc(build: &Build, stage: u32, host: &str) {
-    assert!(stage > 0, "the stage0 compiler isn't assembled, it's downloaded");
+    // nothing to do in stage0
+    if stage == 0 {
+        return
+    }
     // The compiler that we're assembling
     let target_compiler = Compiler::new(stage, host);
 

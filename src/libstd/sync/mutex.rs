@@ -133,7 +133,14 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> { }
 /// dropped (falls out of scope), the lock will be unlocked.
 ///
 /// The data protected by the mutex can be access through this guard via its
-/// `Deref` and `DerefMut` implementations
+/// `Deref` and `DerefMut` implementations.
+///
+/// This structure is created by the [`lock()`] and [`try_lock()`] methods on
+/// [`Mutex`].
+///
+/// [`lock()`]: struct.Mutex.html#method.lock
+/// [`try_lock()`]: struct.Mutex.html#method.try_lock
+/// [`Mutex`]: struct.Mutex.html
 #[must_use]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
@@ -352,7 +359,7 @@ pub fn guard_poison<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a poison::Fla
     &guard.__lock.poison
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "emscripten")))]
 mod tests {
     use sync::mpsc::channel;
     use sync::{Arc, Mutex, Condvar};

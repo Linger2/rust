@@ -33,6 +33,7 @@ pub mod rt {
     use parse::{self, token, classify};
     use ptr::P;
     use std::rc::Rc;
+    use symbol::Symbol;
 
     use tokenstream::{self, TokenTree};
 
@@ -46,7 +47,7 @@ pub mod rt {
 
     impl ToTokens for TokenTree {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec!(self.clone())
+            vec![self.clone()]
         }
     }
 
@@ -80,67 +81,71 @@ pub mod rt {
 
     impl ToTokens for ast::Path {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP,
-                                  token::Interpolated(token::NtPath(Box::new(self.clone()))))]
+            let nt = token::NtPath(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Ty {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtTy(P(self.clone()))))]
+            let nt = token::NtTy(P(self.clone()));
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Block {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtBlock(P(self.clone()))))]
+            let nt = token::NtBlock(P(self.clone()));
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Generics {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(token::NtGenerics(self.clone())))]
+            let nt = token::NtGenerics(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::WhereClause {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP,
-                                  token::Interpolated(token::NtWhereClause(self.clone())))]
+            let nt = token::NtWhereClause(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for P<ast::Item> {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtItem(self.clone())))]
+            let nt = token::NtItem(self.clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::ImplItem {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span,
-                                  token::Interpolated(token::NtImplItem(P(self.clone()))))]
+            let nt = token::NtImplItem(self.clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for P<ast::ImplItem> {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtImplItem(self.clone())))]
+            let nt = token::NtImplItem((**self).clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::TraitItem {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span,
-                                  token::Interpolated(token::NtTraitItem(P(self.clone()))))]
+            let nt = token::NtTraitItem(self.clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Stmt {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            let mut tts = vec![
-                TokenTree::Token(self.span, token::Interpolated(token::NtStmt(P(self.clone()))))
-            ];
+            let nt = token::NtStmt(self.clone());
+            let mut tts = vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))];
 
             // Some statements require a trailing semicolon.
             if classify::stmt_ends_with_semi(&self.node) {
@@ -153,31 +158,36 @@ pub mod rt {
 
     impl ToTokens for P<ast::Expr> {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtExpr(self.clone())))]
+            let nt = token::NtExpr(self.clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for P<ast::Pat> {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(self.span, token::Interpolated(token::NtPat(self.clone())))]
+            let nt = token::NtPat(self.clone());
+            vec![TokenTree::Token(self.span, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Arm {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(token::NtArm(self.clone())))]
+            let nt = token::NtArm(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for ast::Arg {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(token::NtArg(self.clone())))]
+            let nt = token::NtArg(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
     impl ToTokens for P<ast::Block> {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(token::NtBlock(self.clone())))]
+            let nt = token::NtBlock(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
@@ -202,9 +212,10 @@ pub mod rt {
     impl_to_tokens_slice! { P<ast::Item>, [] }
     impl_to_tokens_slice! { ast::Arg, [TokenTree::Token(DUMMY_SP, token::Comma)] }
 
-    impl ToTokens for P<ast::MetaItem> {
+    impl ToTokens for ast::MetaItem {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(token::NtMeta(self.clone())))]
+            let nt = token::NtMeta(self.clone());
+            vec![TokenTree::Token(DUMMY_SP, token::Interpolated(Rc::new(nt)))]
         }
     }
 
@@ -213,13 +224,13 @@ pub mod rt {
             let mut r = vec![];
             // FIXME: The spans could be better
             r.push(TokenTree::Token(self.span, token::Pound));
-            if self.node.style == ast::AttrStyle::Inner {
+            if self.style == ast::AttrStyle::Inner {
                 r.push(TokenTree::Token(self.span, token::Not));
             }
             r.push(TokenTree::Delimited(self.span, Rc::new(tokenstream::Delimited {
                 delim: token::Bracket,
                 open_span: self.span,
-                tts: self.node.value.to_tokens(cx),
+                tts: self.value.to_tokens(cx),
                 close_span: self.span,
             })));
             r
@@ -228,8 +239,7 @@ pub mod rt {
 
     impl ToTokens for str {
         fn to_tokens(&self, cx: &ExtCtxt) -> Vec<TokenTree> {
-            let lit = ast::LitKind::Str(
-                token::intern_and_get_ident(self), ast::StrStyle::Cooked);
+            let lit = ast::LitKind::Str(Symbol::intern(self), ast::StrStyle::Cooked);
             dummy_spanned(lit).to_tokens(cx)
         }
     }
@@ -331,7 +341,6 @@ pub mod rt {
             panictry!(parse::parse_item_from_source_str(
                 "<quote expansion>".to_string(),
                 s,
-                self.cfg(),
                 self.parse_sess())).expect("parse error")
         }
 
@@ -339,7 +348,6 @@ pub mod rt {
             panictry!(parse::parse_stmt_from_source_str(
                 "<quote expansion>".to_string(),
                 s,
-                self.cfg(),
                 self.parse_sess())).expect("parse error")
         }
 
@@ -347,7 +355,6 @@ pub mod rt {
             panictry!(parse::parse_expr_from_source_str(
                 "<quote expansion>".to_string(),
                 s,
-                self.cfg(),
                 self.parse_sess()))
         }
 
@@ -355,7 +362,6 @@ pub mod rt {
             panictry!(parse::parse_tts_from_source_str(
                 "<quote expansion>".to_string(),
                 s,
-                self.cfg(),
                 self.parse_sess()))
         }
     }
@@ -399,7 +405,7 @@ pub fn parse_block_panic(parser: &mut Parser) -> P<Block> {
     panictry!(parser.parse_block())
 }
 
-pub fn parse_meta_item_panic(parser: &mut Parser) -> P<ast::MetaItem> {
+pub fn parse_meta_item_panic(parser: &mut Parser) -> ast::MetaItem {
     panictry!(parser.parse_meta_item())
 }
 
@@ -420,7 +426,7 @@ pub fn expand_quote_expr<'cx>(cx: &'cx mut ExtCtxt,
                               sp: Span,
                               tts: &[TokenTree])
                               -> Box<base::MacResult+'cx> {
-    let expanded = expand_parse_call(cx, sp, "parse_expr_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_expr_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -428,7 +434,7 @@ pub fn expand_quote_item<'cx>(cx: &'cx mut ExtCtxt,
                               sp: Span,
                               tts: &[TokenTree])
                               -> Box<base::MacResult+'cx> {
-    let expanded = expand_parse_call(cx, sp, "parse_item_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_item_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -436,7 +442,7 @@ pub fn expand_quote_pat<'cx>(cx: &'cx mut ExtCtxt,
                              sp: Span,
                              tts: &[TokenTree])
                              -> Box<base::MacResult+'cx> {
-    let expanded = expand_parse_call(cx, sp, "parse_pat_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_pat_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -444,7 +450,7 @@ pub fn expand_quote_arm(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
                         -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_arm_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_arm_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -452,7 +458,7 @@ pub fn expand_quote_ty(cx: &mut ExtCtxt,
                        sp: Span,
                        tts: &[TokenTree])
                        -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_ty_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_ty_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -460,7 +466,7 @@ pub fn expand_quote_stmt(cx: &mut ExtCtxt,
                          sp: Span,
                          tts: &[TokenTree])
                          -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_stmt_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_stmt_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -469,7 +475,7 @@ pub fn expand_quote_attr(cx: &mut ExtCtxt,
                          tts: &[TokenTree])
                          -> Box<base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_attribute_panic",
-                                    vec!(cx.expr_bool(sp, true)), tts);
+                                    vec![cx.expr_bool(sp, true)], tts);
 
     base::MacEager::expr(expanded)
 }
@@ -478,7 +484,7 @@ pub fn expand_quote_arg(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
                         -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_arg_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_arg_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -486,7 +492,7 @@ pub fn expand_quote_block(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
                         -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_block_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_block_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -494,7 +500,7 @@ pub fn expand_quote_meta_item(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
                         -> Box<base::MacResult+'static> {
-    let expanded = expand_parse_call(cx, sp, "parse_meta_item_panic", vec!(), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_meta_item_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -503,7 +509,7 @@ pub fn expand_quote_path(cx: &mut ExtCtxt,
                         tts: &[TokenTree])
                         -> Box<base::MacResult+'static> {
     let mode = mk_parser_path(cx, sp, &["PathStyle", "Type"]);
-    let expanded = expand_parse_call(cx, sp, "parse_path_panic", vec!(mode), tts);
+    let expanded = expand_parse_call(cx, sp, "parse_path_panic", vec![mode], tts);
     base::MacEager::expr(expanded)
 }
 
@@ -521,39 +527,39 @@ pub fn expand_quote_matcher(cx: &mut ExtCtxt,
     base::MacEager::expr(expanded)
 }
 
-fn ids_ext(strs: Vec<String> ) -> Vec<ast::Ident> {
-    strs.iter().map(|str| str_to_ident(&(*str))).collect()
+fn ids_ext(strs: Vec<String>) -> Vec<ast::Ident> {
+    strs.iter().map(|s| ast::Ident::from_str(s)).collect()
 }
 
-fn id_ext(str: &str) -> ast::Ident {
-    str_to_ident(str)
+fn id_ext(s: &str) -> ast::Ident {
+    ast::Ident::from_str(s)
 }
 
 // Lift an ident to the expr that evaluates to that ident.
 fn mk_ident(cx: &ExtCtxt, sp: Span, ident: ast::Ident) -> P<ast::Expr> {
-    let e_str = cx.expr_str(sp, ident.name.as_str());
+    let e_str = cx.expr_str(sp, ident.name);
     cx.expr_method_call(sp,
                         cx.expr_ident(sp, id_ext("ext_cx")),
                         id_ext("ident_of"),
-                        vec!(e_str))
+                        vec![e_str])
 }
 
 // Lift a name to the expr that evaluates to that name
 fn mk_name(cx: &ExtCtxt, sp: Span, ident: ast::Ident) -> P<ast::Expr> {
-    let e_str = cx.expr_str(sp, ident.name.as_str());
+    let e_str = cx.expr_str(sp, ident.name);
     cx.expr_method_call(sp,
                         cx.expr_ident(sp, id_ext("ext_cx")),
                         id_ext("name_of"),
-                        vec!(e_str))
+                        vec![e_str])
 }
 
 fn mk_tt_path(cx: &ExtCtxt, sp: Span, name: &str) -> P<ast::Expr> {
-    let idents = vec!(id_ext("syntax"), id_ext("tokenstream"), id_ext("TokenTree"), id_ext(name));
+    let idents = vec![id_ext("syntax"), id_ext("tokenstream"), id_ext("TokenTree"), id_ext(name)];
     cx.expr_path(cx.path_global(sp, idents))
 }
 
 fn mk_token_path(cx: &ExtCtxt, sp: Span, name: &str) -> P<ast::Expr> {
-    let idents = vec!(id_ext("syntax"), id_ext("parse"), id_ext("token"), id_ext(name));
+    let idents = vec![id_ext("syntax"), id_ext("parse"), id_ext("token"), id_ext(name)];
     cx.expr_path(cx.path_global(sp, idents))
 }
 
@@ -603,11 +609,11 @@ fn expr_mk_token(cx: &ExtCtxt, sp: Span, tok: &token::Token) -> P<ast::Expr> {
     }
     match *tok {
         token::BinOp(binop) => {
-            return cx.expr_call(sp, mk_token_path(cx, sp, "BinOp"), vec!(mk_binop(cx, sp, binop)));
+            return cx.expr_call(sp, mk_token_path(cx, sp, "BinOp"), vec![mk_binop(cx, sp, binop)]);
         }
         token::BinOpEq(binop) => {
             return cx.expr_call(sp, mk_token_path(cx, sp, "BinOpEq"),
-                                vec!(mk_binop(cx, sp, binop)));
+                                vec![mk_binop(cx, sp, binop)]);
         }
 
         token::OpenDelim(delim) => {
@@ -657,13 +663,13 @@ fn expr_mk_token(cx: &ExtCtxt, sp: Span, tok: &token::Token) -> P<ast::Expr> {
         token::Lifetime(ident) => {
             return cx.expr_call(sp,
                                 mk_token_path(cx, sp, "Lifetime"),
-                                vec!(mk_ident(cx, sp, ident)));
+                                vec![mk_ident(cx, sp, ident)]);
         }
 
         token::DocComment(ident) => {
             return cx.expr_call(sp,
                                 mk_token_path(cx, sp, "DocComment"),
-                                vec!(mk_name(cx, sp, ast::Ident::with_empty_ctxt(ident))));
+                                vec![mk_name(cx, sp, ast::Ident::with_empty_ctxt(ident))]);
         }
 
         token::MatchNt(name, kind) => {
@@ -718,7 +724,7 @@ fn statements_mk_tt(cx: &ExtCtxt, tt: &TokenTree, matcher: bool) -> Vec<ast::Stm
                 cx.expr_method_call(sp,
                                     cx.expr_ident(sp, ident),
                                     id_ext("to_tokens"),
-                                    vec!(cx.expr_ident(sp, id_ext("ext_cx"))));
+                                    vec![cx.expr_ident(sp, id_ext("ext_cx"))]);
             let e_to_toks =
                 cx.expr_method_call(sp, e_to_toks, id_ext("into_iter"), vec![]);
 
@@ -726,9 +732,9 @@ fn statements_mk_tt(cx: &ExtCtxt, tt: &TokenTree, matcher: bool) -> Vec<ast::Stm
                 cx.expr_method_call(sp,
                                     cx.expr_ident(sp, id_ext("tt")),
                                     id_ext("extend"),
-                                    vec!(e_to_toks));
+                                    vec![e_to_toks]);
 
-            vec!(cx.stmt_expr(e_push))
+            vec![cx.stmt_expr(e_push)]
         }
         ref tt @ TokenTree::Token(_, MatchNt(..)) if !matcher => {
             let mut seq = vec![];
@@ -741,13 +747,13 @@ fn statements_mk_tt(cx: &ExtCtxt, tt: &TokenTree, matcher: bool) -> Vec<ast::Stm
             let e_sp = cx.expr_ident(sp, id_ext("_sp"));
             let e_tok = cx.expr_call(sp,
                                      mk_tt_path(cx, sp, "Token"),
-                                     vec!(e_sp, expr_mk_token(cx, sp, tok)));
+                                     vec![e_sp, expr_mk_token(cx, sp, tok)]);
             let e_push =
                 cx.expr_method_call(sp,
                                     cx.expr_ident(sp, id_ext("tt")),
                                     id_ext("push"),
-                                    vec!(e_tok));
-            vec!(cx.stmt_expr(e_push))
+                                    vec![e_tok]);
+            vec![cx.stmt_expr(e_push)]
         },
         TokenTree::Delimited(_, ref delimed) => {
             statements_mk_tt(cx, &delimed.open_tt(), matcher).into_iter()
@@ -800,13 +806,13 @@ fn statements_mk_tt(cx: &ExtCtxt, tt: &TokenTree, matcher: bool) -> Vec<ast::Stm
                                                    vec![e_seq_struct]);
             let e_tok = cx.expr_call(sp,
                                      mk_tt_path(cx, sp, "Sequence"),
-                                     vec!(e_sp, e_rc_new));
+                                     vec![e_sp, e_rc_new]);
             let e_push =
                 cx.expr_method_call(sp,
                                     cx.expr_ident(sp, id_ext("tt")),
                                     id_ext("push"),
-                                    vec!(e_tok));
-            vec!(cx.stmt_expr(e_push))
+                                    vec![e_tok]);
+            vec![cx.stmt_expr(e_push)]
         }
     }
 }
@@ -871,7 +877,7 @@ fn mk_stmts_let(cx: &ExtCtxt, sp: Span) -> Vec<ast::Stmt> {
 
     let stmt_let_tt = cx.stmt_let(sp, true, id_ext("tt"), cx.expr_vec_ng(sp));
 
-    vec!(stmt_let_sp, stmt_let_tt)
+    vec![stmt_let_sp, stmt_let_tt]
 }
 
 fn statements_mk_tts(cx: &ExtCtxt, tts: &[TokenTree], matcher: bool) -> Vec<ast::Stmt> {
@@ -920,10 +926,6 @@ fn expand_parse_call(cx: &ExtCtxt,
                      tts: &[TokenTree]) -> P<ast::Expr> {
     let (cx_expr, tts_expr) = expand_tts(cx, sp, tts);
 
-    let cfg_call = || cx.expr_method_call(
-        sp, cx.expr_ident(sp, id_ext("ext_cx")),
-        id_ext("cfg"), Vec::new());
-
     let parse_sess_call = || cx.expr_method_call(
         sp, cx.expr_ident(sp, id_ext("ext_cx")),
         id_ext("parse_sess"), Vec::new());
@@ -931,7 +933,7 @@ fn expand_parse_call(cx: &ExtCtxt,
     let new_parser_call =
         cx.expr_call(sp,
                      cx.expr_ident(sp, id_ext("new_parser_from_tts")),
-                     vec!(parse_sess_call(), cfg_call(), tts_expr));
+                     vec![parse_sess_call(), tts_expr]);
 
     let path = vec![id_ext("syntax"), id_ext("ext"), id_ext("quote"), id_ext(parse_method)];
     let mut args = vec![cx.expr_mut_addr_of(sp, new_parser_call)];

@@ -12,8 +12,10 @@ pub use self::RelationDir::*;
 use self::TypeVariableValue::*;
 use self::UndoEntry::*;
 use hir::def_id::{DefId};
-use ty::{self, Ty};
+use syntax::util::small_vector::SmallVector;
+use syntax::ast;
 use syntax_pos::Span;
+use ty::{self, Ty};
 
 use std::cmp::min;
 use std::marker::PhantomData;
@@ -27,8 +29,24 @@ pub struct TypeVariableTable<'tcx> {
     eq_relations: ut::UnificationTable<ty::TyVid>,
 }
 
+/// Reasons to create a type inference variable
+pub enum TypeVariableOrigin {
+    MiscVariable(Span),
+    NormalizeProjectionType(Span),
+    TypeInference(Span),
+    TypeParameterDefinition(Span, ast::Name),
+    TransformedUpvar(Span),
+    SubstitutionPlaceholder(Span),
+    AutoDeref(Span),
+    AdjustmentType(Span),
+    DivergingStmt(Span),
+    DivergingBlockExpr(Span),
+    LatticeVariable(Span),
+}
+
 struct TypeVariableData<'tcx> {
     value: TypeVariableValue<'tcx>,
+    origin: TypeVariableOrigin,
     diverging: bool
 }
 
@@ -106,6 +124,10 @@ impl<'tcx> TypeVariableTable<'tcx> {
         self.values.get(vid.index as usize).diverging
     }
 
+    pub fn var_origin(&self, vid: ty::TyVid) -> &TypeVariableOrigin {
+        &self.values.get(vid.index as usize).origin
+    }
+
     /// Records that `a <: b`, `a :> b`, or `a == b`, depending on `dir`.
     ///
     /// Precondition: neither `a` nor `b` are known.
@@ -149,7 +171,7 @@ impl<'tcx> TypeVariableTable<'tcx> {
         &mut self,
         vid: ty::TyVid,
         ty: Ty<'tcx>,
-        stack: &mut Vec<(Ty<'tcx>, RelationDir, ty::TyVid)>)
+        stack: &mut SmallVector<(Ty<'tcx>, RelationDir, ty::TyVid)>)
     {
         debug_assert!(self.root_var(vid) == vid);
         let old_value = {
@@ -172,15 +194,21 @@ impl<'tcx> TypeVariableTable<'tcx> {
 
     pub fn new_var(&mut self,
                    diverging: bool,
-                   default: Option<Default<'tcx>>) -> ty::TyVid {
+                   origin: TypeVariableOrigin,
+                   default: Option<Default<'tcx>>,) -> ty::TyVid {
         self.eq_relations.new_key(());
         let index = self.values.push(TypeVariableData {
             value: Bounded { relations: vec![], default: default },
+            origin: origin,
             diverging: diverging
         });
         let v = ty::TyVid { index: index as u32 };
         debug!("new_var() -> {:?}", v);
         v
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.values.len()
     }
 
     pub fn root_var(&mut self, vid: ty::TyVid) -> ty::TyVid {

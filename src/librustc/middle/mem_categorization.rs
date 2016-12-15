@@ -74,7 +74,7 @@ use hir::def_id::DefId;
 use hir::map as ast_map;
 use infer::InferCtxt;
 use middle::const_qualif::ConstQualif;
-use hir::def::Def;
+use hir::def::{Def, CtorKind};
 use ty::adjustment;
 use ty::{self, Ty, TyCtxt};
 
@@ -354,11 +354,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
     }
 
     fn expr_ty_adjusted(&self, expr: &hir::Expr) -> McResult<Ty<'tcx>> {
-        let unadjusted_ty = self.expr_ty(expr)?;
-        Ok(unadjusted_ty.adjust(
-            self.tcx(), expr.span, expr.id,
-            self.infcx.adjustments().get(&expr.id),
-            |method_call| self.infcx.node_method_ty(method_call)))
+        self.infcx.expr_ty_adjusted(expr)
     }
 
     fn node_ty(&self, id: ast::NodeId) -> McResult<Ty<'tcx>> {
@@ -396,19 +392,21 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             }
 
             Some(adjustment) => {
-                match *adjustment {
-                    adjustment::AdjustDerefRef(
-                        adjustment::AutoDerefRef {
-                            autoref: None, unsize: None, autoderefs, ..}) => {
+                match adjustment.kind {
+                    adjustment::Adjust::DerefRef {
+                        autoderefs,
+                        autoref: None,
+                        unsize: false
+                    } => {
                         // Equivalent to *expr or something similar.
                         self.cat_expr_autoderefd(expr, autoderefs)
                     }
 
-                    adjustment::AdjustNeverToAny(..) |
-                    adjustment::AdjustReifyFnPointer |
-                    adjustment::AdjustUnsafeFnPointer |
-                    adjustment::AdjustMutToConstPointer |
-                    adjustment::AdjustDerefRef(_) => {
+                    adjustment::Adjust::NeverToAny |
+                    adjustment::Adjust::ReifyFnPointer |
+                    adjustment::Adjust::UnsafeFnPointer |
+                    adjustment::Adjust::MutToConstPointer |
+                    adjustment::Adjust::DerefRef {..} => {
                         debug!("cat_expr({:?}): {:?}",
                                adjustment,
                                expr);
@@ -490,8 +488,9 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             }
           }
 
-          hir::ExprPath(..) => {
-            self.cat_def(expr.id, expr.span, expr_ty, self.tcx().expect_def(expr.id))
+          hir::ExprPath(ref qpath) => {
+            let def = self.infcx.tables.borrow().qpath_def(qpath, expr.id);
+            self.cat_def(expr.id, expr.span, expr_ty, def)
           }
 
           hir::ExprType(ref e, _) => {
@@ -503,7 +502,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
           hir::ExprClosure(..) | hir::ExprRet(..) |
           hir::ExprUnary(..) |
           hir::ExprMethodCall(..) | hir::ExprCast(..) |
-          hir::ExprVec(..) | hir::ExprTup(..) | hir::ExprIf(..) |
+          hir::ExprArray(..) | hir::ExprTup(..) | hir::ExprIf(..) |
           hir::ExprBinary(..) | hir::ExprWhile(..) |
           hir::ExprBlock(..) | hir::ExprLoop(..) | hir::ExprMatch(..) |
           hir::ExprLit(..) | hir::ExprBreak(..) |
@@ -524,18 +523,9 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
                id, expr_ty, def);
 
         match def {
-          Def::Struct(..) | Def::Union(..) | Def::Variant(..) | Def::Const(..) |
+          Def::StructCtor(..) | Def::VariantCtor(..) | Def::Const(..) |
           Def::AssociatedConst(..) | Def::Fn(..) | Def::Method(..) => {
                 Ok(self.cat_rvalue_node(id, span, expr_ty))
-          }
-
-          Def::Mod(_) |
-          Def::Trait(_) | Def::Enum(..) | Def::TyAlias(..) | Def::PrimTy(_) |
-          Def::TyParam(..) |
-          Def::Label(_) | Def::SelfTy(..) |
-          Def::AssociatedTy(..) => {
-              span_bug!(span, "Unexpected definition in \
-                               memory categorization: {:?}", def);
           }
 
           Def::Static(_, mutbl) => {
@@ -598,7 +588,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             }))
           }
 
-          Def::Err => bug!("Def::Err in memory categorization")
+          def => span_bug!(span, "unexpected definition in memory categorization: {:?}", def)
         }
     }
 
@@ -715,7 +705,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             };
 
             match fn_expr.node {
-                hir::ExprClosure(.., ref body, _) => body.id,
+                hir::ExprClosure(.., body_id, _) => body_id.node_id(),
                 _ => bug!()
             }
         };
@@ -956,9 +946,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
                 let ref_ty = self.overloaded_method_return_ty(method_ty);
                 base_cmt = self.cat_rvalue_node(elt.id(), elt.span(), ref_ty);
 
-                // FIXME(#20649) -- why are we using the `self_ty` as the element type...?
-                let self_ty = method_ty.fn_sig().input(0);
-                (self.tcx().no_late_bound_regions(&self_ty).unwrap(),
+                (ref_ty.builtin_deref(false, ty::NoPreference).unwrap().ty,
                  ElementKind::OtherElement)
             }
             None => {
@@ -1075,28 +1063,37 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
 
         // Note: This goes up here (rather than within the PatKind::TupleStruct arm
         // alone) because PatKind::Struct can also refer to variants.
-        let cmt = match self.tcx().expect_def_or_none(pat.id) {
-            Some(Def::Err) => return Err(()),
-            Some(Def::Variant(variant_did)) => {
-                // univariant enums do not need downcasts
-                let enum_did = self.tcx().parent_def_id(variant_did).unwrap();
-                if !self.tcx().lookup_adt_def(enum_did).is_univariant() {
-                    self.cat_downcast(pat, cmt.clone(), cmt.ty, variant_did)
-                } else {
-                    cmt
+        let cmt = match pat.node {
+            PatKind::Path(hir::QPath::Resolved(_, ref path)) |
+            PatKind::TupleStruct(hir::QPath::Resolved(_, ref path), ..) |
+            PatKind::Struct(hir::QPath::Resolved(_, ref path), ..) => {
+                match path.def {
+                    Def::Err => return Err(()),
+                    Def::Variant(variant_did) |
+                    Def::VariantCtor(variant_did, ..) => {
+                        // univariant enums do not need downcasts
+                        let enum_did = self.tcx().parent_def_id(variant_did).unwrap();
+                        if !self.tcx().lookup_adt_def(enum_did).is_univariant() {
+                            self.cat_downcast(pat, cmt.clone(), cmt.ty, variant_did)
+                        } else {
+                            cmt
+                        }
+                    }
+                    _ => cmt
                 }
             }
             _ => cmt
         };
 
         match pat.node {
-          PatKind::TupleStruct(_, ref subpats, ddpos) => {
-            let expected_len = match self.tcx().expect_def(pat.id) {
-                Def::Variant(def_id) => {
+          PatKind::TupleStruct(ref qpath, ref subpats, ddpos) => {
+            let def = self.infcx.tables.borrow().qpath_def(qpath, pat.id);
+            let expected_len = match def {
+                Def::VariantCtor(def_id, CtorKind::Fn) => {
                     let enum_def = self.tcx().parent_def_id(def_id).unwrap();
                     self.tcx().lookup_adt_def(enum_def).variant_with_id(def_id).fields.len()
                 }
-                Def::Struct(..) => {
+                Def::StructCtor(_, CtorKind::Fn) => {
                     match self.pat_ty(&pat)?.sty {
                         ty::TyAdt(adt_def, _) => {
                             adt_def.struct_variant().fields.len()
@@ -1155,7 +1152,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             self.cat_pattern_(subcmt, &subpat, op)?;
           }
 
-          PatKind::Vec(ref before, ref slice, ref after) => {
+          PatKind::Slice(ref before, ref slice, ref after) => {
             let context = InteriorOffsetKind::Pattern;
             let elt_cmt = self.cat_index(pat, cmt, context)?;
             for before_pat in before {
@@ -1169,7 +1166,7 @@ impl<'a, 'gcx, 'tcx> MemCategorizationContext<'a, 'gcx, 'tcx> {
             }
           }
 
-          PatKind::Path(..) | PatKind::Binding(.., None) |
+          PatKind::Path(_) | PatKind::Binding(.., None) |
           PatKind::Lit(..) | PatKind::Range(..) | PatKind::Wild => {
             // always ok
           }

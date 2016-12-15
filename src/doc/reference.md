@@ -21,6 +21,11 @@ separately by extracting documentation attributes from their source code. Many
 of the features that one might expect to be language features are library
 features in Rust, so what you're looking for may be there, not here.
 
+Finally, this document is not normative. It may include details that are
+specific to `rustc` itself, and should not be taken as a specification for
+the Rust language. We intend to produce such a document someday, but this
+is what we have for now.
+
 You may also be interested in the [grammar].
 
 [book]: book/index.html
@@ -598,7 +603,8 @@ syntax named by _designator_. Valid designators are:
 * `ty`: a [type](#types)
 * `ident`: an [identifier](#identifiers)
 * `path`: a [path](#paths)
-* `tt`: either side of the `=>` in macro rules
+* `tt`: a token tree (a single [token](#tokens) or a sequence of token trees surrounded
+  by matching `()`, `[]`, or `{}`)
 * `meta`: the contents of an [attribute](#attributes)
 
 In the transcriber, the
@@ -735,13 +741,14 @@ There are several kinds of item:
 * [`extern crate` declarations](#extern-crate-declarations)
 * [`use` declarations](#use-declarations)
 * [modules](#modules)
-* [functions](#functions)
+* [function definitions](#functions)
+* [`extern` blocks](#external-blocks)
 * [type definitions](grammar.html#type-definitions)
-* [structs](#structs)
-* [enumerations](#enumerations)
+* [struct definitions](#structs)
+* [enumeration definitions](#enumerations)
 * [constant items](#constant-items)
 * [static items](#static-items)
-* [traits](#traits)
+* [trait definitions](#traits)
 * [implementations](#implementations)
 
 Some items form an implicit scope for the declaration of sub-items. In other
@@ -2457,11 +2464,6 @@ The currently implemented features of the reference compiler are:
 * `unboxed_closures` - Rust's new closure design, which is currently a work in
                        progress feature with many known bugs.
 
-* `unmarked_api` - Allows use of items within a `#![staged_api]` crate
-                   which have not been marked with a stability marker.
-                   Such items should not be allowed by the compiler to exist,
-                   so if you need this there probably is a compiler bug.
-
 * `allow_internal_unstable` - Allows `macro_rules!` macros to be tagged with the
                               `#[allow_internal_unstable]` attribute, designed
                               to allow `std` macros to call
@@ -2469,21 +2471,19 @@ The currently implemented features of the reference compiler are:
                               internally without imposing on callers
                               (i.e. making them behave like function calls in
                               terms of encapsulation).
-* - `default_type_parameter_fallback` - Allows type parameter defaults to
-                                        influence type inference.
 
-* - `stmt_expr_attributes` - Allows attributes on expressions and
-                             non-item statements.
+* `default_type_parameter_fallback` - Allows type parameter defaults to
+                                      influence type inference.
 
-* - `type_ascription` - Allows type ascription expressions `expr: Type`.
+* `stmt_expr_attributes` - Allows attributes on expressions.
 
-* - `abi_vectorcall` - Allows the usage of the vectorcall calling convention
-                             (e.g. `extern "vectorcall" func fn_();`)
+* `type_ascription` - Allows type ascription expressions `expr: Type`.
 
-* - `dotdot_in_tuple_patterns` - Allows `..` in tuple (struct) patterns.
+* `abi_vectorcall` - Allows the usage of the vectorcall calling convention
+                     (e.g. `extern "vectorcall" func fn_();`)
 
-* - `abi_sysv64` - Allows the usage of the system V AMD64 calling convention
-                             (e.g. `extern "sysv64" func fn_();`)
+* `abi_sysv64` - Allows the usage of the system V AMD64 calling convention
+                 (e.g. `extern "sysv64" func fn_();`)
 
 If a feature is promoted to a language feature, then all existing programs will
 start to receive compilation warnings about `#![feature]` directives which enabled
@@ -2861,8 +2861,8 @@ assert_eq!(x, y);
 
 ### Unary operator expressions
 
-Rust defines the following unary operators. They are all written as prefix operators,
-before the expression they apply to.
+Rust defines the following unary operators. With the exception of `?`, they are
+all written as prefix operators, before the expression they apply to.
 
 * `-`
   : Negation. Signed integer types and floating-point types support negation. It
@@ -2891,6 +2891,10 @@ before the expression they apply to.
     If the `&` or `&mut` operators are applied to an rvalue, a
     temporary value is created; the lifetime of this temporary value
     is defined by [syntactic rules](#temporary-lifetimes).
+* `?`
+  : Propagating errors if applied to `Err(_)` and unwrapping if
+    applied to `Ok(_)`. Only works on the `Result<T, E>` type,
+    and written in postfix notation.
 
 ### Binary operator expressions
 
@@ -3110,10 +3114,12 @@ the lambda expression captures its environment by reference, effectively
 borrowing pointers to all outer variables mentioned inside the function.
 Alternately, the compiler may infer that a lambda expression should copy or
 move values (depending on their type) from the environment into the lambda
-expression's captured environment.
+expression's captured environment. A lambda can be forced to capture its
+environment by moving values by prefixing it with the `move` keyword.
 
 In this example, we define a function `ten_times` that takes a higher-order
-function argument, and we then call it with a lambda expression as an argument:
+function argument, and we then call it with a lambda expression as an argument,
+followed by a lambda expression that moves values from its environment.
 
 ```
 fn ten_times<F>(f: F) where F: Fn(i32) {
@@ -3123,6 +3129,9 @@ fn ten_times<F>(f: F) where F: Fn(i32) {
 }
 
 ten_times(|j| println!("hello, {}", j));
+
+let word = "konnichiwa".to_owned();
+ten_times(move |j| println!("{}, {}", word, j));
 ```
 
 ### Infinite loops
@@ -3752,6 +3761,21 @@ to an implicit type parameter representing the "implementing" type. In an impl,
 it is an alias for the implementing type. For example, in:
 
 ```
+pub trait From<T> {
+    fn from(T) -> Self;
+}
+
+impl From<i32> for String {
+    fn from(x: i32) -> Self {
+        x.to_string()
+    }
+}
+```
+
+The notation `Self` in the impl refers to the implementing type: `String`. In another 
+example:
+
+```
 trait Printable {
     fn make_string(&self) -> String;
 }
@@ -3959,6 +3983,16 @@ the top-level type for the implementation of the called method. If no such metho
 found, `.deref()` is called and the compiler continues to search for the method
 implementation in the returned type `U`.
 
+## The `Send` trait
+
+The `Send` trait indicates that a value of this type is safe to send from one
+thread to another.
+
+## The `Sync` trait
+
+The `Sync` trait indicates that a value of this type is safe to share between
+multiple threads.
+
 # Memory model
 
 A Rust program's memory consists of a static set of *items* and a *heap*.
@@ -4009,9 +4043,9 @@ Methods that take either `self` or `Box<Self>` can optionally place them in a
 mutable variable by prefixing them with `mut` (similar to regular arguments):
 
 ```
-trait Changer {
-    fn change(mut self) -> Self;
-    fn modify(mut self: Box<Self>) -> Box<Self>;
+trait Changer: Sized {
+    fn change(mut self) {}
+    fn modify(mut self: Box<Self>) {}
 }
 ```
 
@@ -4063,6 +4097,12 @@ be ignored in favor of only building the artifacts specified by command line.
   windows. This format is recommended for use in situations such as linking
   Rust code into an existing non-Rust application because it will not have
   dynamic dependencies on other Rust code.
+
+* `--crate-type=cdylib`, `#[crate_type = "cdylib"]` - A dynamic system
+  library will be produced.  This is used when compiling Rust code as
+  a dynamic library to be loaded from another language.  This output type will
+  create `*.so` files on Linux, `*.dylib` files on OSX, and `*.dll` files on
+  Windows.
 
 * `--crate-type=rlib`, `#[crate_type = "rlib"]` - A "Rust library" file will be
   produced. This is used as an intermediate artifact and can be thought of as a

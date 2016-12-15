@@ -10,24 +10,61 @@ system.
 
 ## Using rustbuild
 
-When configuring Rust via `./configure`, pass the following to enable building
-via this build system:
+The rustbuild build system has a primary entry point, a top level `x.py` script:
 
 ```
-./configure --enable-rustbuild
-make
+python ./x.py build
 ```
 
-Afterwards the `Makefile` which is generated will have a few commands like
-`make check`, `make tidy`, etc. For finer-grained control, the
-`bootstrap.py` entry point can be used:
+Note that if you're on Unix you should be able to execute the script directly:
 
 ```
-python src/bootstrap/bootstrap.py
+./x.py build
 ```
 
-This accepts a number of options like `--stage` and `--step` which can configure
-what's actually being done.
+The script accepts commands, flags, and arguments to determine what to do:
+
+* `build` - a general purpose command for compiling code. Alone `build` will
+  bootstrap the entire compiler, and otherwise arguments passed indicate what to
+  build. For example:
+
+  ```
+  # build the whole compiler
+  ./x.py build
+
+  # build the stage1 compiler
+  ./x.py build --stage 1
+
+  # build stage0 libstd
+  ./x.py build --stage 0 src/libstd
+
+  # build a particular crate in stage0
+  ./x.py build --stage 0 src/libtest
+  ```
+
+* `test` - a command for executing unit tests. Like the `build` command this
+  will execute the entire test suite by default, and otherwise it can be used to
+  select which test suite is run:
+
+  ```
+  # run all unit tests
+  ./x.py test
+
+  # execute the run-pass test suite
+  ./x.py test src/test/run-pass
+
+  # execute only some tests in the run-pass test suite
+  ./x.py test src/test/run-pass --test-args substring-of-test-name
+
+  # execute tests in the standard library in stage0
+  ./x.py test --stage 0 src/libstd
+
+  # execute all doc tests
+  ./x.py test src/doc
+  ```
+
+* `doc` - a command for building documentation. Like above can take arguments
+  for what to document.
 
 ## Configuring rustbuild
 
@@ -42,12 +79,19 @@ be found at `src/bootstrap/config.toml.example`, and the configuration file
 can also be passed as `--config path/to/config.toml` if the build system is
 being invoked manually (via the python script).
 
+Finally, rustbuild makes use of the [gcc-rs crate] which has [its own
+method][env-vars] of configuring C compilers and C flags via environment
+variables.
+
+[gcc-rs crate]: https://github.com/alexcrichton/gcc-rs
+[env-vars]: https://github.com/alexcrichton/gcc-rs#external-configuration-via-environment-variables
+
 ## Build stages
 
 The rustbuild build system goes through a few phases to actually build the
 compiler. What actually happens when you invoke rustbuild is:
 
-1. The entry point script, `src/bootstrap/bootstrap.py` is run. This script is
+1. The entry point script, `x.py` is run. This script is
    responsible for downloading the stage0 compiler/Cargo binaries, and it then
    compiles the build system itself (this folder). Finally, it then invokes the
    actual `bootstrap` binary build system.
@@ -225,16 +269,17 @@ After that, each module in rustbuild should have enough documentation to keep
 you up and running. Some general areas that you may be interested in modifying
 are:
 
-* Adding a new build tool? Take a look at `build/step.rs` for examples of other
-  tools, as well as `build/mod.rs`.
+* Adding a new build tool? Take a look at `bootstrap/step.rs` for examples of
+  other tools.
 * Adding a new compiler crate? Look no further! Adding crates can be done by
   adding a new directory with `Cargo.toml` followed by configuring all
   `Cargo.toml` files accordingly.
 * Adding a new dependency from crates.io? We're still working on that, so hold
   off on that for now.
-* Adding a new configuration option? Take a look at `build/config.rs` or perhaps
-  `build/flags.rs` and then modify the build elsewhere to read that option.
-* Adding a sanity check? Take a look at `build/sanity.rs`.
+* Adding a new configuration option? Take a look at `bootstrap/config.rs` or
+  perhaps `bootstrap/flags.rs` and then modify the build elsewhere to read that
+  option.
+* Adding a sanity check? Take a look at `bootstrap/sanity.rs`.
 
 If you have any questions feel free to reach out on `#rust-internals` on IRC or
 open an issue in the bug tracker!

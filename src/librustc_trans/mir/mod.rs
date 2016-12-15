@@ -11,7 +11,7 @@
 use libc::c_uint;
 use llvm::{self, ValueRef};
 use rustc::ty;
-use rustc::mir::repr as mir;
+use rustc::mir;
 use rustc::mir::tcx::LvalueTy;
 use session::config::FullDebugInfo;
 use base;
@@ -21,10 +21,9 @@ use machine;
 use type_of;
 
 use syntax_pos::{DUMMY_SP, NO_EXPANSION, COMMAND_LINE_EXPN, BytePos};
-use syntax::parse::token::keywords;
+use syntax::symbol::keywords;
 
-use std::ops::Deref;
-use std::rc::Rc;
+use std::cell::Ref;
 use std::iter;
 
 use basic_block::BasicBlock;
@@ -34,30 +33,14 @@ use rustc_data_structures::indexed_vec::{IndexVec, Idx};
 
 pub use self::constant::trans_static_initializer;
 
-use self::lvalue::{LvalueRef, get_dataptr, get_meta};
+use self::lvalue::{LvalueRef};
 use rustc::mir::traversal;
 
 use self::operand::{OperandRef, OperandValue};
 
-#[derive(Clone)]
-pub enum CachedMir<'mir, 'tcx: 'mir> {
-    Ref(&'mir mir::Mir<'tcx>),
-    Owned(Rc<mir::Mir<'tcx>>)
-}
-
-impl<'mir, 'tcx: 'mir> Deref for CachedMir<'mir, 'tcx> {
-    type Target = mir::Mir<'tcx>;
-    fn deref(&self) -> &mir::Mir<'tcx> {
-        match *self {
-            CachedMir::Ref(r) => r,
-            CachedMir::Owned(ref rc) => rc
-        }
-    }
-}
-
 /// Master context for translating MIR.
 pub struct MirContext<'bcx, 'tcx:'bcx> {
-    mir: CachedMir<'bcx, 'tcx>,
+    mir: Ref<'tcx, mir::Mir<'tcx>>,
 
     /// Function context
     fcx: &'bcx common::FunctionContext<'bcx, 'tcx>,
@@ -223,7 +206,7 @@ pub fn trans_mir<'blk, 'tcx: 'blk>(fcx: &'blk FunctionContext<'blk, 'tcx>) {
     let scopes = debuginfo::create_mir_scopes(fcx);
 
     let mut mircx = MirContext {
-        mir: mir.clone(),
+        mir: Ref::clone(&mir),
         fcx: fcx,
         llpersonalityslot: None,
         blocks: block_bcxs,
@@ -371,7 +354,6 @@ fn arg_local_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
                 _ => bug!("spread argument isn't a tuple?!")
             };
 
-            let lltuplety = type_of::type_of(bcx.ccx(), arg_ty);
             let lltemp = bcx.with_block(|bcx| {
                 base::alloc_ty(bcx, arg_ty, &format!("arg{}", arg_index))
             });
@@ -384,32 +366,27 @@ fn arg_local_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
                     // they are the two sub-fields of a single aggregate field.
                     let meta = &fcx.fn_ty.args[idx];
                     idx += 1;
-                    arg.store_fn_arg(bcx, &mut llarg_idx, get_dataptr(bcx, dst));
-                    meta.store_fn_arg(bcx, &mut llarg_idx, get_meta(bcx, dst));
+                    arg.store_fn_arg(bcx, &mut llarg_idx,
+                                     base::get_dataptr_builder(bcx, dst));
+                    meta.store_fn_arg(bcx, &mut llarg_idx,
+                                      base::get_meta_builder(bcx, dst));
                 } else {
                     arg.store_fn_arg(bcx, &mut llarg_idx, dst);
                 }
-
-                bcx.with_block(|bcx| arg_scope.map(|scope| {
-                    let byte_offset_of_var_in_tuple =
-                        machine::llelement_offset(bcx.ccx(), lltuplety, i);
-
-                    let ops = unsafe {
-                        [llvm::LLVMRustDIBuilderCreateOpDeref(),
-                         llvm::LLVMRustDIBuilderCreateOpPlus(),
-                         byte_offset_of_var_in_tuple as i64]
-                    };
-
-                    let variable_access = VariableAccess::IndirectVariable {
-                        alloca: lltemp,
-                        address_operations: &ops
-                    };
-                    declare_local(bcx, keywords::Invalid.name(),
-                                  tupled_arg_ty, scope, variable_access,
-                                  VariableKind::ArgumentVariable(arg_index + i + 1),
-                                  bcx.fcx().span.unwrap_or(DUMMY_SP));
-                }));
             }
+
+            // Now that we have one alloca that contains the aggregate value,
+            // we can create one debuginfo entry for the argument.
+            bcx.with_block(|bcx| arg_scope.map(|scope| {
+                let variable_access = VariableAccess::DirectVariable {
+                    alloca: lltemp
+                };
+                declare_local(bcx, arg_decl.name.unwrap_or(keywords::Invalid.name()),
+                              arg_ty, scope, variable_access,
+                              VariableKind::ArgumentVariable(arg_index + 1),
+                              bcx.fcx().span.unwrap_or(DUMMY_SP));
+            }));
+
             return LocalRef::Lvalue(LvalueRef::new_sized(lltemp, LvalueTy::from_ty(arg_ty)));
         }
 
@@ -466,8 +443,10 @@ fn arg_local_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
                 // so make an alloca to store them in.
                 let meta = &fcx.fn_ty.args[idx];
                 idx += 1;
-                arg.store_fn_arg(bcx, &mut llarg_idx, get_dataptr(bcx, lltemp));
-                meta.store_fn_arg(bcx, &mut llarg_idx, get_meta(bcx, lltemp));
+                arg.store_fn_arg(bcx, &mut llarg_idx,
+                                 base::get_dataptr_builder(bcx, lltemp));
+                meta.store_fn_arg(bcx, &mut llarg_idx,
+                                  base::get_meta_builder(bcx, lltemp));
             } else  {
                 // otherwise, arg is passed by value, so make a
                 // temporary and store it there
@@ -491,8 +470,8 @@ fn arg_local_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
             } else {
                 (arg_ty, false)
             };
-            let upvar_tys = if let ty::TyClosure(_, ref substs) = closure_ty.sty {
-                &substs.upvar_tys[..]
+            let upvar_tys = if let ty::TyClosure(def_id, substs) = closure_ty.sty {
+                substs.upvar_tys(def_id, tcx)
             } else {
                 bug!("upvar_decls with non-closure arg0 type `{}`", closure_ty);
             };

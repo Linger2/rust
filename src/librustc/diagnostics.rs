@@ -672,120 +672,6 @@ extern "C" {
 ```
 "##,
 
-E0269: r##"
-A returned value was expected but not all control paths return one.
-
-Erroneous code example:
-
-```compile_fail,E0269
-fn abracada_FAIL() -> String {
-    "this won't work".to_string();
-    // error: not all control paths return a value
-}
-```
-
-In the previous code, the function is supposed to return a `String`, however,
-the code returns nothing (because of the ';'). Another erroneous code would be:
-
-```compile_fail
-fn abracada_FAIL(b: bool) -> u32 {
-    if b {
-        0
-    } else {
-        "a" // It fails because an `u32` was expected and something else is
-            // returned.
-    }
-}
-```
-
-It is advisable to find out what the unhandled cases are and check for them,
-returning an appropriate value or panicking if necessary. Check if you need
-to remove a semicolon from the last expression, like in the first erroneous
-code example.
-"##,
-
-E0270: r##"
-Rust lets you define functions which are known to never return, i.e. are
-'diverging', by marking its return type as `!`.
-
-For example, the following functions never return:
-
-```no_run
-fn foo() -> ! {
-    loop {}
-}
-
-fn bar() -> ! {
-    foo() // foo() is diverging, so this will diverge too
-}
-
-fn baz() -> ! {
-    panic!(); // this macro internally expands to a call to a diverging function
-}
-```
-
-Such functions can be used in a place where a value is expected without
-returning a value of that type, for instance:
-
-```no_run
-fn foo() -> ! {
-    loop {}
-}
-
-let x = 3;
-
-let y = match x {
-    1 => 1,
-    2 => 4,
-    _ => foo() // diverging function called here
-};
-
-println!("{}", y)
-```
-
-If the third arm of the match block is reached, since `foo()` doesn't ever
-return control to the match block, it is fine to use it in a place where an
-integer was expected. The `match` block will never finish executing, and any
-point where `y` (like the print statement) is needed will not be reached.
-
-However, if we had a diverging function that actually does finish execution:
-
-```ignore
-fn foo() -> ! {
-    loop {break;}
-}
-```
-
-Then we would have an unknown value for `y` in the following code:
-
-```no_run
-fn foo() -> ! {
-    loop {}
-}
-
-let x = 3;
-
-let y = match x {
-    1 => 1,
-    2 => 4,
-    _ => foo()
-};
-
-println!("{}", y);
-```
-
-In the previous example, the print statement was never reached when the
-wildcard match arm was hit, so we were okay with `foo()` not returning an
-integer that we could set to `y`. But in this example, `foo()` actually does
-return control, so the print statement will be executed with an uninitialized
-value.
-
-Obviously we cannot have functions which are allowed to be used in such
-positions and yet can return control. So, if you are defining a function that
-returns `!`, make sure that there is no way for it to actually finish
-executing.
-"##,
-
 E0271: r##"
 This is because of a type mismatch between the associated type of some
 trait (e.g. `T::Bar`, where `T` implements `trait Quux { type Bar; }`)
@@ -1327,30 +1213,6 @@ let x: i32 = "I am not a number!";
 //      |
 //    type `i32` assigned to variable `x`
 ```
-
-Another situation in which this occurs is when you attempt to use the `try!`
-macro inside a function that does not return a `Result<T, E>`:
-
-```compile_fail,E0308
-use std::fs::File;
-
-fn main() {
-    let mut f = try!(File::create("foo.txt"));
-}
-```
-
-This code gives an error like this:
-
-```text
-<std macros>:5:8: 6:42 error: mismatched types:
- expected `()`,
-     found `core::result::Result<_, _>`
- (expected (),
-     found enum `core::result::Result`) [E0308]
-```
-
-`try!` returns a `Result<T, E>`, and so the function must. But `main()` has
-`()` as its return type, hence the error.
 "##,
 
 E0309: r##"
@@ -1429,6 +1291,23 @@ fn make_child<'elve>(x: &mut &'elve isize, y: &mut &'elve isize) {
     *x = *y; // ok!
 }
 ```
+"##,
+
+E0317: r##"
+This error occurs when an `if` expression without an `else` block is used in a
+context where a type other than `()` is expected, for example a `let`
+expression:
+
+```compile_fail,E0317
+fn main() {
+    let x = 5;
+    let a = if x == 5 { 1 };
+}
+```
+
+An `if` expression without an `else` block has the type `()`, so this is a type
+error. To resolve it, add an `else` block having the same type as the `if`
+block.
 "##,
 
 E0398: r##"

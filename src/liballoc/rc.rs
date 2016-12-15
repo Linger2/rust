@@ -12,65 +12,53 @@
 
 //! Single-threaded reference-counting pointers.
 //!
-//! The type [`Rc<T>`][rc] provides shared ownership of a value, allocated
-//! in the heap. Invoking [`clone`][clone] on `Rc` produces a new pointer
-//! to the same value in the heap. When the last `Rc` pointer to a given
-//! value is destroyed, the pointed-to value is also destroyed.
+//! The type [`Rc<T>`][`Rc`] provides shared ownership of a value of type `T`,
+//! allocated in the heap. Invoking [`clone()`][clone] on [`Rc`] produces a new
+//! pointer to the same value in the heap. When the last [`Rc`] pointer to a
+//! given value is destroyed, the pointed-to value is also destroyed.
 //!
-//! Shared pointers in Rust disallow mutation by default, and `Rc` is no
-//! exception. If you need to mutate through an `Rc`, use [`Cell`][cell] or
-//! [`RefCell`][refcell].
+//! Shared references in Rust disallow mutation by default, and `Rc` is no
+//! exception. If you need to mutate through an [`Rc`], use [`Cell`] or
+//! [`RefCell`].
 //!
-//! `Rc` uses non-atomic reference counting. This means that overhead is very
-//! low, but an `Rc` cannot be sent between threads, and consequently `Rc`
+//! [`Rc`] uses non-atomic reference counting. This means that overhead is very
+//! low, but an [`Rc`] cannot be sent between threads, and consequently [`Rc`]
 //! does not implement [`Send`][send]. As a result, the Rust compiler
-//! will check *at compile time* that you are not sending `Rc`s between
+//! will check *at compile time* that you are not sending [`Rc`]s between
 //! threads. If you need multi-threaded, atomic reference counting, use
 //! [`sync::Arc`][arc].
 //!
-//! The [`downgrade`][downgrade] method can be used to create a non-owning
-//! [`Weak`][weak] pointer. A `Weak` pointer can be [`upgrade`][upgrade]d
-//! to an `Rc`, but this will return [`None`][option] if the value has
+//! The [`downgrade()`][downgrade] method can be used to create a non-owning
+//! [`Weak`] pointer. A [`Weak`] pointer can be [`upgrade`][upgrade]d
+//! to an [`Rc`], but this will return [`None`] if the value has
 //! already been dropped.
 //!
-//! A cycle between `Rc` pointers will never be deallocated. For this reason,
-//! `Weak` is used to break cycles. For example, a tree could have strong
-//! `Rc` pointers from parent nodes to children, and `Weak` pointers from
+//! A cycle between [`Rc`] pointers will never be deallocated. For this reason,
+//! [`Weak`] is used to break cycles. For example, a tree could have strong
+//! [`Rc`] pointers from parent nodes to children, and [`Weak`] pointers from
 //! children back to their parents.
 //!
-//! `Rc<T>` automatically dereferences to `T` (via the [`Deref`][deref] trait),
-//! so you can call `T`'s methods on a value of type `Rc<T>`. To avoid name
-//! clashes with `T`'s methods, the methods of `Rc<T>` itself are [associated
+//! `Rc<T>` automatically dereferences to `T` (via the [`Deref`] trait),
+//! so you can call `T`'s methods on a value of type [`Rc<T>`][`Rc`]. To avoid name
+//! clashes with `T`'s methods, the methods of [`Rc<T>`][`Rc`] itself are [associated
 //! functions][assoc], called using function-like syntax:
 //!
 //! ```
-//! # use std::rc::Rc;
-//! # let my_rc = Rc::new(());
+//! use std::rc::Rc;
+//! let my_rc = Rc::new(());
+//!
 //! Rc::downgrade(&my_rc);
 //! ```
 //!
-//! `Weak<T>` does not auto-dereference to `T`, because the value may have
+//! [`Weak<T>`][`Weak`] does not auto-dereference to `T`, because the value may have
 //! already been destroyed.
-//!
-//! [rc]: struct.Rc.html
-//! [weak]: struct.Weak.html
-//! [clone]: ../../std/clone/trait.Clone.html#tymethod.clone
-//! [cell]: ../../std/cell/struct.Cell.html
-//! [refcell]: ../../std/cell/struct.RefCell.html
-//! [send]: ../../std/marker/trait.Send.html
-//! [arc]: ../../std/sync/struct.Arc.html
-//! [deref]: ../../std/ops/trait.Deref.html
-//! [downgrade]: struct.Rc.html#method.downgrade
-//! [upgrade]: struct.Weak.html#method.upgrade
-//! [option]: ../../std/option/enum.Option.html
-//! [assoc]: ../../book/method-syntax.html#associated-functions
 //!
 //! # Examples
 //!
 //! Consider a scenario where a set of `Gadget`s are owned by a given `Owner`.
 //! We want to have our `Gadget`s point to their `Owner`. We can't do this with
 //! unique ownership, because more than one gadget may belong to the same
-//! `Owner`. `Rc` allows us to share an `Owner` between multiple `Gadget`s,
+//! `Owner`. [`Rc`] allows us to share an `Owner` between multiple `Gadget`s,
 //! and have the `Owner` remain allocated as long as any `Gadget` points at it.
 //!
 //! ```
@@ -126,20 +114,20 @@
 //! ```
 //!
 //! If our requirements change, and we also need to be able to traverse from
-//! `Owner` to `Gadget`, we will run into problems. An `Rc` pointer from `Owner`
+//! `Owner` to `Gadget`, we will run into problems. An [`Rc`] pointer from `Owner`
 //! to `Gadget` introduces a cycle between the values. This means that their
 //! reference counts can never reach 0, and the values will remain allocated
-//! forever: a memory leak. In order to get around this, we can use `Weak`
+//! forever: a memory leak. In order to get around this, we can use [`Weak`]
 //! pointers.
 //!
 //! Rust actually makes it somewhat difficult to produce this loop in the first
 //! place. In order to end up with two values that point at each other, one of
-//! them needs to be mutable. This is difficult because `Rc` enforces
+//! them needs to be mutable. This is difficult because [`Rc`] enforces
 //! memory safety by only giving out shared references to the value it wraps,
 //! and these don't allow direct mutation. We need to wrap the part of the
-//! value we wish to mutate in a [`RefCell`][refcell], which provides *interior
+//! value we wish to mutate in a [`RefCell`], which provides *interior
 //! mutability*: a method to achieve mutability through a shared reference.
-//! `RefCell` enforces Rust's borrowing rules at runtime.
+//! [`RefCell`] enforces Rust's borrowing rules at runtime.
 //!
 //! ```
 //! use std::rc::Rc;
@@ -213,6 +201,19 @@
 //!     // Gadget Man, so he gets destroyed as well.
 //! }
 //! ```
+//!
+//! [`Rc`]: struct.Rc.html
+//! [`Weak`]: struct.Weak.html
+//! [clone]: ../../std/clone/trait.Clone.html#tymethod.clone
+//! [`Cell`]: ../../std/cell/struct.Cell.html
+//! [`RefCell`]: ../../std/cell/struct.RefCell.html
+//! [send]: ../../std/marker/trait.Send.html
+//! [arc]: ../../std/sync/struct.Arc.html
+//! [`Deref`]: ../../std/ops/trait.Deref.html
+//! [downgrade]: struct.Rc.html#method.downgrade
+//! [upgrade]: struct.Weak.html#method.upgrade
+//! [`None`]: ../../std/option/enum.Option.html#variant.None
+//! [assoc]: ../../book/method-syntax.html#associated-functions
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -229,13 +230,14 @@ use core::hash::{Hash, Hasher};
 use core::intrinsics::{abort, assume};
 use core::marker;
 use core::marker::Unsize;
-use core::mem::{self, align_of_val, forget, size_of_val, uninitialized};
+use core::mem::{self, align_of_val, forget, size_of, size_of_val, uninitialized};
 use core::ops::Deref;
 use core::ops::CoerceUnsized;
 use core::ptr::{self, Shared};
 use core::convert::From;
 
 use heap::deallocate;
+use raw_vec::RawVec;
 
 struct RcBox<T: ?Sized> {
     strong: Cell<usize>,
@@ -249,9 +251,11 @@ struct RcBox<T: ?Sized> {
 /// See the [module-level documentation](./index.html) for more details.
 ///
 /// The inherent methods of `Rc` are all associated functions, which means
-/// that you have to call them as e.g. `Rc::get_mut(&value)` instead of
-/// `value.get_mut()`.  This avoids conflicts with methods of the inner
+/// that you have to call them as e.g. [`Rc::get_mut(&value)`][get_mut] instead of
+/// `value.get_mut()`. This avoids conflicts with methods of the inner
 /// type `T`.
+///
+/// [get_mut]: #method.get_mut
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Rc<T: ?Sized> {
     ptr: Shared<RcBox<T>>,
@@ -294,9 +298,12 @@ impl<T> Rc<T> {
 
     /// Returns the contained value, if the `Rc` has exactly one strong reference.
     ///
-    /// Otherwise, an `Err` is returned with the same `Rc` that was passed in.
+    /// Otherwise, an [`Err`][result] is returned with the same `Rc` that was
+    /// passed in.
     ///
     /// This will succeed even if there are outstanding weak references.
+    ///
+    /// [result]: ../../std/result/enum.Result.html
     ///
     /// # Examples
     ///
@@ -331,7 +338,11 @@ impl<T> Rc<T> {
         }
     }
 
-    /// Checks whether `Rc::try_unwrap` would return `Ok`.
+    /// Checks whether [`Rc::try_unwrap`][try_unwrap] would return
+    /// [`Ok`].
+    ///
+    /// [try_unwrap]: struct.Rc.html#method.try_unwrap
+    /// [`Ok`]: ../../std/result/enum.Result.html#variant.Ok
     ///
     /// # Examples
     ///
@@ -354,6 +365,93 @@ impl<T> Rc<T> {
                issue = "28356")]
     pub fn would_unwrap(this: &Self) -> bool {
         Rc::strong_count(&this) == 1
+    }
+
+    /// Consumes the `Rc`, returning the wrapped pointer.
+    ///
+    /// To avoid a memory leak the pointer must be converted back to an `Rc` using
+    /// [`Rc::from_raw`][from_raw].
+    ///
+    /// [from_raw]: struct.Rc.html#method.from_raw
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(rc_raw)]
+    ///
+    /// use std::rc::Rc;
+    ///
+    /// let x = Rc::new(10);
+    /// let x_ptr = Rc::into_raw(x);
+    /// assert_eq!(unsafe { *x_ptr }, 10);
+    /// ```
+    #[unstable(feature = "rc_raw", issue = "37197")]
+    pub fn into_raw(this: Self) -> *mut T {
+        let ptr = unsafe { &mut (**this.ptr).value as *mut _ };
+        mem::forget(this);
+        ptr
+    }
+
+    /// Constructs an `Rc` from a raw pointer.
+    ///
+    /// The raw pointer must have been previously returned by a call to a
+    /// [`Rc::into_raw`][into_raw].
+    ///
+    /// This function is unsafe because improper use may lead to memory problems. For example, a
+    /// double-free may occur if the function is called twice on the same raw pointer.
+    ///
+    /// [into_raw]: struct.Rc.html#method.into_raw
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(rc_raw)]
+    ///
+    /// use std::rc::Rc;
+    ///
+    /// let x = Rc::new(10);
+    /// let x_ptr = Rc::into_raw(x);
+    ///
+    /// unsafe {
+    ///     // Convert back to an `Rc` to prevent leak.
+    ///     let x = Rc::from_raw(x_ptr);
+    ///     assert_eq!(*x, 10);
+    ///
+    ///     // Further calls to `Rc::from_raw(x_ptr)` would be memory unsafe.
+    /// }
+    ///
+    /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
+    /// ```
+    #[unstable(feature = "rc_raw", issue = "37197")]
+    pub unsafe fn from_raw(ptr: *mut T) -> Self {
+        // To find the corresponding pointer to the `RcBox` we need to subtract the offset of the
+        // `value` field from the pointer.
+        Rc { ptr: Shared::new((ptr as *mut u8).offset(-offset_of!(RcBox<T>, value)) as *mut _) }
+    }
+}
+
+impl Rc<str> {
+    /// Constructs a new `Rc<str>` from a string slice.
+    #[doc(hidden)]
+    #[unstable(feature = "rustc_private",
+               reason = "for internal use in rustc",
+               issue = "0")]
+    pub fn __from_str(value: &str) -> Rc<str> {
+        unsafe {
+            // Allocate enough space for `RcBox<str>`.
+            let aligned_len = 2 + (value.len() + size_of::<usize>() - 1) / size_of::<usize>();
+            let vec = RawVec::<usize>::with_capacity(aligned_len);
+            let ptr = vec.ptr();
+            forget(vec);
+            // Initialize fields of `RcBox<str>`.
+            *ptr.offset(0) = 1; // strong: Cell::new(1)
+            *ptr.offset(1) = 1; // weak: Cell::new(1)
+            ptr::copy_nonoverlapping(value.as_ptr(), ptr.offset(2) as *mut u8, value.len());
+            // Combine the allocation address and the string length into a fat pointer to `RcBox`.
+            let rcbox_ptr: *mut RcBox<str> = mem::transmute([ptr as usize, value.len()]);
+            assert!(aligned_len * size_of::<usize>() == size_of_val(&*rcbox_ptr));
+            Rc { ptr: Shared::new(rcbox_ptr) }
+        }
     }
 }
 
@@ -447,14 +545,14 @@ impl<T: ?Sized> Rc<T> {
     /// Returns a mutable reference to the inner value, if there are
     /// no other `Rc` or [`Weak`][weak] pointers to the same value.
     ///
-    /// Returns [`None`][option] otherwise, because it is not safe to
+    /// Returns [`None`] otherwise, because it is not safe to
     /// mutate a shared value.
     ///
     /// See also [`make_mut`][make_mut], which will [`clone`][clone]
     /// the inner value when it's shared.
     ///
     /// [weak]: struct.Weak.html
-    /// [option]: ../../std/option/enum.Option.html
+    /// [`None`]: ../../std/option/enum.Option.html#variant.None
     /// [make_mut]: struct.Rc.html#method.make_mut
     /// [clone]: ../../std/clone/trait.Clone.html#tymethod.clone
     ///
@@ -582,8 +680,10 @@ impl<T: ?Sized> Drop for Rc<T> {
     /// Drops the `Rc`.
     ///
     /// This will decrement the strong reference count. If the strong reference
-    /// count reaches zero then the only other references (if any) are `Weak`,
-    /// so we `drop` the inner value.
+    /// count reaches zero then the only other references (if any) are
+    /// [`Weak`][weak], so we `drop` the inner value.
+    ///
+    /// [weak]: struct.Weak.html
     ///
     /// # Examples
     ///
@@ -1249,6 +1349,23 @@ mod tests {
         let x = Rc::new(5);
         let _w = Rc::downgrade(&x);
         assert_eq!(Rc::try_unwrap(x), Ok(5));
+    }
+
+    #[test]
+    fn into_from_raw() {
+        let x = Rc::new(box "hello");
+        let y = x.clone();
+
+        let x_ptr = Rc::into_raw(x);
+        drop(y);
+        unsafe {
+            assert_eq!(**x_ptr, "hello");
+
+            let x = Rc::from_raw(x_ptr);
+            assert_eq!(**x, "hello");
+
+            assert_eq!(Rc::try_unwrap(x).map(|x| *x), Ok("hello"));
+        }
     }
 
     #[test]

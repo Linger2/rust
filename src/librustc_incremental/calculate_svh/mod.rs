@@ -29,57 +29,72 @@
 
 use syntax::ast;
 use std::cell::RefCell;
-use std::hash::{Hash, SipHasher, Hasher};
+use std::hash::Hash;
 use rustc::dep_graph::DepNode;
 use rustc::hir;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, DefId};
 use rustc::hir::intravisit as visit;
+use rustc::hir::intravisit::{Visitor, NestedVisitorMap};
 use rustc::ty::TyCtxt;
-use rustc_data_structures::fnv::FnvHashMap;
+use rustc_data_structures::fx::FxHashMap;
 use rustc::util::common::record_time;
 use rustc::session::config::DebugInfoLevel::NoDebugInfo;
 
 use self::def_path_hash::DefPathHashes;
 use self::svh_visitor::StrictVersionHashVisitor;
 use self::caching_codemap_view::CachingCodemapView;
+use self::hasher::IchHasher;
+use ich::Fingerprint;
+
 
 mod def_path_hash;
 mod svh_visitor;
 mod caching_codemap_view;
+pub mod hasher;
 
 pub struct IncrementalHashesMap {
-    hashes: FnvHashMap<DepNode<DefId>, u64>,
+    hashes: FxHashMap<DepNode<DefId>, Fingerprint>,
 
     // These are the metadata hashes for the current crate as they were stored
     // during the last compilation session. They are only loaded if
     // -Z query-dep-graph was specified and are needed for auto-tests using
     // the #[rustc_metadata_dirty] and #[rustc_metadata_clean] attributes to
     // check whether some metadata hash has changed in between two revisions.
-    pub prev_metadata_hashes: RefCell<FnvHashMap<DefId, u64>>,
+    pub prev_metadata_hashes: RefCell<FxHashMap<DefId, Fingerprint>>,
 }
 
 impl IncrementalHashesMap {
     pub fn new() -> IncrementalHashesMap {
         IncrementalHashesMap {
-            hashes: FnvHashMap(),
-            prev_metadata_hashes: RefCell::new(FnvHashMap()),
+            hashes: FxHashMap(),
+            prev_metadata_hashes: RefCell::new(FxHashMap()),
         }
     }
 
-    pub fn insert(&mut self, k: DepNode<DefId>, v: u64) -> Option<u64> {
+    pub fn insert(&mut self, k: DepNode<DefId>, v: Fingerprint) -> Option<Fingerprint> {
         self.hashes.insert(k, v)
     }
 
-    pub fn iter<'a>(&'a self) -> ::std::collections::hash_map::Iter<'a, DepNode<DefId>, u64> {
+    pub fn iter<'a>(&'a self)
+                    -> ::std::collections::hash_map::Iter<'a, DepNode<DefId>, Fingerprint> {
         self.hashes.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
     }
 }
 
 impl<'a> ::std::ops::Index<&'a DepNode<DefId>> for IncrementalHashesMap {
-    type Output = u64;
+    type Output = Fingerprint;
 
-    fn index(&self, index: &'a DepNode<DefId>) -> &u64 {
-        &self.hashes[index]
+    fn index(&self, index: &'a DepNode<DefId>) -> &Fingerprint {
+        match self.hashes.get(index) {
+            Some(fingerprint) => fingerprint,
+            None => {
+                bug!("Could not find ICH for {:?}", index);
+            }
+        }
     }
 }
 
@@ -97,10 +112,19 @@ pub fn compute_incremental_hashes_map<'a, 'tcx: 'a>(tcx: TyCtxt<'a, 'tcx, 'tcx>)
         hash_spans: hash_spans,
     };
     record_time(&tcx.sess.perf_stats.incr_comp_hashes_time, || {
-        visitor.calculate_def_id(DefId::local(CRATE_DEF_INDEX),
-                                 |v| visit::walk_crate(v, krate));
-        krate.visit_all_items(&mut visitor);
+        visitor.calculate_def_id(DefId::local(CRATE_DEF_INDEX), |v| {
+            v.hash_crate_root_module(krate);
+        });
+        krate.visit_all_item_likes(&mut visitor.as_deep_visitor());
+
+        for macro_def in krate.exported_macros.iter() {
+            visitor.calculate_node_id(macro_def.id,
+                                      |v| v.visit_macro_def(macro_def));
+        }
     });
+
+    tcx.sess.perf_stats.incr_comp_hashes_count.set(visitor.hashes.len() as u64);
+
     record_time(&tcx.sess.perf_stats.svh_time, || visitor.compute_crate_hash());
     visitor.hashes
 }
@@ -126,28 +150,42 @@ impl<'a, 'tcx> HashItemsVisitor<'a, 'tcx> {
     {
         assert!(def_id.is_local());
         debug!("HashItemsVisitor::calculate(def_id={:?})", def_id);
-        // FIXME: this should use SHA1, not SipHash. SipHash is not
-        // built to avoid collisions.
-        let mut state = SipHasher::new();
+        self.calculate_def_hash(DepNode::Hir(def_id), false, &mut walk_op);
+        self.calculate_def_hash(DepNode::HirBody(def_id), true, &mut walk_op);
+    }
+
+    fn calculate_def_hash<W>(&mut self,
+                             dep_node: DepNode<DefId>,
+                             hash_bodies: bool,
+                             walk_op: &mut W)
+        where W: for<'v> FnMut(&mut StrictVersionHashVisitor<'v, 'a, 'tcx>)
+    {
+        let mut state = IchHasher::new();
         walk_op(&mut StrictVersionHashVisitor::new(&mut state,
                                                    self.tcx,
                                                    &mut self.def_path_hashes,
                                                    &mut self.codemap,
-                                                   self.hash_spans));
+                                                   self.hash_spans,
+                                                   hash_bodies));
+        let bytes_hashed = state.bytes_hashed();
         let item_hash = state.finish();
-        self.hashes.insert(DepNode::Hir(def_id), item_hash);
-        debug!("calculate_item_hash: def_id={:?} hash={:?}", def_id, item_hash);
+        debug!("calculate_def_hash: dep_node={:?} hash={:?}", dep_node, item_hash);
+        self.hashes.insert(dep_node, item_hash);
+
+        let bytes_hashed = self.tcx.sess.perf_stats.incr_comp_bytes_hashed.get() +
+            bytes_hashed;
+        self.tcx.sess.perf_stats.incr_comp_bytes_hashed.set(bytes_hashed);
     }
 
     fn compute_crate_hash(&mut self) {
         let krate = self.tcx.map.krate();
 
-        let mut crate_state = SipHasher::new();
+        let mut crate_state = IchHasher::new();
 
         let crate_disambiguator = self.tcx.sess.local_crate_disambiguator();
         "crate_disambiguator".hash(&mut crate_state);
-        crate_disambiguator.len().hash(&mut crate_state);
-        crate_disambiguator.hash(&mut crate_state);
+        crate_disambiguator.as_str().len().hash(&mut crate_state);
+        crate_disambiguator.as_str().hash(&mut crate_state);
 
         // add each item (in some deterministic order) to the overall
         // crate hash.
@@ -174,7 +212,8 @@ impl<'a, 'tcx> HashItemsVisitor<'a, 'tcx> {
                                                             self.tcx,
                                                             &mut self.def_path_hashes,
                                                             &mut self.codemap,
-                                                            self.hash_spans);
+                                                            self.hash_spans,
+                                                            false);
             visitor.hash_attributes(&krate.attrs);
         }
 
@@ -185,10 +224,19 @@ impl<'a, 'tcx> HashItemsVisitor<'a, 'tcx> {
 }
 
 
-impl<'a, 'tcx> visit::Visitor<'tcx> for HashItemsVisitor<'a, 'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for HashItemsVisitor<'a, 'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::None
+    }
+
     fn visit_item(&mut self, item: &'tcx hir::Item) {
         self.calculate_node_id(item.id, |v| v.visit_item(item));
         visit::walk_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, impl_item: &'tcx hir::ImplItem) {
+        self.calculate_node_id(impl_item.id, |v| v.visit_impl_item(impl_item));
+        visit::walk_impl_item(self, impl_item);
     }
 
     fn visit_foreign_item(&mut self, item: &'tcx hir::ForeignItem) {

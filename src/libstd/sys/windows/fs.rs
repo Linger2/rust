@@ -81,6 +81,14 @@ pub struct FilePermissions { attrs: c::DWORD }
 
 pub struct DirBuilder;
 
+impl fmt::Debug for ReadDir {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // This will only be called from std::fs::ReadDir, which will add a "ReadDir()" frame.
+        // Thus the result will be e g 'ReadDir("C:\")'
+        fmt::Debug::fmt(&*self.root, f)
+    }
+}
+
 impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
@@ -311,12 +319,20 @@ impl File {
         self.handle.read(buf)
     }
 
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.handle.read_at(buf, offset)
+    }
+
     pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.handle.read_to_end(buf)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         self.handle.write(buf)
+    }
+
+    pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        self.handle.write_at(buf, offset)
     }
 
     pub fn flush(&self) -> io::Result<()> { Ok(()) }
@@ -400,6 +416,24 @@ impl File {
             }
             Ok(PathBuf::from(OsString::from_wide(subst)))
         }
+    }
+
+    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
+        let mut info = c::FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: perm.attrs,
+        };
+        let size = mem::size_of_val(&info);
+        cvt(unsafe {
+            c::SetFileInformationByHandle(self.handle.raw(),
+                                          c::FileBasicInfo,
+                                          &mut info as *mut _ as *mut _,
+                                          size as c::DWORD)
+        })?;
+        Ok(())
     }
 }
 

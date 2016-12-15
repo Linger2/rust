@@ -25,11 +25,18 @@
 //!
 //! ```rust
 //! use std::path::Path;
+//! use std::ffi::OsStr;
 //!
 //! let path = Path::new("/tmp/foo/bar.txt");
-//! let file = path.file_name();
+//!
+//! let parent = path.parent();
+//! assert_eq!(parent, Some(Path::new("/tmp/foo")));
+//!
+//! let file_stem = path.file_stem();
+//! assert_eq!(file_stem, Some(OsStr::new("bar")));
+//!
 //! let extension = path.extension();
-//! let parent_dir = path.parent();
+//! assert_eq!(extension, Some(OsStr::new("txt")));
 //! ```
 //!
 //! To build or modify paths, use `PathBuf`:
@@ -113,7 +120,7 @@ use ops::{self, Deref};
 
 use ffi::{OsStr, OsString};
 
-use self::platform::{is_sep_byte, is_verbatim_sep, MAIN_SEP_STR, parse_prefix};
+use sys::path::{is_sep_byte, is_verbatim_sep, MAIN_SEP_STR, parse_prefix};
 
 ////////////////////////////////////////////////////////////////////////////////
 // GENERAL NOTES
@@ -124,130 +131,6 @@ use self::platform::{is_sep_byte, is_verbatim_sep, MAIN_SEP_STR, parse_prefix};
 // as-is.  Eventually, this transmutation should be replaced by direct uses of
 // OsStr APIs for parsing, but it will take a while for those to become
 // available.
-
-////////////////////////////////////////////////////////////////////////////////
-// Platform-specific definitions
-////////////////////////////////////////////////////////////////////////////////
-
-// The following modules give the most basic tools for parsing paths on various
-// platforms. The bulk of the code is devoted to parsing prefixes on Windows.
-
-#[cfg(unix)]
-mod platform {
-    use super::Prefix;
-    use ffi::OsStr;
-
-    #[inline]
-    pub fn is_sep_byte(b: u8) -> bool {
-        b == b'/'
-    }
-
-    #[inline]
-    pub fn is_verbatim_sep(b: u8) -> bool {
-        b == b'/'
-    }
-
-    pub fn parse_prefix(_: &OsStr) -> Option<Prefix> {
-        None
-    }
-
-    pub const MAIN_SEP_STR: &'static str = "/";
-    pub const MAIN_SEP: char = '/';
-}
-
-#[cfg(windows)]
-mod platform {
-    use ascii::*;
-
-    use super::{os_str_as_u8_slice, u8_slice_as_os_str, Prefix};
-    use ffi::OsStr;
-
-    #[inline]
-    pub fn is_sep_byte(b: u8) -> bool {
-        b == b'/' || b == b'\\'
-    }
-
-    #[inline]
-    pub fn is_verbatim_sep(b: u8) -> bool {
-        b == b'\\'
-    }
-
-    pub fn parse_prefix<'a>(path: &'a OsStr) -> Option<Prefix> {
-        use super::Prefix::*;
-        unsafe {
-            // The unsafety here stems from converting between &OsStr and &[u8]
-            // and back. This is safe to do because (1) we only look at ASCII
-            // contents of the encoding and (2) new &OsStr values are produced
-            // only from ASCII-bounded slices of existing &OsStr values.
-            let mut path = os_str_as_u8_slice(path);
-
-            if path.starts_with(br"\\") {
-                // \\
-                path = &path[2..];
-                if path.starts_with(br"?\") {
-                    // \\?\
-                    path = &path[2..];
-                    if path.starts_with(br"UNC\") {
-                        // \\?\UNC\server\share
-                        path = &path[4..];
-                        let (server, share) = match parse_two_comps(path, is_verbatim_sep) {
-                            Some((server, share)) =>
-                                (u8_slice_as_os_str(server), u8_slice_as_os_str(share)),
-                            None => (u8_slice_as_os_str(path), u8_slice_as_os_str(&[])),
-                        };
-                        return Some(VerbatimUNC(server, share));
-                    } else {
-                        // \\?\path
-                        let idx = path.iter().position(|&b| b == b'\\');
-                        if idx == Some(2) && path[1] == b':' {
-                            let c = path[0];
-                            if c.is_ascii() && (c as char).is_alphabetic() {
-                                // \\?\C:\ path
-                                return Some(VerbatimDisk(c.to_ascii_uppercase()));
-                            }
-                        }
-                        let slice = &path[..idx.unwrap_or(path.len())];
-                        return Some(Verbatim(u8_slice_as_os_str(slice)));
-                    }
-                } else if path.starts_with(b".\\") {
-                    // \\.\path
-                    path = &path[2..];
-                    let pos = path.iter().position(|&b| b == b'\\');
-                    let slice = &path[..pos.unwrap_or(path.len())];
-                    return Some(DeviceNS(u8_slice_as_os_str(slice)));
-                }
-                match parse_two_comps(path, is_sep_byte) {
-                    Some((server, share)) if !server.is_empty() && !share.is_empty() => {
-                        // \\server\share
-                        return Some(UNC(u8_slice_as_os_str(server), u8_slice_as_os_str(share)));
-                    }
-                    _ => (),
-                }
-            } else if path.get(1) == Some(& b':') {
-                // C:
-                let c = path[0];
-                if c.is_ascii() && (c as char).is_alphabetic() {
-                    return Some(Disk(c.to_ascii_uppercase()));
-                }
-            }
-            return None;
-        }
-
-        fn parse_two_comps(mut path: &[u8], f: fn(u8) -> bool) -> Option<(&[u8], &[u8])> {
-            let first = match path.iter().position(|x| f(*x)) {
-                None => return None,
-                Some(x) => &path[..x],
-            };
-            path = &path[(first.len() + 1)..];
-            let idx = path.iter().position(|x| f(*x));
-            let second = &path[..idx.unwrap_or(path.len())];
-            Some((first, second))
-        }
-    }
-
-    pub const MAIN_SEP_STR: &'static str = "\\";
-    pub const MAIN_SEP: char = '\\';
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Windows Prefixes
@@ -371,9 +254,11 @@ pub fn is_separator(c: char) -> bool {
     c.is_ascii() && is_sep_byte(c as u8)
 }
 
-/// The primary separator for the current platform
+/// The primary separator of path components for the current platform.
+///
+/// For example, `/` on Unix and `\` on Windows.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub const MAIN_SEPARATOR: char = platform::MAIN_SEP;
+pub const MAIN_SEPARATOR: char = ::sys::path::MAIN_SEP;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Misc helpers
@@ -572,7 +457,17 @@ pub enum Component<'a> {
 }
 
 impl<'a> Component<'a> {
-    /// Extracts the underlying `OsStr` slice
+    /// Extracts the underlying `OsStr` slice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::Path;
+    ///
+    /// let path = Path::new("./tmp/foo/bar.txt");
+    /// let components: Vec<_> = path.components().map(|comp| comp.as_os_str()).collect();
+    /// assert_eq!(&components, &[".", "tmp", "foo", "bar.txt"]);
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn as_os_str(self) -> &'a OsStr {
         match self {
@@ -1038,6 +933,7 @@ impl<'a> cmp::Ord for Components<'a> {
 /// [`Path`]: struct.Path.html
 /// [`push`]: struct.PathBuf.html#method.push
 /// [`set_extension`]: struct.PathBuf.html#method.set_extension
+/// [`Deref`]: ../ops/trait.Deref.html
 ///
 /// More details about the overall approach can be found in
 /// the module documentation.
@@ -1106,17 +1002,24 @@ impl PathBuf {
     ///
     /// # Examples
     ///
+    /// Pushing a relative path extends the existing path:
+    ///
     /// ```
     /// use std::path::PathBuf;
     ///
-    /// let mut path = PathBuf::new();
-    /// path.push("/tmp");
+    /// let mut path = PathBuf::from("/tmp");
     /// path.push("file.bk");
     /// assert_eq!(path, PathBuf::from("/tmp/file.bk"));
+    /// ```
     ///
-    /// // Pushing an absolute path replaces the current path
-    /// path.push("/etc/passwd");
-    /// assert_eq!(path, PathBuf::from("/etc/passwd"));
+    /// Pushing an absolute path replaces the existing path:
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    ///
+    /// let mut path = PathBuf::from("/tmp");
+    /// path.push("/etc");
+    /// assert_eq!(path, PathBuf::from("/etc"));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn push<P: AsRef<Path>>(&mut self, path: P) {
@@ -1296,6 +1199,13 @@ impl From<OsString> for PathBuf {
     }
 }
 
+#[stable(feature = "from_path_buf_for_os_string", since = "1.14.0")]
+impl From<PathBuf> for OsString {
+    fn from(path_buf : PathBuf) -> OsString {
+        path_buf.inner
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<String> for PathBuf {
     fn from(s: String) -> PathBuf {
@@ -1406,38 +1316,41 @@ impl AsRef<OsStr> for PathBuf {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
-impl Into<OsString> for PathBuf {
-    fn into(self) -> OsString {
-        self.inner
-    }
-}
-
 /// A slice of a path (akin to [`str`]).
 ///
 /// This type supports a number of operations for inspecting a path, including
 /// breaking the path into its components (separated by `/` or `\`, depending on
 /// the platform), extracting the file name, determining whether the path is
-/// absolute, and so on. More details about the overall approach can be found in
-/// the module documentation.
+/// absolute, and so on.
 ///
 /// This is an *unsized* type, meaning that it must always be used behind a
-/// pointer like `&` or [`Box`].
+/// pointer like `&` or [`Box`]. For an owned version of this type,
+/// see [`PathBuf`].
 ///
 /// [`str`]: ../primitive.str.html
 /// [`Box`]: ../boxed/struct.Box.html
+/// [`PathBuf`]: struct.PathBuf.html
+///
+/// More details about the overall approach can be found in
+/// the module documentation.
 ///
 /// # Examples
 ///
 /// ```
 /// use std::path::Path;
+/// use std::ffi::OsStr;
 ///
 /// let path = Path::new("/tmp/foo/bar.txt");
-/// let file = path.file_name();
-/// let extension = path.extension();
-/// let parent_dir = path.parent();
-/// ```
 ///
+/// let parent = path.parent();
+/// assert_eq!(parent, Some(Path::new("/tmp/foo")));
+///
+/// let file_stem = path.file_stem();
+/// assert_eq!(file_stem, Some(OsStr::new("bar")));
+///
+/// let extension = path.extension();
+/// assert_eq!(extension, Some(OsStr::new("txt")));
+/// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Path {
     inner: OsStr,
@@ -3511,10 +3424,11 @@ mod tests {
 
     #[test]
     pub fn test_compare() {
-        use hash::{Hash, Hasher, SipHasher};
+        use hash::{Hash, Hasher};
+        use collections::hash_map::DefaultHasher;
 
         fn hash<T: Hash>(t: T) -> u64 {
-            let mut s = SipHasher::new_with_keys(0, 0);
+            let mut s = DefaultHasher::new();
             t.hash(&mut s);
             s.finish()
         }

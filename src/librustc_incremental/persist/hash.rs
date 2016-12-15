@@ -12,12 +12,13 @@ use rustc::dep_graph::DepNode;
 use rustc::hir::def_id::{CrateNum, DefId};
 use rustc::hir::svh::Svh;
 use rustc::ty::TyCtxt;
-use rustc_data_structures::fnv::FnvHashMap;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::flock;
 use rustc_serialize::Decodable;
 use rustc_serialize::opaque::Decoder;
 
 use IncrementalHashesMap;
+use ich::Fingerprint;
 use super::data::*;
 use super::fs::*;
 use super::file_format;
@@ -25,8 +26,8 @@ use super::file_format;
 pub struct HashContext<'a, 'tcx: 'a> {
     pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
     incremental_hashes_map: &'a IncrementalHashesMap,
-    item_metadata_hashes: FnvHashMap<DefId, u64>,
-    crate_hashes: FnvHashMap<CrateNum, Svh>,
+    item_metadata_hashes: FxHashMap<DefId, Fingerprint>,
+    crate_hashes: FxHashMap<CrateNum, Svh>,
 }
 
 impl<'a, 'tcx> HashContext<'a, 'tcx> {
@@ -36,28 +37,30 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         HashContext {
             tcx: tcx,
             incremental_hashes_map: incremental_hashes_map,
-            item_metadata_hashes: FnvHashMap(),
-            crate_hashes: FnvHashMap(),
+            item_metadata_hashes: FxHashMap(),
+            crate_hashes: FxHashMap(),
         }
     }
 
     pub fn is_hashable(dep_node: &DepNode<DefId>) -> bool {
         match *dep_node {
             DepNode::Krate |
-            DepNode::Hir(_) => true,
+            DepNode::Hir(_) |
+            DepNode::HirBody(_) =>
+                true,
             DepNode::MetaData(def_id) => !def_id.is_local(),
             _ => false,
         }
     }
 
-    pub fn hash(&mut self, dep_node: &DepNode<DefId>) -> Option<u64> {
+    pub fn hash(&mut self, dep_node: &DepNode<DefId>) -> Option<Fingerprint> {
         match *dep_node {
             DepNode::Krate => {
                 Some(self.incremental_hashes_map[dep_node])
             }
 
             // HIR nodes (which always come from our crate) are an input:
-            DepNode::Hir(def_id) => {
+            DepNode::Hir(def_id) | DepNode::HirBody(def_id) => {
                 assert!(def_id.is_local(),
                         "cannot hash HIR for non-local def-id {:?} => {:?}",
                         def_id,
@@ -89,7 +92,7 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         }
     }
 
-    fn metadata_hash(&mut self, def_id: DefId) -> u64 {
+    fn metadata_hash(&mut self, def_id: DefId) -> Fingerprint {
         debug!("metadata_hash(def_id={:?})", def_id);
 
         assert!(!def_id.is_local());
@@ -102,14 +105,15 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
 
             // check whether we did not find detailed metadata for this
             // krate; in that case, we just use the krate's overall hash
-            if let Some(&hash) = self.crate_hashes.get(&def_id.krate) {
-                debug!("metadata_hash: def_id={:?} crate_hash={:?}", def_id, hash);
+            if let Some(&svh) = self.crate_hashes.get(&def_id.krate) {
+                debug!("metadata_hash: def_id={:?} crate_hash={:?}", def_id, svh);
 
                 // micro-"optimization": avoid a cache miss if we ask
                 // for metadata from this particular def-id again.
-                self.item_metadata_hashes.insert(def_id, hash.as_u64());
+                let fingerprint = svh_to_fingerprint(svh);
+                self.item_metadata_hashes.insert(def_id, fingerprint);
 
-                return hash.as_u64();
+                return fingerprint;
             }
 
             // otherwise, load the data and repeat.
@@ -152,7 +156,7 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
 
             let hashes_file_path = metadata_hash_import_path(&session_dir);
 
-            match file_format::read_file(&hashes_file_path)
+            match file_format::read_file(self.tcx.sess, &hashes_file_path)
             {
                 Ok(Some(data)) => {
                     match self.load_from_data(cnum, &data, svh) {
@@ -205,4 +209,8 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
         }
         Ok(())
     }
+}
+
+fn svh_to_fingerprint(svh: Svh) -> Fingerprint {
+    Fingerprint::from_smaller_hash(svh.as_u64())
 }

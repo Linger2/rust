@@ -15,7 +15,12 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use clone;
+use cmp;
+use fmt;
+use hash;
 use intrinsics;
+use marker::{Copy, PhantomData, Sized};
 use ptr;
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -332,7 +337,7 @@ pub unsafe fn zeroed<T>() -> T {
 /// Bypasses Rust's normal memory-initialization checks by pretending to
 /// produce a value of type `T`, while doing nothing at all.
 ///
-/// **This is incredibly dangerous, and should not be done lightly. Deeply
+/// **This is incredibly dangerous and should not be done lightly. Deeply
 /// consider initializing your memory with a default value instead.**
 ///
 /// This is useful for [FFI] functions and initializing arrays sometimes,
@@ -347,24 +352,18 @@ pub unsafe fn zeroed<T>() -> T {
 /// a boolean, your program may take one, both, or neither of the branches.
 ///
 /// Writing to the uninitialized value is similarly dangerous. Rust believes the
-/// value is initialized, and will therefore try to [`Drop`][drop] the uninitialized
+/// value is initialized, and will therefore try to [`Drop`] the uninitialized
 /// value and its fields if you try to overwrite it in a normal manner. The only way
 /// to safely initialize an uninitialized value is with [`ptr::write`][write],
 /// [`ptr::copy`][copy], or [`ptr::copy_nonoverlapping`][copy_no].
 ///
-/// If the value does implement `Drop`, it must be initialized before
+/// If the value does implement [`Drop`], it must be initialized before
 /// it goes out of scope (and therefore would be dropped). Note that this
 /// includes a `panic` occurring and unwinding the stack suddenly.
 ///
-/// [ub]: ../../reference.html#behavior-considered-undefined
-/// [write]: ../ptr/fn.write.html
-/// [copy]: ../intrinsics/fn.copy.html
-/// [copy_no]: ../intrinsics/fn.copy_nonoverlapping.html
-/// [drop]: ../ops/trait.Drop.html
-///
 /// # Examples
 ///
-/// Here's how to safely initialize an array of `Vec`s.
+/// Here's how to safely initialize an array of [`Vec`]s.
 ///
 /// ```
 /// use std::mem;
@@ -405,8 +404,8 @@ pub unsafe fn zeroed<T>() -> T {
 /// ```
 ///
 /// This example emphasizes exactly how delicate and dangerous using `mem::uninitialized`
-/// can be. Note that the `vec!` macro *does* let you initialize every element with a
-/// value that is only `Clone`, so the following is semantically equivalent and
+/// can be. Note that the [`vec!`] macro *does* let you initialize every element with a
+/// value that is only [`Clone`], so the following is semantically equivalent and
 /// vastly less dangerous, as long as you can live with an extra heap
 /// allocation:
 ///
@@ -414,6 +413,15 @@ pub unsafe fn zeroed<T>() -> T {
 /// let data: Vec<Vec<u32>> = vec![Vec::new(); 1000];
 /// println!("{:?}", &data[0]);
 /// ```
+///
+/// [`Vec`]: ../../std/vec/struct.Vec.html
+/// [`vec!`]: ../../std/macro.vec.html
+/// [`Clone`]: ../../std/clone/trait.Clone.html
+/// [ub]: ../../reference.html#behavior-considered-undefined
+/// [write]: ../ptr/fn.write.html
+/// [copy]: ../intrinsics/fn.copy.html
+/// [copy_no]: ../intrinsics/fn.copy_nonoverlapping.html
+/// [`Drop`]: ../ops/trait.Drop.html
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn uninitialized<T>() -> T {
@@ -487,7 +495,7 @@ pub fn swap<T>(x: &mut T, y: &mut T) {
 /// }
 /// ```
 ///
-/// Note that `T` does not necessarily implement `Clone`, so it can't even clone and reset
+/// Note that `T` does not necessarily implement [`Clone`], so it can't even clone and reset
 /// `self.buf`. But `replace` can be used to disassociate the original value of `self.buf` from
 /// `self`, allowing it to be returned:
 ///
@@ -502,6 +510,8 @@ pub fn swap<T>(x: &mut T, y: &mut T) {
 ///     }
 /// }
 /// ```
+///
+/// [`Clone`]: ../../std/clone/trait.Clone.html
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn replace<T>(dest: &mut T, mut src: T) -> T {
@@ -566,8 +576,8 @@ pub fn replace<T>(dest: &mut T, mut src: T) -> T {
 /// v.push(4); // no problems
 /// ```
 ///
-/// Since `RefCell` enforces the borrow rules at runtime, `drop` can
-/// release a `RefCell` borrow:
+/// Since [`RefCell`] enforces the borrow rules at runtime, `drop` can
+/// release a [`RefCell`] borrow:
 ///
 /// ```
 /// use std::cell::RefCell;
@@ -583,7 +593,7 @@ pub fn replace<T>(dest: &mut T, mut src: T) -> T {
 /// println!("{}", *borrow);
 /// ```
 ///
-/// Integers and other types implementing `Copy` are unaffected by `drop`.
+/// Integers and other types implementing [`Copy`] are unaffected by `drop`.
 ///
 /// ```
 /// #[derive(Copy, Clone)]
@@ -597,6 +607,8 @@ pub fn replace<T>(dest: &mut T, mut src: T) -> T {
 /// println!("x: {}, y: {}", x, y.0); // still available
 /// ```
 ///
+/// [`RefCell`]: ../../std/cell/struct.RefCell.html
+/// [`Copy`]: ../../std/marker/trait.Copy.html
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn drop<T>(_x: T) { }
@@ -647,3 +659,80 @@ pub fn drop<T>(_x: T) { }
 pub unsafe fn transmute_copy<T, U>(src: &T) -> U {
     ptr::read(src as *const T as *const U)
 }
+
+/// Opaque type representing the discriminant of an enum.
+///
+/// See the `discriminant` function in this module for more information.
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+pub struct Discriminant<T>(u64, PhantomData<*const T>);
+
+// N.B. These trait implementations cannot be derived because we don't want any bounds on T.
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> Copy for Discriminant<T> {}
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> clone::Clone for Discriminant<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> cmp::PartialEq for Discriminant<T> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.0 == rhs.0
+    }
+}
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> cmp::Eq for Discriminant<T> {}
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> hash::Hash for Discriminant<T> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+impl<T> fmt::Debug for Discriminant<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_tuple("Discriminant")
+           .field(&self.0)
+           .finish()
+    }
+}
+
+/// Returns a value uniquely identifying the enum variant in `v`.
+///
+/// If `T` is not an enum, calling this function will not result in undefined behavior, but the
+/// return value is unspecified.
+///
+/// # Stability
+///
+/// The discriminant of an enum variant may change if the enum definition changes. A discriminant
+/// of some variant will not change between compilations with the same compiler.
+///
+/// # Examples
+///
+/// This can be used to compare enums that carry data, while disregarding
+/// the actual data:
+///
+/// ```
+/// #![feature(discriminant_value)]
+/// use std::mem;
+///
+/// enum Foo { A(&'static str), B(i32), C(i32) }
+///
+/// assert!(mem::discriminant(&Foo::A("bar")) == mem::discriminant(&Foo::A("baz")));
+/// assert!(mem::discriminant(&Foo::B(1))     == mem::discriminant(&Foo::B(2)));
+/// assert!(mem::discriminant(&Foo::B(3))     != mem::discriminant(&Foo::C(3)));
+/// ```
+#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+pub fn discriminant<T>(v: &T) -> Discriminant<T> {
+    unsafe {
+        Discriminant(intrinsics::discriminant_value(v), PhantomData)
+    }
+}
+

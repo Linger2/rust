@@ -8,11 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use debuginfo::{DIBuilderRef, DIDescriptor,
-                DIFile, DILexicalBlock, DISubprogram, DIType,
-                DIBasicType, DIDerivedType, DICompositeType, DIScope,
-                DIVariable, DIGlobalVariable, DIArray, DISubrange,
-                DITemplateTypeParameter, DIEnumerator, DINameSpace};
+use debuginfo::{DIBuilderRef, DIDescriptor, DIFile, DILexicalBlock, DISubprogram, DIType,
+                DIBasicType, DIDerivedType, DICompositeType, DIScope, DIVariable,
+                DIGlobalVariable, DIArray, DISubrange, DITemplateTypeParameter, DIEnumerator,
+                DINameSpace, DIFlags};
 
 use libc::{c_uint, c_int, size_t, c_char};
 use libc::{c_longlong, c_ulonglong, c_void};
@@ -42,9 +41,10 @@ pub enum CallConv {
     ColdCallConv = 9,
     X86StdcallCallConv = 64,
     X86FastcallCallConv = 65,
+    ArmAapcsCallConv = 67,
     X86_64_SysV = 78,
     X86_64_Win64 = 79,
-    X86_VectorCall = 80
+    X86_VectorCall = 80,
 }
 
 /// LLVMRustLinkage
@@ -64,6 +64,15 @@ pub enum Linkage {
     CommonLinkage = 10,
 }
 
+// LLVMRustVisibility
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[repr(C)]
+pub enum Visibility {
+    Default = 0,
+    Hidden = 1,
+    Protected = 2,
+}
+
 /// LLVMDiagnosticSeverity
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -78,64 +87,36 @@ pub enum DiagnosticSeverity {
 #[derive(Copy, Clone)]
 #[repr(C)]
 pub enum DLLStorageClass {
-  Default   = 0,
-  DllImport = 1, /* Function to be imported from DLL. */
-  DllExport = 2, /* Function to be accessible from DLL. */
+    Default = 0,
+    DllImport = 1, // Function to be imported from DLL.
+    DllExport = 2, // Function to be accessible from DLL.
 }
 
-bitflags! {
-    #[derive(Default, Debug)]
-    flags Attribute : u64 {
-        const ZExt            = 1 << 0,
-        const SExt            = 1 << 1,
-        const NoReturn        = 1 << 2,
-        const InReg           = 1 << 3,
-        const StructRet       = 1 << 4,
-        const NoUnwind        = 1 << 5,
-        const NoAlias         = 1 << 6,
-        const ByVal           = 1 << 7,
-        const Nest            = 1 << 8,
-        const ReadNone        = 1 << 9,
-        const ReadOnly        = 1 << 10,
-        const NoInline        = 1 << 11,
-        const AlwaysInline    = 1 << 12,
-        const OptimizeForSize = 1 << 13,
-        const StackProtect    = 1 << 14,
-        const StackProtectReq = 1 << 15,
-        const NoCapture       = 1 << 21,
-        const NoRedZone       = 1 << 22,
-        const NoImplicitFloat = 1 << 23,
-        const Naked           = 1 << 24,
-        const InlineHint      = 1 << 25,
-        const ReturnsTwice    = 1 << 29,
-        const UWTable         = 1 << 30,
-        const NonLazyBind     = 1 << 31,
-
-        // Some of these are missing from the LLVM C API, the rest are
-        // present, but commented out, and preceded by the following warning:
-        // FIXME: These attributes are currently not included in the C API as
-        // a temporary measure until the API/ABI impact to the C API is understood
-        // and the path forward agreed upon.
-        const SanitizeAddress = 1 << 32,
-        const MinSize         = 1 << 33,
-        const NoDuplicate     = 1 << 34,
-        const StackProtectStrong = 1 << 35,
-        const SanitizeThread  = 1 << 36,
-        const SanitizeMemory  = 1 << 37,
-        const NoBuiltin       = 1 << 38,
-        const Returned        = 1 << 39,
-        const Cold            = 1 << 40,
-        const Builtin         = 1 << 41,
-        const OptimizeNone    = 1 << 42,
-        const InAlloca        = 1 << 43,
-        const NonNull         = 1 << 44,
-        const JumpTable       = 1 << 45,
-        const Convergent      = 1 << 46,
-        const SafeStack       = 1 << 47,
-        const NoRecurse       = 1 << 48,
-        const InaccessibleMemOnly         = 1 << 49,
-        const InaccessibleMemOrArgMemOnly = 1 << 50,
-    }
+/// Matches LLVMRustAttribute in rustllvm.h
+/// Semantically a subset of the C++ enum llvm::Attribute::AttrKind,
+/// though it is not ABI compatible (since it's a C++ enum)
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub enum Attribute {
+    AlwaysInline    = 0,
+    ByVal           = 1,
+    Cold            = 2,
+    InlineHint      = 3,
+    MinSize         = 4,
+    Naked           = 5,
+    NoAlias         = 6,
+    NoCapture       = 7,
+    NoInline        = 8,
+    NonNull         = 9,
+    NoRedZone       = 10,
+    NoReturn        = 11,
+    NoUnwind        = 12,
+    OptimizeForSize = 13,
+    ReadOnly        = 14,
+    SExt            = 15,
+    StructRet       = 16,
+    UWTable         = 17,
+    ZExt            = 18,
 }
 
 /// LLVMIntPredicate
@@ -180,23 +161,23 @@ pub enum RealPredicate {
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(C)]
 pub enum TypeKind {
-    Void      = 0,
-    Half      = 1,
-    Float     = 2,
-    Double    = 3,
-    X86_FP80  = 4,
-    FP128     = 5,
+    Void = 0,
+    Half = 1,
+    Float = 2,
+    Double = 3,
+    X86_FP80 = 4,
+    FP128 = 5,
     PPC_FP128 = 6,
-    Label     = 7,
-    Integer   = 8,
-    Function  = 9,
-    Struct    = 10,
-    Array     = 11,
-    Pointer   = 12,
-    Vector    = 13,
-    Metadata  = 14,
-    X86_MMX   = 15,
-    Token     = 16,
+    Label = 7,
+    Integer = 8,
+    Function = 9,
+    Struct = 10,
+    Array = 11,
+    Pointer = 12,
+    Vector = 13,
+    Metadata = 14,
+    X86_MMX = 15,
+    Token = 16,
 }
 
 /// LLVMAtomicRmwBinOp
@@ -204,14 +185,14 @@ pub enum TypeKind {
 #[repr(C)]
 pub enum AtomicRmwBinOp {
     AtomicXchg = 0,
-    AtomicAdd  = 1,
-    AtomicSub  = 2,
-    AtomicAnd  = 3,
+    AtomicAdd = 1,
+    AtomicSub = 2,
+    AtomicAnd = 3,
     AtomicNand = 4,
-    AtomicOr   = 5,
-    AtomicXor  = 6,
-    AtomicMax  = 7,
-    AtomicMin  = 8,
+    AtomicOr = 5,
+    AtomicXor = 6,
+    AtomicMax = 7,
+    AtomicMin = 8,
     AtomicUMax = 9,
     AtomicUMin = 10,
 }
@@ -227,7 +208,7 @@ pub enum AtomicOrdering {
     Acquire = 4,
     Release = 5,
     AcquireRelease = 6,
-    SequentiallyConsistent = 7
+    SequentiallyConsistent = 7,
 }
 
 /// LLVMRustSynchronizationScope
@@ -427,9 +408,9 @@ pub type OperandBundleDefRef = *mut OperandBundleDef_opaque;
 pub type DiagnosticHandler = unsafe extern "C" fn(DiagnosticInfoRef, *mut c_void);
 pub type InlineAsmDiagHandler = unsafe extern "C" fn(SMDiagnosticRef, *const c_void, c_uint);
 
+
 pub mod debuginfo {
-    pub use self::DIDescriptorFlags::*;
-    use super::{MetadataRef};
+    use super::MetadataRef;
 
     #[allow(missing_copy_implementations)]
     pub enum DIBuilder_opaque {}
@@ -453,24 +434,29 @@ pub mod debuginfo {
     pub type DIEnumerator = DIDescriptor;
     pub type DITemplateTypeParameter = DIDescriptor;
 
-    #[derive(Copy, Clone)]
-    pub enum DIDescriptorFlags {
-      FlagPrivate            = 1 << 0,
-      FlagProtected          = 1 << 1,
-      FlagFwdDecl            = 1 << 2,
-      FlagAppleBlock         = 1 << 3,
-      FlagBlockByrefStruct   = 1 << 4,
-      FlagVirtual            = 1 << 5,
-      FlagArtificial         = 1 << 6,
-      FlagExplicit           = 1 << 7,
-      FlagPrototyped         = 1 << 8,
-      FlagObjcClassComplete  = 1 << 9,
-      FlagObjectPointer      = 1 << 10,
-      FlagVector             = 1 << 11,
-      FlagStaticMember       = 1 << 12,
-      FlagIndirectVariable   = 1 << 13,
-      FlagLValueReference    = 1 << 14,
-      FlagRValueReference    = 1 << 15
+    // These values **must** match with LLVMRustDIFlags!!
+    bitflags! {
+        #[repr(C)]
+        #[derive(Debug, Default)]
+        flags DIFlags: ::libc::uint32_t {
+            const FlagZero                = 0,
+            const FlagPrivate             = 1,
+            const FlagProtected           = 2,
+            const FlagPublic              = 3,
+            const FlagFwdDecl             = (1 << 2),
+            const FlagAppleBlock          = (1 << 3),
+            const FlagBlockByrefStruct    = (1 << 4),
+            const FlagVirtual             = (1 << 5),
+            const FlagArtificial          = (1 << 6),
+            const FlagExplicit            = (1 << 7),
+            const FlagPrototyped          = (1 << 8),
+            const FlagObjcClassComplete   = (1 << 9),
+            const FlagObjectPointer       = (1 << 10),
+            const FlagVector              = (1 << 11),
+            const FlagStaticMember        = (1 << 12),
+            const FlagLValueReference     = (1 << 13),
+            const FlagRValueReference     = (1 << 14),
+        }
     }
 }
 
@@ -485,24 +471,17 @@ pub mod debuginfo {
 // generates an llvmdeps.rs file next to this one which will be
 // automatically updated whenever LLVM is updated to include an up-to-date
 // set of the libraries we need to link to LLVM for.
-#[link(name = "rustllvm", kind = "static")]
-#[cfg(not(cargobuild))]
-extern {}
-
-#[linked_from = "rustllvm"] // not quite true but good enough
-extern {
-    /* Create and destroy contexts. */
+#[cfg_attr(not(all(stage0,cargobuild)),
+           link(name = "rustllvm", kind = "static"))] // not quite true but good enough
+#[cfg_attr(stage0, linked_from = "rustllvm")]
+extern "C" {
+    // Create and destroy contexts.
     pub fn LLVMContextCreate() -> ContextRef;
     pub fn LLVMContextDispose(C: ContextRef);
-    pub fn LLVMGetMDKindIDInContext(C: ContextRef,
-                                    Name: *const c_char,
-                                    SLen: c_uint)
-                                    -> c_uint;
+    pub fn LLVMGetMDKindIDInContext(C: ContextRef, Name: *const c_char, SLen: c_uint) -> c_uint;
 
-    /* Create and destroy modules. */
-    pub fn LLVMModuleCreateWithNameInContext(ModuleID: *const c_char,
-                                             C: ContextRef)
-                                             -> ModuleRef;
+    // Create and destroy modules.
+    pub fn LLVMModuleCreateWithNameInContext(ModuleID: *const c_char, C: ContextRef) -> ModuleRef;
     pub fn LLVMGetModuleContext(M: ModuleRef) -> ContextRef;
     pub fn LLVMCloneModule(M: ModuleRef) -> ModuleRef;
     pub fn LLVMDisposeModule(M: ModuleRef);
@@ -510,10 +489,6 @@ extern {
     /// Data layout. See Module::getDataLayout.
     pub fn LLVMGetDataLayout(M: ModuleRef) -> *const c_char;
     pub fn LLVMSetDataLayout(M: ModuleRef, Triple: *const c_char);
-
-    /// Target triple. See Module::getTargetTriple.
-    pub fn LLVMGetTarget(M: ModuleRef) -> *const c_char;
-    pub fn LLVMSetTarget(M: ModuleRef, Triple: *const c_char);
 
     /// See Module::dump.
     pub fn LLVMDumpModule(M: ModuleRef);
@@ -524,137 +499,91 @@ extern {
     /// See llvm::LLVMTypeKind::getTypeID.
     pub fn LLVMRustGetTypeKind(Ty: TypeRef) -> TypeKind;
 
-    /// See llvm::LLVMType::getContext.
-    pub fn LLVMGetTypeContext(Ty: TypeRef) -> ContextRef;
+    /// See llvm::Value::getContext
+    pub fn LLVMRustGetValueContext(V: ValueRef) -> ContextRef;
 
-    /* Operations on integer types */
+    // Operations on integer types
     pub fn LLVMInt1TypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMInt8TypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMInt16TypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMInt32TypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMInt64TypeInContext(C: ContextRef) -> TypeRef;
-    pub fn LLVMIntTypeInContext(C: ContextRef, NumBits: c_uint)
-                                -> TypeRef;
+    pub fn LLVMIntTypeInContext(C: ContextRef, NumBits: c_uint) -> TypeRef;
 
     pub fn LLVMGetIntTypeWidth(IntegerTy: TypeRef) -> c_uint;
 
-    /* Operations on real types */
+    // Operations on real types
     pub fn LLVMFloatTypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMDoubleTypeInContext(C: ContextRef) -> TypeRef;
-    pub fn LLVMX86FP80TypeInContext(C: ContextRef) -> TypeRef;
-    pub fn LLVMFP128TypeInContext(C: ContextRef) -> TypeRef;
-    pub fn LLVMPPCFP128TypeInContext(C: ContextRef) -> TypeRef;
 
-    /* Operations on function types */
+    // Operations on function types
     pub fn LLVMFunctionType(ReturnType: TypeRef,
                             ParamTypes: *const TypeRef,
                             ParamCount: c_uint,
                             IsVarArg: Bool)
                             -> TypeRef;
-    pub fn LLVMIsFunctionVarArg(FunctionTy: TypeRef) -> Bool;
     pub fn LLVMGetReturnType(FunctionTy: TypeRef) -> TypeRef;
     pub fn LLVMCountParamTypes(FunctionTy: TypeRef) -> c_uint;
     pub fn LLVMGetParamTypes(FunctionTy: TypeRef, Dest: *mut TypeRef);
 
-    /* Operations on struct types */
+    // Operations on struct types
     pub fn LLVMStructTypeInContext(C: ContextRef,
                                    ElementTypes: *const TypeRef,
                                    ElementCount: c_uint,
                                    Packed: Bool)
                                    -> TypeRef;
     pub fn LLVMCountStructElementTypes(StructTy: TypeRef) -> c_uint;
-    pub fn LLVMGetStructElementTypes(StructTy: TypeRef,
-                                     Dest: *mut TypeRef);
+    pub fn LLVMGetStructElementTypes(StructTy: TypeRef, Dest: *mut TypeRef);
     pub fn LLVMIsPackedStruct(StructTy: TypeRef) -> Bool;
 
-    /* Operations on array, pointer, and vector types (sequence types) */
+    // Operations on array, pointer, and vector types (sequence types)
     pub fn LLVMRustArrayType(ElementType: TypeRef, ElementCount: u64) -> TypeRef;
-    pub fn LLVMPointerType(ElementType: TypeRef, AddressSpace: c_uint)
-                           -> TypeRef;
-    pub fn LLVMVectorType(ElementType: TypeRef, ElementCount: c_uint)
-                          -> TypeRef;
+    pub fn LLVMPointerType(ElementType: TypeRef, AddressSpace: c_uint) -> TypeRef;
+    pub fn LLVMVectorType(ElementType: TypeRef, ElementCount: c_uint) -> TypeRef;
 
     pub fn LLVMGetElementType(Ty: TypeRef) -> TypeRef;
     pub fn LLVMGetArrayLength(ArrayTy: TypeRef) -> c_uint;
-    pub fn LLVMGetPointerAddressSpace(PointerTy: TypeRef) -> c_uint;
-    pub fn LLVMGetPointerToGlobal(EE: ExecutionEngineRef, V: ValueRef)
-                                  -> *const c_void;
     pub fn LLVMGetVectorSize(VectorTy: TypeRef) -> c_uint;
 
-    /* Operations on other types */
+    // Operations on other types
     pub fn LLVMVoidTypeInContext(C: ContextRef) -> TypeRef;
-    pub fn LLVMLabelTypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMRustMetadataTypeInContext(C: ContextRef) -> TypeRef;
 
-    /* Operations on all values */
+    // Operations on all values
     pub fn LLVMTypeOf(Val: ValueRef) -> TypeRef;
     pub fn LLVMGetValueName(Val: ValueRef) -> *const c_char;
     pub fn LLVMSetValueName(Val: ValueRef, Name: *const c_char);
-    pub fn LLVMDumpValue(Val: ValueRef);
     pub fn LLVMReplaceAllUsesWith(OldVal: ValueRef, NewVal: ValueRef);
     pub fn LLVMSetMetadata(Val: ValueRef, KindID: c_uint, Node: ValueRef);
 
-    /* Operations on Uses */
+    // Operations on Uses
     pub fn LLVMGetFirstUse(Val: ValueRef) -> UseRef;
     pub fn LLVMGetNextUse(U: UseRef) -> UseRef;
     pub fn LLVMGetUser(U: UseRef) -> ValueRef;
-    pub fn LLVMGetUsedValue(U: UseRef) -> ValueRef;
 
-    /* Operations on Users */
-    pub fn LLVMGetNumOperands(Val: ValueRef) -> c_int;
+    // Operations on Users
     pub fn LLVMGetOperand(Val: ValueRef, Index: c_uint) -> ValueRef;
-    pub fn LLVMSetOperand(Val: ValueRef, Index: c_uint, Op: ValueRef);
 
-    /* Operations on constants of any type */
+    // Operations on constants of any type
     pub fn LLVMConstNull(Ty: TypeRef) -> ValueRef;
-    /* all zeroes */
-    pub fn LLVMConstAllOnes(Ty: TypeRef) -> ValueRef;
-    pub fn LLVMConstICmp(Pred: IntPredicate, V1: ValueRef, V2: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstFCmp(Pred: RealPredicate, V1: ValueRef, V2: ValueRef)
-                         -> ValueRef;
-    /* only for isize/vector */
+    pub fn LLVMConstICmp(Pred: IntPredicate, V1: ValueRef, V2: ValueRef) -> ValueRef;
+    pub fn LLVMConstFCmp(Pred: RealPredicate, V1: ValueRef, V2: ValueRef) -> ValueRef;
+    // only for isize/vector
     pub fn LLVMGetUndef(Ty: TypeRef) -> ValueRef;
-    pub fn LLVMIsConstant(Val: ValueRef) -> Bool;
     pub fn LLVMIsNull(Val: ValueRef) -> Bool;
     pub fn LLVMIsUndef(Val: ValueRef) -> Bool;
-    pub fn LLVMConstPointerNull(Ty: TypeRef) -> ValueRef;
 
-    /* Operations on metadata */
-    pub fn LLVMMDStringInContext(C: ContextRef,
-                                 Str: *const c_char,
-                                 SLen: c_uint)
-                                 -> ValueRef;
-    pub fn LLVMMDNodeInContext(C: ContextRef,
-                               Vals: *const ValueRef,
-                               Count: c_uint)
-                               -> ValueRef;
-    pub fn LLVMAddNamedMetadataOperand(M: ModuleRef,
-                                       Str: *const c_char,
-                                       Val: ValueRef);
+    // Operations on metadata
+    pub fn LLVMMDNodeInContext(C: ContextRef, Vals: *const ValueRef, Count: c_uint) -> ValueRef;
 
-    /* Operations on scalar constants */
-    pub fn LLVMConstInt(IntTy: TypeRef, N: c_ulonglong, SignExtend: Bool)
-                        -> ValueRef;
-    pub fn LLVMConstIntOfString(IntTy: TypeRef, Text: *const c_char, Radix: u8)
-                                -> ValueRef;
-    pub fn LLVMConstIntOfStringAndSize(IntTy: TypeRef,
-                                       Text: *const c_char,
-                                       SLen: c_uint,
-                                       Radix: u8)
-                                       -> ValueRef;
+    // Operations on scalar constants
+    pub fn LLVMConstInt(IntTy: TypeRef, N: c_ulonglong, SignExtend: Bool) -> ValueRef;
     pub fn LLVMConstReal(RealTy: TypeRef, N: f64) -> ValueRef;
-    pub fn LLVMConstRealOfString(RealTy: TypeRef, Text: *const c_char)
-                                 -> ValueRef;
-    pub fn LLVMConstRealOfStringAndSize(RealTy: TypeRef,
-                                        Text: *const c_char,
-                                        SLen: c_uint)
-                                        -> ValueRef;
     pub fn LLVMConstIntGetZExtValue(ConstantVal: ValueRef) -> c_ulonglong;
     pub fn LLVMConstIntGetSExtValue(ConstantVal: ValueRef) -> c_longlong;
 
 
-    /* Operations on composite constants */
+    // Operations on composite constants
     pub fn LLVMConstStringInContext(C: ContextRef,
                                     Str: *const c_char,
                                     Length: c_uint,
@@ -670,353 +599,151 @@ extern {
                           ConstantVals: *const ValueRef,
                           Length: c_uint)
                           -> ValueRef;
-    pub fn LLVMConstVector(ScalarConstantVals: *const ValueRef, Size: c_uint)
-                           -> ValueRef;
+    pub fn LLVMConstVector(ScalarConstantVals: *const ValueRef, Size: c_uint) -> ValueRef;
 
-    /* Constant expressions */
-    pub fn LLVMAlignOf(Ty: TypeRef) -> ValueRef;
+    // Constant expressions
     pub fn LLVMSizeOf(Ty: TypeRef) -> ValueRef;
     pub fn LLVMConstNeg(ConstantVal: ValueRef) -> ValueRef;
-    pub fn LLVMConstNSWNeg(ConstantVal: ValueRef) -> ValueRef;
-    pub fn LLVMConstNUWNeg(ConstantVal: ValueRef) -> ValueRef;
     pub fn LLVMConstFNeg(ConstantVal: ValueRef) -> ValueRef;
     pub fn LLVMConstNot(ConstantVal: ValueRef) -> ValueRef;
-    pub fn LLVMConstAdd(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstNSWAdd(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstNUWAdd(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstFAdd(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstSub(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstNSWSub(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstNUWSub(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstFSub(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstMul(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstNSWMul(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstNUWMul(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstFMul(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstUDiv(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstSDiv(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstExactSDiv(LHSConstant: ValueRef,
-                              RHSConstant: ValueRef)
-                              -> ValueRef;
-    pub fn LLVMConstFDiv(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstURem(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstSRem(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstFRem(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstAnd(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstOr(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                       -> ValueRef;
-    pub fn LLVMConstXor(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstShl(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                        -> ValueRef;
-    pub fn LLVMConstLShr(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstAShr(LHSConstant: ValueRef, RHSConstant: ValueRef)
-                         -> ValueRef;
-    pub fn LLVMConstGEP(ConstantVal: ValueRef,
-                        ConstantIndices: *const ValueRef,
-                        NumIndices: c_uint)
-                        -> ValueRef;
-    pub fn LLVMConstInBoundsGEP(ConstantVal: ValueRef,
-                                ConstantIndices: *const ValueRef,
-                                NumIndices: c_uint)
-                                -> ValueRef;
-    pub fn LLVMConstTrunc(ConstantVal: ValueRef, ToType: TypeRef)
-                          -> ValueRef;
-    pub fn LLVMConstSExt(ConstantVal: ValueRef, ToType: TypeRef)
-                         -> ValueRef;
-    pub fn LLVMConstZExt(ConstantVal: ValueRef, ToType: TypeRef)
-                         -> ValueRef;
-    pub fn LLVMConstFPTrunc(ConstantVal: ValueRef, ToType: TypeRef)
-                            -> ValueRef;
-    pub fn LLVMConstFPExt(ConstantVal: ValueRef, ToType: TypeRef)
-                          -> ValueRef;
-    pub fn LLVMConstUIToFP(ConstantVal: ValueRef, ToType: TypeRef)
-                           -> ValueRef;
-    pub fn LLVMConstSIToFP(ConstantVal: ValueRef, ToType: TypeRef)
-                           -> ValueRef;
-    pub fn LLVMConstFPToUI(ConstantVal: ValueRef, ToType: TypeRef)
-                           -> ValueRef;
-    pub fn LLVMConstFPToSI(ConstantVal: ValueRef, ToType: TypeRef)
-                           -> ValueRef;
-    pub fn LLVMConstPtrToInt(ConstantVal: ValueRef, ToType: TypeRef)
-                             -> ValueRef;
-    pub fn LLVMConstIntToPtr(ConstantVal: ValueRef, ToType: TypeRef)
-                             -> ValueRef;
-    pub fn LLVMConstBitCast(ConstantVal: ValueRef, ToType: TypeRef)
-                            -> ValueRef;
-    pub fn LLVMConstZExtOrBitCast(ConstantVal: ValueRef, ToType: TypeRef)
-                                  -> ValueRef;
-    pub fn LLVMConstSExtOrBitCast(ConstantVal: ValueRef, ToType: TypeRef)
-                                  -> ValueRef;
-    pub fn LLVMConstTruncOrBitCast(ConstantVal: ValueRef, ToType: TypeRef)
-                                   -> ValueRef;
-    pub fn LLVMConstPointerCast(ConstantVal: ValueRef, ToType: TypeRef)
-                                -> ValueRef;
-    pub fn LLVMConstIntCast(ConstantVal: ValueRef,
-                            ToType: TypeRef,
-                            isSigned: Bool)
-                            -> ValueRef;
-    pub fn LLVMConstFPCast(ConstantVal: ValueRef, ToType: TypeRef)
-                           -> ValueRef;
-    pub fn LLVMConstSelect(ConstantCondition: ValueRef,
-                           ConstantIfTrue: ValueRef,
-                           ConstantIfFalse: ValueRef)
-                           -> ValueRef;
-    pub fn LLVMConstExtractElement(VectorConstant: ValueRef,
-                                   IndexConstant: ValueRef)
-                                   -> ValueRef;
-    pub fn LLVMConstInsertElement(VectorConstant: ValueRef,
-                                  ElementValueConstant: ValueRef,
-                                  IndexConstant: ValueRef)
-                                  -> ValueRef;
-    pub fn LLVMConstShuffleVector(VectorAConstant: ValueRef,
-                                  VectorBConstant: ValueRef,
-                                  MaskConstant: ValueRef)
-                                  -> ValueRef;
+    pub fn LLVMConstAdd(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstFAdd(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstSub(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstFSub(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstMul(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstFMul(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstUDiv(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstSDiv(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstFDiv(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstURem(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstSRem(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstFRem(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstAnd(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstOr(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstXor(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstShl(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstLShr(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstAShr(LHSConstant: ValueRef, RHSConstant: ValueRef) -> ValueRef;
+    pub fn LLVMConstTrunc(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstZExt(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstUIToFP(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstSIToFP(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstFPToUI(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstFPToSI(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstPtrToInt(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstIntToPtr(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstBitCast(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstPointerCast(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
+    pub fn LLVMConstIntCast(ConstantVal: ValueRef, ToType: TypeRef, isSigned: Bool) -> ValueRef;
+    pub fn LLVMConstFPCast(ConstantVal: ValueRef, ToType: TypeRef) -> ValueRef;
     pub fn LLVMConstExtractValue(AggConstant: ValueRef,
                                  IdxList: *const c_uint,
                                  NumIdx: c_uint)
                                  -> ValueRef;
-    pub fn LLVMConstInsertValue(AggConstant: ValueRef,
-                                ElementValueConstant: ValueRef,
-                                IdxList: *const c_uint,
-                                NumIdx: c_uint)
-                                -> ValueRef;
     pub fn LLVMConstInlineAsm(Ty: TypeRef,
                               AsmString: *const c_char,
                               Constraints: *const c_char,
                               HasSideEffects: Bool,
                               IsAlignStack: Bool)
                               -> ValueRef;
-    pub fn LLVMBlockAddress(F: ValueRef, BB: BasicBlockRef) -> ValueRef;
 
 
-
-    /* Operations on global variables, functions, and aliases (globals) */
+    // Operations on global variables, functions, and aliases (globals)
     pub fn LLVMGetGlobalParent(Global: ValueRef) -> ModuleRef;
     pub fn LLVMIsDeclaration(Global: ValueRef) -> Bool;
     pub fn LLVMRustGetLinkage(Global: ValueRef) -> Linkage;
     pub fn LLVMRustSetLinkage(Global: ValueRef, RustLinkage: Linkage);
     pub fn LLVMGetSection(Global: ValueRef) -> *const c_char;
     pub fn LLVMSetSection(Global: ValueRef, Section: *const c_char);
-    pub fn LLVMGetVisibility(Global: ValueRef) -> c_uint;
-    pub fn LLVMSetVisibility(Global: ValueRef, Viz: c_uint);
+    pub fn LLVMRustGetVisibility(Global: ValueRef) -> Visibility;
+    pub fn LLVMRustSetVisibility(Global: ValueRef, Viz: Visibility);
     pub fn LLVMGetAlignment(Global: ValueRef) -> c_uint;
     pub fn LLVMSetAlignment(Global: ValueRef, Bytes: c_uint);
-    pub fn LLVMSetDLLStorageClass(V: ValueRef,
-                                  C: DLLStorageClass);
+    pub fn LLVMSetDLLStorageClass(V: ValueRef, C: DLLStorageClass);
 
 
-    /* Operations on global variables */
+    // Operations on global variables
     pub fn LLVMIsAGlobalVariable(GlobalVar: ValueRef) -> ValueRef;
-    pub fn LLVMAddGlobal(M: ModuleRef, Ty: TypeRef, Name: *const c_char)
-                         -> ValueRef;
-    pub fn LLVMAddGlobalInAddressSpace(M: ModuleRef,
-                                       Ty: TypeRef,
-                                       Name: *const c_char,
-                                       AddressSpace: c_uint)
-                                       -> ValueRef;
-    pub fn LLVMGetNamedGlobal(M: ModuleRef,
-                              Name: *const c_char)
-                              -> ValueRef;
-    pub fn LLVMRustGetOrInsertGlobal(M: ModuleRef,
-                                     Name: *const c_char,
-                                     T: TypeRef)
-                                     -> ValueRef;
+    pub fn LLVMAddGlobal(M: ModuleRef, Ty: TypeRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMGetNamedGlobal(M: ModuleRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMRustGetOrInsertGlobal(M: ModuleRef, Name: *const c_char, T: TypeRef) -> ValueRef;
     pub fn LLVMGetFirstGlobal(M: ModuleRef) -> ValueRef;
-    pub fn LLVMGetLastGlobal(M: ModuleRef) -> ValueRef;
     pub fn LLVMGetNextGlobal(GlobalVar: ValueRef) -> ValueRef;
-    pub fn LLVMGetPreviousGlobal(GlobalVar: ValueRef) -> ValueRef;
     pub fn LLVMDeleteGlobal(GlobalVar: ValueRef);
     pub fn LLVMGetInitializer(GlobalVar: ValueRef) -> ValueRef;
-    pub fn LLVMSetInitializer(GlobalVar: ValueRef,
-                              ConstantVal: ValueRef);
-    pub fn LLVMIsThreadLocal(GlobalVar: ValueRef) -> Bool;
+    pub fn LLVMSetInitializer(GlobalVar: ValueRef, ConstantVal: ValueRef);
     pub fn LLVMSetThreadLocal(GlobalVar: ValueRef, IsThreadLocal: Bool);
     pub fn LLVMIsGlobalConstant(GlobalVar: ValueRef) -> Bool;
     pub fn LLVMSetGlobalConstant(GlobalVar: ValueRef, IsConstant: Bool);
     pub fn LLVMRustGetNamedValue(M: ModuleRef, Name: *const c_char) -> ValueRef;
 
-    /* Operations on aliases */
-    pub fn LLVMAddAlias(M: ModuleRef,
-                        Ty: TypeRef,
-                        Aliasee: ValueRef,
-                        Name: *const c_char)
-                        -> ValueRef;
-
-    /* Operations on functions */
-    pub fn LLVMAddFunction(M: ModuleRef,
-                           Name: *const c_char,
-                           FunctionTy: TypeRef)
-                           -> ValueRef;
+    // Operations on functions
+    pub fn LLVMAddFunction(M: ModuleRef, Name: *const c_char, FunctionTy: TypeRef) -> ValueRef;
     pub fn LLVMGetNamedFunction(M: ModuleRef, Name: *const c_char) -> ValueRef;
     pub fn LLVMGetFirstFunction(M: ModuleRef) -> ValueRef;
-    pub fn LLVMGetLastFunction(M: ModuleRef) -> ValueRef;
     pub fn LLVMGetNextFunction(Fn: ValueRef) -> ValueRef;
-    pub fn LLVMGetPreviousFunction(Fn: ValueRef) -> ValueRef;
-    pub fn LLVMDeleteFunction(Fn: ValueRef);
     pub fn LLVMRustGetOrInsertFunction(M: ModuleRef,
                                        Name: *const c_char,
                                        FunctionTy: TypeRef)
                                        -> ValueRef;
-    pub fn LLVMGetIntrinsicID(Fn: ValueRef) -> c_uint;
-    pub fn LLVMGetFunctionCallConv(Fn: ValueRef) -> c_uint;
     pub fn LLVMSetFunctionCallConv(Fn: ValueRef, CC: c_uint);
-    pub fn LLVMGetGC(Fn: ValueRef) -> *const c_char;
-    pub fn LLVMSetGC(Fn: ValueRef, Name: *const c_char);
     pub fn LLVMRustAddDereferenceableAttr(Fn: ValueRef, index: c_uint, bytes: u64);
-    pub fn LLVMRustAddFunctionAttribute(Fn: ValueRef, index: c_uint, PA: u64);
-    pub fn LLVMRustAddFunctionAttrString(Fn: ValueRef, index: c_uint, Name: *const c_char);
-    pub fn LLVMRustAddFunctionAttrStringValue(Fn: ValueRef, index: c_uint,
+    pub fn LLVMRustAddFunctionAttribute(Fn: ValueRef, index: c_uint, attr: Attribute);
+    pub fn LLVMRustAddFunctionAttrStringValue(Fn: ValueRef,
+                                              index: c_uint,
                                               Name: *const c_char,
                                               Value: *const c_char);
-    pub fn LLVMRustRemoveFunctionAttributes(Fn: ValueRef,
-                                            index: c_uint,
-                                            attr: u64);
-    pub fn LLVMRustRemoveFunctionAttrString(Fn: ValueRef,
-                                            index: c_uint,
-                                            Name: *const c_char);
-    pub fn LLVMGetFunctionAttr(Fn: ValueRef) -> c_uint;
-    pub fn LLVMRemoveFunctionAttr(Fn: ValueRef, val: c_uint);
+    pub fn LLVMRustRemoveFunctionAttributes(Fn: ValueRef, index: c_uint, attr: Attribute);
 
-    /* Operations on parameters */
+    // Operations on parameters
     pub fn LLVMCountParams(Fn: ValueRef) -> c_uint;
-    pub fn LLVMGetParams(Fn: ValueRef, Params: *const ValueRef);
     pub fn LLVMGetParam(Fn: ValueRef, Index: c_uint) -> ValueRef;
-    pub fn LLVMGetParamParent(Inst: ValueRef) -> ValueRef;
-    pub fn LLVMGetFirstParam(Fn: ValueRef) -> ValueRef;
-    pub fn LLVMGetLastParam(Fn: ValueRef) -> ValueRef;
-    pub fn LLVMGetNextParam(Arg: ValueRef) -> ValueRef;
-    pub fn LLVMGetPreviousParam(Arg: ValueRef) -> ValueRef;
-    pub fn LLVMAddAttribute(Arg: ValueRef, PA: c_uint);
-    pub fn LLVMRemoveAttribute(Arg: ValueRef, PA: c_uint);
-    pub fn LLVMGetAttribute(Arg: ValueRef) -> c_uint;
-    pub fn LLVMSetParamAlignment(Arg: ValueRef, align: c_uint);
 
-    /* Operations on basic blocks */
+    // Operations on basic blocks
     pub fn LLVMBasicBlockAsValue(BB: BasicBlockRef) -> ValueRef;
-    pub fn LLVMValueIsBasicBlock(Val: ValueRef) -> Bool;
-    pub fn LLVMValueAsBasicBlock(Val: ValueRef) -> BasicBlockRef;
     pub fn LLVMGetBasicBlockParent(BB: BasicBlockRef) -> ValueRef;
-    pub fn LLVMCountBasicBlocks(Fn: ValueRef) -> c_uint;
-    pub fn LLVMGetBasicBlocks(Fn: ValueRef, BasicBlocks: *const ValueRef);
-    pub fn LLVMGetFirstBasicBlock(Fn: ValueRef) -> BasicBlockRef;
-    pub fn LLVMGetLastBasicBlock(Fn: ValueRef) -> BasicBlockRef;
-    pub fn LLVMGetNextBasicBlock(BB: BasicBlockRef) -> BasicBlockRef;
-    pub fn LLVMGetPreviousBasicBlock(BB: BasicBlockRef) -> BasicBlockRef;
-    pub fn LLVMGetEntryBasicBlock(Fn: ValueRef) -> BasicBlockRef;
-
     pub fn LLVMAppendBasicBlockInContext(C: ContextRef,
                                          Fn: ValueRef,
                                          Name: *const c_char)
                                          -> BasicBlockRef;
-    pub fn LLVMInsertBasicBlockInContext(C: ContextRef,
-                                         BB: BasicBlockRef,
-                                         Name: *const c_char)
-                                         -> BasicBlockRef;
     pub fn LLVMDeleteBasicBlock(BB: BasicBlockRef);
 
-    pub fn LLVMMoveBasicBlockAfter(BB: BasicBlockRef,
-                                   MoveAfter: BasicBlockRef);
-
-    pub fn LLVMMoveBasicBlockBefore(BB: BasicBlockRef,
-                                    MoveBefore: BasicBlockRef);
-
-    /* Operations on instructions */
+    // Operations on instructions
     pub fn LLVMGetInstructionParent(Inst: ValueRef) -> BasicBlockRef;
     pub fn LLVMGetFirstInstruction(BB: BasicBlockRef) -> ValueRef;
-    pub fn LLVMGetLastInstruction(BB: BasicBlockRef) -> ValueRef;
-    pub fn LLVMGetNextInstruction(Inst: ValueRef) -> ValueRef;
-    pub fn LLVMGetPreviousInstruction(Inst: ValueRef) -> ValueRef;
     pub fn LLVMInstructionEraseFromParent(Inst: ValueRef);
 
-    /* Operations on call sites */
+    // Operations on call sites
     pub fn LLVMSetInstructionCallConv(Instr: ValueRef, CC: c_uint);
-    pub fn LLVMGetInstructionCallConv(Instr: ValueRef) -> c_uint;
-    pub fn LLVMAddInstrAttribute(Instr: ValueRef,
-                                 index: c_uint,
-                                 IA: c_uint);
-    pub fn LLVMRemoveInstrAttribute(Instr: ValueRef,
-                                    index: c_uint,
-                                    IA: c_uint);
-    pub fn LLVMSetInstrParamAlignment(Instr: ValueRef,
-                                      index: c_uint,
-                                      align: c_uint);
-    pub fn LLVMRustAddCallSiteAttribute(Instr: ValueRef,
-                                    index: c_uint,
-                                    Val: u64);
-    pub fn LLVMRustAddDereferenceableCallSiteAttr(Instr: ValueRef,
-                                                  index: c_uint,
-                                                  bytes: u64);
+    pub fn LLVMRustAddCallSiteAttribute(Instr: ValueRef, index: c_uint, attr: Attribute);
+    pub fn LLVMRustAddDereferenceableCallSiteAttr(Instr: ValueRef, index: c_uint, bytes: u64);
 
-    /* Operations on call instructions (only) */
-    pub fn LLVMIsTailCall(CallInst: ValueRef) -> Bool;
-    pub fn LLVMSetTailCall(CallInst: ValueRef, IsTailCall: Bool);
-
-    /* Operations on load/store instructions (only) */
-    pub fn LLVMGetVolatile(MemoryAccessInst: ValueRef) -> Bool;
+    // Operations on load/store instructions (only)
     pub fn LLVMSetVolatile(MemoryAccessInst: ValueRef, volatile: Bool);
 
-    /* Operations on phi nodes */
+    // Operations on phi nodes
     pub fn LLVMAddIncoming(PhiNode: ValueRef,
                            IncomingValues: *const ValueRef,
                            IncomingBlocks: *const BasicBlockRef,
                            Count: c_uint);
-    pub fn LLVMCountIncoming(PhiNode: ValueRef) -> c_uint;
-    pub fn LLVMGetIncomingValue(PhiNode: ValueRef, Index: c_uint)
-                                -> ValueRef;
-    pub fn LLVMGetIncomingBlock(PhiNode: ValueRef, Index: c_uint)
-                                -> BasicBlockRef;
 
-    /* Instruction builders */
+    // Instruction builders
     pub fn LLVMCreateBuilderInContext(C: ContextRef) -> BuilderRef;
-    pub fn LLVMPositionBuilder(Builder: BuilderRef,
-                               Block: BasicBlockRef,
-                               Instr: ValueRef);
-    pub fn LLVMPositionBuilderBefore(Builder: BuilderRef,
-                                     Instr: ValueRef);
-    pub fn LLVMPositionBuilderAtEnd(Builder: BuilderRef,
-                                    Block: BasicBlockRef);
+    pub fn LLVMPositionBuilder(Builder: BuilderRef, Block: BasicBlockRef, Instr: ValueRef);
+    pub fn LLVMPositionBuilderBefore(Builder: BuilderRef, Instr: ValueRef);
+    pub fn LLVMPositionBuilderAtEnd(Builder: BuilderRef, Block: BasicBlockRef);
     pub fn LLVMGetInsertBlock(Builder: BuilderRef) -> BasicBlockRef;
-    pub fn LLVMClearInsertionPosition(Builder: BuilderRef);
-    pub fn LLVMInsertIntoBuilder(Builder: BuilderRef, Instr: ValueRef);
-    pub fn LLVMInsertIntoBuilderWithName(Builder: BuilderRef,
-                                         Instr: ValueRef,
-                                         Name: *const c_char);
     pub fn LLVMDisposeBuilder(Builder: BuilderRef);
 
-    /* Metadata */
+    // Metadata
     pub fn LLVMSetCurrentDebugLocation(Builder: BuilderRef, L: ValueRef);
     pub fn LLVMGetCurrentDebugLocation(Builder: BuilderRef) -> ValueRef;
     pub fn LLVMSetInstDebugLocation(Builder: BuilderRef, Inst: ValueRef);
 
-    /* Terminators */
+    // Terminators
     pub fn LLVMBuildRetVoid(B: BuilderRef) -> ValueRef;
     pub fn LLVMBuildRet(B: BuilderRef, V: ValueRef) -> ValueRef;
-    pub fn LLVMBuildAggregateRet(B: BuilderRef,
-                                 RetVals: *const ValueRef,
-                                 N: c_uint)
-                                 -> ValueRef;
+    pub fn LLVMBuildAggregateRet(B: BuilderRef, RetVals: *const ValueRef, N: c_uint) -> ValueRef;
     pub fn LLVMBuildBr(B: BuilderRef, Dest: BasicBlockRef) -> ValueRef;
     pub fn LLVMBuildCondBr(B: BuilderRef,
                            If: ValueRef,
@@ -1028,10 +755,7 @@ extern {
                            Else: BasicBlockRef,
                            NumCases: c_uint)
                            -> ValueRef;
-    pub fn LLVMBuildIndirectBr(B: BuilderRef,
-                               Addr: ValueRef,
-                               NumDests: c_uint)
-                               -> ValueRef;
+    pub fn LLVMBuildIndirectBr(B: BuilderRef, Addr: ValueRef, NumDests: c_uint) -> ValueRef;
     pub fn LLVMRustBuildInvoke(B: BuilderRef,
                                Fn: ValueRef,
                                Args: *const ValueRef,
@@ -1055,42 +779,38 @@ extern {
                                    ParentPad: ValueRef,
                                    ArgCnt: c_uint,
                                    Args: *const ValueRef,
-                                   Name: *const c_char) -> ValueRef;
+                                   Name: *const c_char)
+                                   -> ValueRef;
     pub fn LLVMRustBuildCleanupRet(B: BuilderRef,
                                    CleanupPad: ValueRef,
-                                   UnwindBB: BasicBlockRef) -> ValueRef;
+                                   UnwindBB: BasicBlockRef)
+                                   -> ValueRef;
     pub fn LLVMRustBuildCatchPad(B: BuilderRef,
                                  ParentPad: ValueRef,
                                  ArgCnt: c_uint,
                                  Args: *const ValueRef,
-                                 Name: *const c_char) -> ValueRef;
-    pub fn LLVMRustBuildCatchRet(B: BuilderRef,
-                                 Pad: ValueRef,
-                                 BB: BasicBlockRef) -> ValueRef;
+                                 Name: *const c_char)
+                                 -> ValueRef;
+    pub fn LLVMRustBuildCatchRet(B: BuilderRef, Pad: ValueRef, BB: BasicBlockRef) -> ValueRef;
     pub fn LLVMRustBuildCatchSwitch(Builder: BuilderRef,
                                     ParentPad: ValueRef,
                                     BB: BasicBlockRef,
                                     NumHandlers: c_uint,
-                                    Name: *const c_char) -> ValueRef;
-    pub fn LLVMRustAddHandler(CatchSwitch: ValueRef,
-                              Handler: BasicBlockRef);
+                                    Name: *const c_char)
+                                    -> ValueRef;
+    pub fn LLVMRustAddHandler(CatchSwitch: ValueRef, Handler: BasicBlockRef);
     pub fn LLVMRustSetPersonalityFn(B: BuilderRef, Pers: ValueRef);
 
-    /* Add a case to the switch instruction */
-    pub fn LLVMAddCase(Switch: ValueRef,
-                       OnVal: ValueRef,
-                       Dest: BasicBlockRef);
+    // Add a case to the switch instruction
+    pub fn LLVMAddCase(Switch: ValueRef, OnVal: ValueRef, Dest: BasicBlockRef);
 
-    /* Add a destination to the indirectbr instruction */
-    pub fn LLVMAddDestination(IndirectBr: ValueRef, Dest: BasicBlockRef);
-
-    /* Add a clause to the landing pad instruction */
+    // Add a clause to the landing pad instruction
     pub fn LLVMAddClause(LandingPad: ValueRef, ClauseVal: ValueRef);
 
-    /* Set the cleanup on a landing pad instruction */
+    // Set the cleanup on a landing pad instruction
     pub fn LLVMSetCleanup(LandingPad: ValueRef, Val: Bool);
 
-    /* Arithmetic */
+    // Arithmetic
     pub fn LLVMBuildAdd(B: BuilderRef,
                         LHS: ValueRef,
                         RHS: ValueRef,
@@ -1210,7 +930,7 @@ extern {
                        LHS: ValueRef,
                        RHS: ValueRef,
                        Name: *const c_char)
-                           -> ValueRef;
+                       -> ValueRef;
     pub fn LLVMBuildXor(B: BuilderRef,
                         LHS: ValueRef,
                         RHS: ValueRef,
@@ -1222,29 +942,19 @@ extern {
                           RHS: ValueRef,
                           Name: *const c_char)
                           -> ValueRef;
-    pub fn LLVMBuildNeg(B: BuilderRef, V: ValueRef, Name: *const c_char)
-                        -> ValueRef;
-    pub fn LLVMBuildNSWNeg(B: BuilderRef, V: ValueRef, Name: *const c_char)
-                           -> ValueRef;
-    pub fn LLVMBuildNUWNeg(B: BuilderRef, V: ValueRef, Name: *const c_char)
-                           -> ValueRef;
-    pub fn LLVMBuildFNeg(B: BuilderRef, V: ValueRef, Name: *const c_char)
-                         -> ValueRef;
-    pub fn LLVMBuildNot(B: BuilderRef, V: ValueRef, Name: *const c_char)
-                        -> ValueRef;
+    pub fn LLVMBuildNeg(B: BuilderRef, V: ValueRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMBuildNSWNeg(B: BuilderRef, V: ValueRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMBuildNUWNeg(B: BuilderRef, V: ValueRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMBuildFNeg(B: BuilderRef, V: ValueRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMBuildNot(B: BuilderRef, V: ValueRef, Name: *const c_char) -> ValueRef;
     pub fn LLVMRustSetHasUnsafeAlgebra(Instr: ValueRef);
 
-    /* Memory */
-    pub fn LLVMBuildAlloca(B: BuilderRef, Ty: TypeRef, Name: *const c_char)
-                           -> ValueRef;
+    // Memory
+    pub fn LLVMBuildAlloca(B: BuilderRef, Ty: TypeRef, Name: *const c_char) -> ValueRef;
     pub fn LLVMBuildFree(B: BuilderRef, PointerVal: ValueRef) -> ValueRef;
-    pub fn LLVMBuildLoad(B: BuilderRef,
-                         PointerVal: ValueRef,
-                         Name: *const c_char)
-                         -> ValueRef;
+    pub fn LLVMBuildLoad(B: BuilderRef, PointerVal: ValueRef, Name: *const c_char) -> ValueRef;
 
-    pub fn LLVMBuildStore(B: BuilderRef, Val: ValueRef, Ptr: ValueRef)
-                          -> ValueRef;
+    pub fn LLVMBuildStore(B: BuilderRef, Val: ValueRef, Ptr: ValueRef) -> ValueRef;
 
     pub fn LLVMBuildGEP(B: BuilderRef,
                         Pointer: ValueRef,
@@ -1272,7 +982,7 @@ extern {
                                     Name: *const c_char)
                                     -> ValueRef;
 
-    /* Casts */
+    // Casts
     pub fn LLVMBuildTrunc(B: BuilderRef,
                           Val: ValueRef,
                           DestTy: TypeRef,
@@ -1352,7 +1062,8 @@ extern {
                          Op: Opcode,
                          Val: ValueRef,
                          DestTy: TypeRef,
-                         Name: *const c_char) -> ValueRef;
+                         Name: *const c_char)
+                         -> ValueRef;
     pub fn LLVMBuildPointerCast(B: BuilderRef,
                                 Val: ValueRef,
                                 DestTy: TypeRef,
@@ -1369,7 +1080,7 @@ extern {
                            Name: *const c_char)
                            -> ValueRef;
 
-    /* Comparisons */
+    // Comparisons
     pub fn LLVMBuildICmp(B: BuilderRef,
                          Op: c_uint,
                          LHS: ValueRef,
@@ -1383,9 +1094,8 @@ extern {
                          Name: *const c_char)
                          -> ValueRef;
 
-    /* Miscellaneous instructions */
-    pub fn LLVMBuildPhi(B: BuilderRef, Ty: TypeRef, Name: *const c_char)
-                        -> ValueRef;
+    // Miscellaneous instructions
+    pub fn LLVMBuildPhi(B: BuilderRef, Ty: TypeRef, Name: *const c_char) -> ValueRef;
     pub fn LLVMRustBuildCall(B: BuilderRef,
                              Fn: ValueRef,
                              Args: *const ValueRef,
@@ -1433,17 +1143,15 @@ extern {
                                 Name: *const c_char)
                                 -> ValueRef;
 
-    pub fn LLVMBuildIsNull(B: BuilderRef, Val: ValueRef, Name: *const c_char)
-                           -> ValueRef;
-    pub fn LLVMBuildIsNotNull(B: BuilderRef, Val: ValueRef, Name: *const c_char)
-                              -> ValueRef;
+    pub fn LLVMBuildIsNull(B: BuilderRef, Val: ValueRef, Name: *const c_char) -> ValueRef;
+    pub fn LLVMBuildIsNotNull(B: BuilderRef, Val: ValueRef, Name: *const c_char) -> ValueRef;
     pub fn LLVMBuildPtrDiff(B: BuilderRef,
                             LHS: ValueRef,
                             RHS: ValueRef,
                             Name: *const c_char)
                             -> ValueRef;
 
-    /* Atomic Operations */
+    // Atomic Operations
     pub fn LLVMRustBuildAtomicLoad(B: BuilderRef,
                                    PointerVal: ValueRef,
                                    Name: *const c_char,
@@ -1480,7 +1188,7 @@ extern {
                                     Scope: SynchronizationScope);
 
 
-    /* Selected entries from the downcasts. */
+    // Selected entries from the downcasts.
     pub fn LLVMIsATerminatorInst(Inst: ValueRef) -> ValueRef;
     pub fn LLVMIsAStoreInst(Inst: ValueRef) -> ValueRef;
 
@@ -1490,22 +1198,15 @@ extern {
     /// Creates target data from a target layout string.
     pub fn LLVMCreateTargetData(StringRep: *const c_char) -> TargetDataRef;
     /// Number of bytes clobbered when doing a Store to *T.
-    pub fn LLVMStoreSizeOfType(TD: TargetDataRef, Ty: TypeRef)
-                               -> c_ulonglong;
-
-    /// Number of bytes clobbered when doing a Store to *T.
-    pub fn LLVMSizeOfTypeInBits(TD: TargetDataRef, Ty: TypeRef)
-                                -> c_ulonglong;
+    pub fn LLVMSizeOfTypeInBits(TD: TargetDataRef, Ty: TypeRef) -> c_ulonglong;
 
     /// Distance between successive elements in an array of T. Includes ABI padding.
     pub fn LLVMABISizeOfType(TD: TargetDataRef, Ty: TypeRef) -> c_ulonglong;
 
     /// Returns the preferred alignment of a type.
-    pub fn LLVMPreferredAlignmentOfType(TD: TargetDataRef, Ty: TypeRef)
-                                        -> c_uint;
+    pub fn LLVMPreferredAlignmentOfType(TD: TargetDataRef, Ty: TypeRef) -> c_uint;
     /// Returns the minimum alignment of a type.
-    pub fn LLVMABIAlignmentOfType(TD: TargetDataRef, Ty: TypeRef)
-                                  -> c_uint;
+    pub fn LLVMABIAlignmentOfType(TD: TargetDataRef, Ty: TypeRef) -> c_uint;
 
     /// Computes the byte offset of the indexed struct element for a
     /// target.
@@ -1514,10 +1215,6 @@ extern {
                                Element: c_uint)
                                -> c_ulonglong;
 
-    /// Returns the minimum alignment of a type when part of a call frame.
-    pub fn LLVMCallFrameAlignmentOfType(TD: TargetDataRef, Ty: TypeRef)
-                                        -> c_uint;
-
     /// Disposes target data.
     pub fn LLVMDisposeTargetData(TD: TargetDataRef);
 
@@ -1525,8 +1222,7 @@ extern {
     pub fn LLVMCreatePassManager() -> PassManagerRef;
 
     /// Creates a function-by-function pass manager
-    pub fn LLVMCreateFunctionPassManagerForModule(M: ModuleRef)
-                                                  -> PassManagerRef;
+    pub fn LLVMCreateFunctionPassManagerForModule(M: ModuleRef) -> PassManagerRef;
 
     /// Disposes a pass manager.
     pub fn LLVMDisposePassManager(PM: PassManagerRef);
@@ -1534,93 +1230,25 @@ extern {
     /// Runs a pass manager on a module.
     pub fn LLVMRunPassManager(PM: PassManagerRef, M: ModuleRef) -> Bool;
 
-    /// Runs the function passes on the provided function.
-    pub fn LLVMRunFunctionPassManager(FPM: PassManagerRef, F: ValueRef)
-                                      -> Bool;
-
-    /// Initializes all the function passes scheduled in the manager
-    pub fn LLVMInitializeFunctionPassManager(FPM: PassManagerRef) -> Bool;
-
-    /// Finalizes all the function passes scheduled in the manager
-    pub fn LLVMFinalizeFunctionPassManager(FPM: PassManagerRef) -> Bool;
-
     pub fn LLVMInitializePasses();
-
-    /// Adds a verification pass.
-    pub fn LLVMAddVerifierPass(PM: PassManagerRef);
-
-    pub fn LLVMAddGlobalOptimizerPass(PM: PassManagerRef);
-    pub fn LLVMAddIPSCCPPass(PM: PassManagerRef);
-    pub fn LLVMAddDeadArgEliminationPass(PM: PassManagerRef);
-    pub fn LLVMAddInstructionCombiningPass(PM: PassManagerRef);
-    pub fn LLVMAddCFGSimplificationPass(PM: PassManagerRef);
-    pub fn LLVMAddFunctionInliningPass(PM: PassManagerRef);
-    pub fn LLVMAddFunctionAttrsPass(PM: PassManagerRef);
-    pub fn LLVMAddScalarReplAggregatesPass(PM: PassManagerRef);
-    pub fn LLVMAddScalarReplAggregatesPassSSA(PM: PassManagerRef);
-    pub fn LLVMAddJumpThreadingPass(PM: PassManagerRef);
-    pub fn LLVMAddConstantPropagationPass(PM: PassManagerRef);
-    pub fn LLVMAddReassociatePass(PM: PassManagerRef);
-    pub fn LLVMAddLoopRotatePass(PM: PassManagerRef);
-    pub fn LLVMAddLICMPass(PM: PassManagerRef);
-    pub fn LLVMAddLoopUnswitchPass(PM: PassManagerRef);
-    pub fn LLVMAddLoopDeletionPass(PM: PassManagerRef);
-    pub fn LLVMAddLoopUnrollPass(PM: PassManagerRef);
-    pub fn LLVMAddGVNPass(PM: PassManagerRef);
-    pub fn LLVMAddMemCpyOptPass(PM: PassManagerRef);
-    pub fn LLVMAddSCCPPass(PM: PassManagerRef);
-    pub fn LLVMAddDeadStoreEliminationPass(PM: PassManagerRef);
-    pub fn LLVMAddStripDeadPrototypesPass(PM: PassManagerRef);
-    pub fn LLVMAddConstantMergePass(PM: PassManagerRef);
-    pub fn LLVMAddArgumentPromotionPass(PM: PassManagerRef);
-    pub fn LLVMAddTailCallEliminationPass(PM: PassManagerRef);
-    pub fn LLVMAddIndVarSimplifyPass(PM: PassManagerRef);
-    pub fn LLVMAddAggressiveDCEPass(PM: PassManagerRef);
-    pub fn LLVMAddGlobalDCEPass(PM: PassManagerRef);
-    pub fn LLVMAddCorrelatedValuePropagationPass(PM: PassManagerRef);
-    pub fn LLVMAddPruneEHPass(PM: PassManagerRef);
-    pub fn LLVMAddSimplifyLibCallsPass(PM: PassManagerRef);
-    pub fn LLVMAddLoopIdiomPass(PM: PassManagerRef);
-    pub fn LLVMAddEarlyCSEPass(PM: PassManagerRef);
-    pub fn LLVMAddTypeBasedAliasAnalysisPass(PM: PassManagerRef);
-    pub fn LLVMAddBasicAliasAnalysisPass(PM: PassManagerRef);
 
     pub fn LLVMPassManagerBuilderCreate() -> PassManagerBuilderRef;
     pub fn LLVMPassManagerBuilderDispose(PMB: PassManagerBuilderRef);
-    pub fn LLVMPassManagerBuilderSetOptLevel(PMB: PassManagerBuilderRef,
-                                             OptimizationLevel: c_uint);
-    pub fn LLVMPassManagerBuilderSetSizeLevel(PMB: PassManagerBuilderRef,
-                                              Value: Bool);
-    pub fn LLVMPassManagerBuilderSetDisableUnitAtATime(
-        PMB: PassManagerBuilderRef,
-        Value: Bool);
-    pub fn LLVMPassManagerBuilderSetDisableUnrollLoops(
-        PMB: PassManagerBuilderRef,
-        Value: Bool);
-    pub fn LLVMPassManagerBuilderSetDisableSimplifyLibCalls(
-        PMB: PassManagerBuilderRef,
-        Value: Bool);
-    pub fn LLVMPassManagerBuilderUseInlinerWithThreshold(
-        PMB: PassManagerBuilderRef,
-        threshold: c_uint);
-    pub fn LLVMPassManagerBuilderPopulateModulePassManager(
-        PMB: PassManagerBuilderRef,
-        PM: PassManagerRef);
+    pub fn LLVMPassManagerBuilderSetSizeLevel(PMB: PassManagerBuilderRef, Value: Bool);
+    pub fn LLVMPassManagerBuilderSetDisableUnrollLoops(PMB: PassManagerBuilderRef, Value: Bool);
+    pub fn LLVMPassManagerBuilderUseInlinerWithThreshold(PMB: PassManagerBuilderRef,
+                                                         threshold: c_uint);
+    pub fn LLVMPassManagerBuilderPopulateModulePassManager(PMB: PassManagerBuilderRef,
+                                                           PM: PassManagerRef);
 
-    pub fn LLVMPassManagerBuilderPopulateFunctionPassManager(
-        PMB: PassManagerBuilderRef,
-        PM: PassManagerRef);
-    pub fn LLVMPassManagerBuilderPopulateLTOPassManager(
-        PMB: PassManagerBuilderRef,
-        PM: PassManagerRef,
-        Internalize: Bool,
-        RunInliner: Bool);
+    pub fn LLVMPassManagerBuilderPopulateFunctionPassManager(PMB: PassManagerBuilderRef,
+                                                             PM: PassManagerRef);
+    pub fn LLVMPassManagerBuilderPopulateLTOPassManager(PMB: PassManagerBuilderRef,
+                                                        PM: PassManagerRef,
+                                                        Internalize: Bool,
+                                                        RunInliner: Bool);
 
-    /// Destroys a memory buffer.
-    pub fn LLVMDisposeMemoryBuffer(MemBuf: MemoryBufferRef);
-
-
-    /* Stuff that's in rustllvm/ because it's not upstream yet. */
+    // Stuff that's in rustllvm/ because it's not upstream yet.
 
     /// Opens an object file.
     pub fn LLVMCreateObjectFile(MemBuf: MemoryBufferRef) -> ObjectFileRef;
@@ -1633,9 +1261,7 @@ extern {
     pub fn LLVMDisposeSectionIterator(SI: SectionIteratorRef);
     /// Returns true if the section iterator is at the end of the section
     /// list:
-    pub fn LLVMIsSectionIteratorAtEnd(ObjFile: ObjectFileRef,
-                                      SI: SectionIteratorRef)
-                                      -> Bool;
+    pub fn LLVMIsSectionIteratorAtEnd(ObjFile: ObjectFileRef, SI: SectionIteratorRef) -> Bool;
     /// Moves the section iterator to point to the next section.
     pub fn LLVMMoveToNextSection(SI: SectionIteratorRef);
     /// Returns the current section size.
@@ -1645,20 +1271,8 @@ extern {
 
     /// Reads the given file and returns it as a memory buffer. Use
     /// LLVMDisposeMemoryBuffer() to get rid of it.
-    pub fn LLVMRustCreateMemoryBufferWithContentsOfFile(Path: *const c_char)
-                                                        -> MemoryBufferRef;
-    /// Borrows the contents of the memory buffer (doesn't copy it)
-    pub fn LLVMCreateMemoryBufferWithMemoryRange(InputData: *const c_char,
-                                                 InputDataLength: size_t,
-                                                 BufferName: *const c_char,
-                                                 RequiresNull: Bool)
-                                                 -> MemoryBufferRef;
-    pub fn LLVMCreateMemoryBufferWithMemoryRangeCopy(InputData: *const c_char,
-                                                     InputDataLength: size_t,
-                                                     BufferName: *const c_char)
-                                                     -> MemoryBufferRef;
+    pub fn LLVMRustCreateMemoryBufferWithContentsOfFile(Path: *const c_char) -> MemoryBufferRef;
 
-    pub fn LLVMIsMultithreaded() -> Bool;
     pub fn LLVMStartMultithreaded() -> Bool;
 
     /// Returns a string describing the last error caused by an LLVMRust* call.
@@ -1695,9 +1309,7 @@ extern {
     pub fn LLVMRustVersionMajor() -> u32;
     pub fn LLVMRustVersionMinor() -> u32;
 
-    pub fn LLVMRustAddModuleFlag(M: ModuleRef,
-                                 name: *const c_char,
-                                 value: u32);
+    pub fn LLVMRustAddModuleFlag(M: ModuleRef, name: *const c_char, value: u32);
 
     pub fn LLVMRustDIBuilderCreate(M: ModuleRef) -> DIBuilderRef;
 
@@ -1736,7 +1348,7 @@ extern {
                                            isLocalToUnit: bool,
                                            isDefinition: bool,
                                            ScopeLine: c_uint,
-                                           Flags: c_uint,
+                                           Flags: DIFlags,
                                            isOptimized: bool,
                                            Fn: ValueRef,
                                            TParam: DIArray,
@@ -1751,11 +1363,11 @@ extern {
                                             -> DIBasicType;
 
     pub fn LLVMRustDIBuilderCreatePointerType(Builder: DIBuilderRef,
-                                          PointeeTy: DIType,
-                                          SizeInBits: u64,
-                                          AlignInBits: u64,
-                                          Name: *const c_char)
-                                          -> DIDerivedType;
+                                              PointeeTy: DIType,
+                                              SizeInBits: u64,
+                                              AlignInBits: u64,
+                                              Name: *const c_char)
+                                              -> DIDerivedType;
 
     pub fn LLVMRustDIBuilderCreateStructType(Builder: DIBuilderRef,
                                              Scope: DIDescriptor,
@@ -1764,7 +1376,7 @@ extern {
                                              LineNumber: c_uint,
                                              SizeInBits: u64,
                                              AlignInBits: u64,
-                                             Flags: c_uint,
+                                             Flags: DIFlags,
                                              DerivedFrom: DIType,
                                              Elements: DIArray,
                                              RunTimeLang: c_uint,
@@ -1780,7 +1392,7 @@ extern {
                                              SizeInBits: u64,
                                              AlignInBits: u64,
                                              OffsetInBits: u64,
-                                             Flags: c_uint,
+                                             Flags: DIFlags,
                                              Ty: DIType)
                                              -> DIDerivedType;
 
@@ -1805,7 +1417,8 @@ extern {
                                                  Ty: DIType,
                                                  isLocalToUnit: bool,
                                                  Val: ValueRef,
-                                                 Decl: DIDescriptor)
+                                                 Decl: DIDescriptor,
+                                                 AlignInBits: u64)
                                                  -> DIGlobalVariable;
 
     pub fn LLVMRustDIBuilderCreateVariable(Builder: DIBuilderRef,
@@ -1816,10 +1429,9 @@ extern {
                                            LineNo: c_uint,
                                            Ty: DIType,
                                            AlwaysPreserve: bool,
-                                           Flags: c_uint,
-                                           AddrOps: *const i64,
-                                           AddrOpsCount: c_uint,
-                                           ArgNo: c_uint)
+                                           Flags: DIFlags,
+                                           ArgNo: c_uint,
+                                           AlignInBits: u64)
                                            -> DIVariable;
 
     pub fn LLVMRustDIBuilderCreateArrayType(Builder: DIBuilderRef,
@@ -1855,15 +1467,6 @@ extern {
                                                InsertAtEnd: BasicBlockRef)
                                                -> ValueRef;
 
-    pub fn LLVMRustDIBuilderInsertDeclareBefore(Builder: DIBuilderRef,
-                                                Val: ValueRef,
-                                                VarInfo: DIVariable,
-                                                AddrOps: *const i64,
-                                                AddrOpsCount: c_uint,
-                                                DL: ValueRef,
-                                                InsertBefore: ValueRef)
-                                                -> ValueRef;
-
     pub fn LLVMRustDIBuilderCreateEnumerator(Builder: DIBuilderRef,
                                              Name: *const c_char,
                                              Val: u64)
@@ -1887,7 +1490,7 @@ extern {
                                             LineNumber: c_uint,
                                             SizeInBits: u64,
                                             AlignInBits: u64,
-                                            Flags: c_uint,
+                                            Flags: DIFlags,
                                             Elements: DIArray,
                                             RunTimeLang: c_uint,
                                             UniqueId: *const c_char)
@@ -1928,17 +1531,13 @@ extern {
     pub fn LLVMRustWriteTypeToString(Type: TypeRef, s: RustStringRef);
     pub fn LLVMRustWriteValueToString(value_ref: ValueRef, s: RustStringRef);
 
-    pub fn LLVMIsAArgument(value_ref: ValueRef) -> ValueRef;
-
-    pub fn LLVMIsAAllocaInst(value_ref: ValueRef) -> ValueRef;
     pub fn LLVMIsAConstantInt(value_ref: ValueRef) -> ValueRef;
 
     pub fn LLVMRustPassKind(Pass: PassRef) -> PassKind;
     pub fn LLVMRustFindAndCreatePass(Pass: *const c_char) -> PassRef;
     pub fn LLVMRustAddPass(PM: PassManagerRef, Pass: PassRef);
 
-    pub fn LLVMRustHasFeature(T: TargetMachineRef,
-                              s: *const c_char) -> bool;
+    pub fn LLVMRustHasFeature(T: TargetMachineRef, s: *const c_char) -> bool;
 
     pub fn LLVMRustPrintTargetCPUs(T: TargetMachineRef);
     pub fn LLVMRustPrintTargetFeatures(T: TargetMachineRef);
@@ -1952,11 +1551,10 @@ extern {
                                        UseSoftFP: bool,
                                        PositionIndependentExecutable: bool,
                                        FunctionSections: bool,
-                                       DataSections: bool) -> TargetMachineRef;
+                                       DataSections: bool)
+                                       -> TargetMachineRef;
     pub fn LLVMRustDisposeTargetMachine(T: TargetMachineRef);
-    pub fn LLVMRustAddAnalysisPasses(T: TargetMachineRef,
-                                     PM: PassManagerRef,
-                                     M: ModuleRef);
+    pub fn LLVMRustAddAnalysisPasses(T: TargetMachineRef, PM: PassManagerRef, M: ModuleRef);
     pub fn LLVMRustAddBuilderLibraryInfo(PMB: PassManagerBuilderRef,
                                          M: ModuleRef,
                                          DisableSimplifyLibCalls: bool);
@@ -1965,7 +1563,8 @@ extern {
                                                MergeFunctions: bool,
                                                SLPVectorize: bool,
                                                LoopVectorize: bool);
-    pub fn LLVMRustAddLibraryInfo(PM: PassManagerRef, M: ModuleRef,
+    pub fn LLVMRustAddLibraryInfo(PM: PassManagerRef,
+                                  M: ModuleRef,
                                   DisableSimplifyLibCalls: bool);
     pub fn LLVMRustRunFunctionPassManager(PM: PassManagerRef, M: ModuleRef);
     pub fn LLVMRustWriteOutputFile(T: TargetMachineRef,
@@ -1974,35 +1573,25 @@ extern {
                                    Output: *const c_char,
                                    FileType: FileType)
                                    -> LLVMRustResult;
-    pub fn LLVMRustPrintModule(PM: PassManagerRef,
-                               M: ModuleRef,
-                               Output: *const c_char);
+    pub fn LLVMRustPrintModule(PM: PassManagerRef, M: ModuleRef, Output: *const c_char);
     pub fn LLVMRustSetLLVMOptions(Argc: c_int, Argv: *const *const c_char);
     pub fn LLVMRustPrintPasses();
     pub fn LLVMRustSetNormalizedTarget(M: ModuleRef, triple: *const c_char);
-    pub fn LLVMRustAddAlwaysInlinePass(P: PassManagerBuilderRef,
-                                       AddLifetimes: bool);
-    pub fn LLVMRustLinkInExternalBitcode(M: ModuleRef,
-                                         bc: *const c_char,
-                                         len: size_t) -> bool;
-    pub fn LLVMRustRunRestrictionPass(M: ModuleRef,
-                                      syms: *const *const c_char,
-                                      len: size_t);
+    pub fn LLVMRustAddAlwaysInlinePass(P: PassManagerBuilderRef, AddLifetimes: bool);
+    pub fn LLVMRustLinkInExternalBitcode(M: ModuleRef, bc: *const c_char, len: size_t) -> bool;
+    pub fn LLVMRustRunRestrictionPass(M: ModuleRef, syms: *const *const c_char, len: size_t);
     pub fn LLVMRustMarkAllFunctionsNounwind(M: ModuleRef);
 
     pub fn LLVMRustOpenArchive(path: *const c_char) -> ArchiveRef;
     pub fn LLVMRustArchiveIteratorNew(AR: ArchiveRef) -> ArchiveIteratorRef;
     pub fn LLVMRustArchiveIteratorNext(AIR: ArchiveIteratorRef) -> ArchiveChildRef;
-    pub fn LLVMRustArchiveChildName(ACR: ArchiveChildRef,
-                                    size: *mut size_t) -> *const c_char;
-    pub fn LLVMRustArchiveChildData(ACR: ArchiveChildRef,
-                                    size: *mut size_t) -> *const c_char;
+    pub fn LLVMRustArchiveChildName(ACR: ArchiveChildRef, size: *mut size_t) -> *const c_char;
+    pub fn LLVMRustArchiveChildData(ACR: ArchiveChildRef, size: *mut size_t) -> *const c_char;
     pub fn LLVMRustArchiveChildFree(ACR: ArchiveChildRef);
     pub fn LLVMRustArchiveIteratorFree(AIR: ArchiveIteratorRef);
     pub fn LLVMRustDestroyArchive(AR: ArchiveRef);
 
-    pub fn LLVMRustGetSectionName(SI: SectionIteratorRef,
-                                  data: *mut *const c_char) -> size_t;
+    pub fn LLVMRustGetSectionName(SI: SectionIteratorRef, data: *mut *const c_char) -> size_t;
 
     pub fn LLVMRustWriteTwineToString(T: TwineRef, s: RustStringRef);
 
@@ -2011,23 +1600,19 @@ extern {
                                            DiagnosticContext: *mut c_void);
 
     pub fn LLVMRustUnpackOptimizationDiagnostic(DI: DiagnosticInfoRef,
-                                                pass_name_out: *mut *const c_char,
+                                                pass_name_out: RustStringRef,
                                                 function_out: *mut ValueRef,
                                                 debugloc_out: *mut DebugLocRef,
-                                                message_out: *mut TwineRef);
+                                                message_out: RustStringRef);
     pub fn LLVMRustUnpackInlineAsmDiagnostic(DI: DiagnosticInfoRef,
                                              cookie_out: *mut c_uint,
                                              message_out: *mut TwineRef,
                                              instruction_out: *mut ValueRef);
 
-    pub fn LLVMRustWriteDiagnosticInfoToString(DI: DiagnosticInfoRef,
-                                               s: RustStringRef);
-    pub fn LLVMGetDiagInfoSeverity(DI: DiagnosticInfoRef) -> DiagnosticSeverity;
+    pub fn LLVMRustWriteDiagnosticInfoToString(DI: DiagnosticInfoRef, s: RustStringRef);
     pub fn LLVMRustGetDiagInfoKind(DI: DiagnosticInfoRef) -> DiagnosticKind;
 
-    pub fn LLVMRustWriteDebugLocToString(C: ContextRef,
-                                         DL: DebugLocRef,
-                                         s: RustStringRef);
+    pub fn LLVMRustWriteDebugLocToString(C: ContextRef, DL: DebugLocRef, s: RustStringRef);
 
     pub fn LLVMRustSetInlineAsmDiagnosticHandler(C: ContextRef,
                                                  H: InlineAsmDiagHandler,
@@ -2039,15 +1624,15 @@ extern {
                                 NumMembers: size_t,
                                 Members: *const RustArchiveMemberRef,
                                 WriteSymbtab: bool,
-                                Kind: ArchiveKind) ->
-                                LLVMRustResult;
+                                Kind: ArchiveKind)
+                                -> LLVMRustResult;
     pub fn LLVMRustArchiveMemberNew(Filename: *const c_char,
                                     Name: *const c_char,
-                                    Child: ArchiveChildRef) -> RustArchiveMemberRef;
+                                    Child: ArchiveChildRef)
+                                    -> RustArchiveMemberRef;
     pub fn LLVMRustArchiveMemberFree(Member: RustArchiveMemberRef);
 
-    pub fn LLVMRustSetDataLayoutFromTargetMachine(M: ModuleRef,
-                                                  TM: TargetMachineRef);
+    pub fn LLVMRustSetDataLayoutFromTargetMachine(M: ModuleRef, TM: TargetMachineRef);
     pub fn LLVMRustGetModuleDataLayout(M: ModuleRef) -> TargetDataRef;
 
     pub fn LLVMRustBuildOperandBundleDef(Name: *const c_char,
@@ -2068,4 +1653,4 @@ extern {
 // during llvm-config?
 #[cfg(windows)]
 #[link(name = "ole32")]
-extern {}
+extern "C" {}

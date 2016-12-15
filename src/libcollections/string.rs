@@ -14,24 +14,25 @@
 //! [`ToString`]s, and several error types that may result from working with
 //! [`String`]s.
 //!
-//! [`String`]: struct.String.html
 //! [`ToString`]: trait.ToString.html
 //!
 //! # Examples
 //!
-//! There are multiple ways to create a new `String` from a string literal:
+//! There are multiple ways to create a new [`String`] from a string literal:
 //!
-//! ```rust
+//! ```
 //! let s = "Hello".to_string();
 //!
 //! let s = String::from("world");
 //! let s: String = "also this".into();
 //! ```
 //!
-//! You can create a new `String` from an existing one by concatenating with
+//! You can create a new [`String`] from an existing one by concatenating with
 //! `+`:
 //!
-//! ```rust
+//! [`String`]: struct.String.html
+//!
+//! ```
 //! let s = "Hello".to_string();
 //!
 //! let message = s + " world!";
@@ -40,7 +41,7 @@
 //! If you have a vector of valid UTF-8 bytes, you can make a `String` out of
 //! it. You can do the reverse too.
 //!
-//! ```rust
+//! ```
 //! let sparkle_heart = vec![240, 159, 146, 150];
 //!
 //! // We know these bytes are valid, so we'll use `unwrap()`.
@@ -62,8 +63,8 @@ use core::mem;
 use core::ops::{self, Add, AddAssign, Index, IndexMut};
 use core::ptr;
 use core::str::pattern::Pattern;
-use rustc_unicode::char::{decode_utf16, REPLACEMENT_CHARACTER};
-use rustc_unicode::str as unicode_str;
+use std_unicode::char::{decode_utf16, REPLACEMENT_CHARACTER};
+use std_unicode::str as unicode_str;
 
 use borrow::{Cow, ToOwned};
 use range::RangeArgument;
@@ -134,10 +135,10 @@ use boxed::Box;
 /// Indexing is intended to be a constant-time operation, but UTF-8 encoding
 /// does not allow us to do this. Furthermore, it's not clear what sort of
 /// thing the index should return: a byte, a codepoint, or a grapheme cluster.
-/// The [`as_bytes()`] and [`chars()`] methods return iterators over the first
+/// The [`bytes()`] and [`chars()`] methods return iterators over the first
 /// two, respectively.
 ///
-/// [`as_bytes()`]: #method.as_bytes
+/// [`bytes()`]: #method.bytes
 /// [`chars()`]: #method.chars
 ///
 /// # Deref
@@ -1128,8 +1129,6 @@ impl String {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn insert(&mut self, idx: usize, ch: char) {
-        let len = self.len();
-        assert!(idx <= len);
         assert!(self.is_char_boundary(idx));
         let mut bits = [0; 4];
         let bits = ch.encode_utf8(&mut bits).as_bytes();
@@ -1183,7 +1182,6 @@ impl String {
                reason = "recent addition",
                issue = "35553")]
     pub fn insert_str(&mut self, idx: usize, string: &str) {
-        assert!(idx <= self.len());
         assert!(self.is_char_boundary(idx));
 
         unsafe {
@@ -1257,6 +1255,38 @@ impl String {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Divide one string into two at an index.
+    ///
+    /// The argument, `mid`, should be a byte offset from the start of the string. It must also
+    /// be on the boundary of a UTF-8 code point.
+    ///
+    /// The two strings returned go from the start of the string to `mid`, and from `mid` to the end
+    /// of the string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid` is not on a `UTF-8` code point boundary, or if it is beyond the last
+    /// code point of the string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(string_split_off)]
+    /// # fn main() {
+    /// let mut hello = String::from("Hello, World!");
+    /// let world = hello.split_off(7);
+    /// assert_eq!(hello, "Hello, ");
+    /// assert_eq!(world, "World!");
+    /// # }
+    /// ```
+    #[inline]
+    #[unstable(feature = "string_split_off", issue = "38080")]
+    pub fn split_off(&mut self, mid: usize) -> String {
+        assert!(self.is_char_boundary(mid));
+        let other = self.vec.split_off(mid);
+        unsafe { String::from_utf8_unchecked(other) }
     }
 
     /// Truncates this `String`, removing all contents.
@@ -1859,6 +1889,13 @@ impl<'a> From<&'a str> for String {
     }
 }
 
+#[stable(feature = "string_from_cow_str", since = "1.14.0")]
+impl<'a> From<Cow<'a, str>> for String {
+    fn from(s: Cow<'a, str>) -> String {
+        s.into_owned()
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> From<&'a str> for Cow<'a, str> {
     #[inline]
@@ -1896,10 +1933,10 @@ impl<'a> FromIterator<String> for Cow<'a, str> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
-impl Into<Vec<u8>> for String {
-    fn into(self) -> Vec<u8> {
-        self.into_bytes()
+#[stable(feature = "from_string_for_vec_u8", since = "1.14.0")]
+impl From<String> for Vec<u8> {
+    fn from(string : String) -> Vec<u8> {
+        string.into_bytes()
     }
 }
 

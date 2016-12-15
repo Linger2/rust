@@ -36,9 +36,7 @@
 #![feature(rand)]
 #![feature(rustc_private)]
 #![feature(staged_api)]
-#![feature(step_by)]
-#![feature(question_mark)]
-#![cfg_attr(test, feature(test, rand))]
+#![cfg_attr(test, feature(rand))]
 
 extern crate syntax;
 extern crate libc;
@@ -48,7 +46,6 @@ extern crate serialize;
 extern crate serialize as rustc_serialize; // used by deriving
 
 pub mod tempdir;
-pub mod sha2;
 pub mod target;
 pub mod slice;
 pub mod dynamic_lib;

@@ -270,7 +270,6 @@ use error;
 use fmt;
 use mem;
 use cell::UnsafeCell;
-use marker::Reflect;
 use time::{Duration, Instant};
 
 #[unstable(feature = "mpsc_select", issue = "27800")]
@@ -455,9 +454,15 @@ impl<T> UnsafeFlavor<T> for Receiver<T> {
 }
 
 /// Creates a new asynchronous channel, returning the sender/receiver halves.
-///
 /// All data sent on the sender will become available on the receiver, and no
 /// send will block the calling thread (this channel has an "infinite buffer").
+///
+/// If the [`Receiver`] is disconnected while trying to [`send()`] with the
+/// [`Sender`], the [`send()`] method will return an error.
+///
+/// [`send()`]: ../../../std/sync/mpsc/struct.Sender.html#method.send
+/// [`Sender`]: ../../../std/sync/mpsc/struct.Sender.html
+/// [`Receiver`]: ../../../std/sync/mpsc/struct.Receiver.html
 ///
 /// # Examples
 ///
@@ -488,18 +493,23 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 
 /// Creates a new synchronous, bounded channel.
 ///
-/// Like asynchronous channels, the `Receiver` will block until a message
+/// Like asynchronous channels, the [`Receiver`] will block until a message
 /// becomes available. These channels differ greatly in the semantics of the
 /// sender from asynchronous channels, however.
 ///
-/// This channel has an internal buffer on which messages will be queued. When
-/// the internal buffer becomes full, future sends will *block* waiting for the
-/// buffer to open up. Note that a buffer size of 0 is valid, in which case this
-/// becomes  "rendezvous channel" where each send will not return until a recv
-/// is paired with it.
+/// This channel has an internal buffer on which messages will be queued.
+/// `bound` specifies the buffer size. When the internal buffer becomes full,
+/// future sends will *block* waiting for the buffer to open up. Note that a
+/// buffer size of 0 is valid, in which case this becomes "rendezvous channel"
+/// where each [`send()`] will not return until a recv is paired with it.
 ///
-/// As with asynchronous channels, all senders will panic in `send` if the
-/// `Receiver` has been destroyed.
+/// Like asynchronous channels, if the [`Receiver`] is disconnected while
+/// trying to [`send()`] with the [`SyncSender`], the [`send()`] method will
+/// return an error.
+///
+/// [`send()`]: ../../../std/sync/mpsc/struct.SyncSender.html#method.send
+/// [`SyncSender`]: ../../../std/sync/mpsc/struct.SyncSender.html
+/// [`Receiver`]: ../../../std/sync/mpsc/struct.Receiver.html
 ///
 /// # Examples
 ///
@@ -1163,7 +1173,7 @@ impl<T> fmt::Display for SendError<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: Send + Reflect> error::Error for SendError<T> {
+impl<T: Send> error::Error for SendError<T> {
     fn description(&self) -> &str {
         "sending on a closed channel"
     }
@@ -1198,7 +1208,7 @@ impl<T> fmt::Display for TrySendError<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: Send + Reflect> error::Error for TrySendError<T> {
+impl<T: Send> error::Error for TrySendError<T> {
 
     fn description(&self) -> &str {
         match *self {
@@ -1268,7 +1278,39 @@ impl error::Error for TryRecvError {
     }
 }
 
-#[cfg(test)]
+#[stable(feature = "mpsc_recv_timeout_error", since = "1.14.0")]
+impl fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            RecvTimeoutError::Timeout => {
+                "timed out waiting on channel".fmt(f)
+            }
+            RecvTimeoutError::Disconnected => {
+                "channel is empty and sending half is closed".fmt(f)
+            }
+        }
+    }
+}
+
+#[stable(feature = "mpsc_recv_timeout_error", since = "1.14.0")]
+impl error::Error for RecvTimeoutError {
+    fn description(&self) -> &str {
+        match *self {
+            RecvTimeoutError::Timeout => {
+                "timed out waiting on channel"
+            }
+            RecvTimeoutError::Disconnected => {
+                "channel is empty and sending half is closed"
+            }
+        }
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        None
+    }
+}
+
+#[cfg(all(test, not(target_os = "emscripten")))]
 mod tests {
     use env;
     use super::*;
@@ -1940,9 +1982,16 @@ mod tests {
         // wait for the child thread to exit before we exit
         rx2.recv().unwrap();
     }
+
+    #[test]
+    fn issue_32114() {
+        let (tx, _) = channel();
+        let _ = tx.send(123);
+        assert_eq!(tx.send(123), Err(SendError(123)));
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "emscripten")))]
 mod sync_tests {
     use env;
     use thread;

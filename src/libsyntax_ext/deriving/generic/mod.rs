@@ -198,8 +198,8 @@ use syntax::ext::base::{Annotatable, ExtCtxt};
 use syntax::ext::build::AstBuilder;
 use syntax::codemap::{self, dummy_spanned, respan};
 use syntax::util::move_map::MoveMap;
-use syntax::parse::token::{InternedString, keywords};
 use syntax::ptr::P;
+use syntax::symbol::{Symbol, keywords};
 use syntax_pos::{DUMMY_SP, Span};
 use errors::Handler;
 
@@ -361,8 +361,8 @@ fn find_type_parameters(ty: &ast::Ty,
         types: Vec<P<ast::Ty>>,
     }
 
-    impl<'a, 'b> visit::Visitor for Visitor<'a, 'b> {
-        fn visit_ty(&mut self, ty: &ast::Ty) {
+    impl<'a, 'b> visit::Visitor<'a> for Visitor<'a, 'b> {
+        fn visit_ty(&mut self, ty: &'a ast::Ty) {
             match ty.node {
                 ast::TyKind::Path(_, ref path) if !path.global => {
                     if let Some(segment) = path.segments.first() {
@@ -442,7 +442,7 @@ impl<'a> TraitDef<'a> {
                 attrs.extend(item.attrs
                     .iter()
                     .filter(|a| {
-                        match &a.name()[..] {
+                        match &*a.name().as_str() {
                             "allow" | "warn" | "deny" | "forbid" | "stable" | "unstable" => true,
                             _ => false,
                         }
@@ -536,7 +536,7 @@ impl<'a> TraitDef<'a> {
                 bounds.push((*declared_bound).clone());
             }
 
-            cx.typaram(self.span, ty_param.ident, P::from_vec(bounds), None)
+            cx.typaram(self.span, ty_param.ident, vec![], P::from_vec(bounds), None)
         }));
 
         // and similarly for where clauses
@@ -639,15 +639,15 @@ impl<'a> TraitDef<'a> {
 
         let attr = cx.attribute(self.span,
                                 cx.meta_word(self.span,
-                                             InternedString::new("automatically_derived")));
+                                             Symbol::intern("automatically_derived")));
         // Just mark it now since we know that it'll end up used downstream
         attr::mark_used(&attr);
         let opt_trait_ref = Some(trait_ref);
-        let unused_qual = cx.attribute(self.span,
-                                       cx.meta_list(self.span,
-                                                    InternedString::new("allow"),
-                                                    vec![cx.meta_list_item_word(self.span,
-                                           InternedString::new("unused_qualifications"))]));
+        let unused_qual = {
+            let word = cx.meta_list_item_word(self.span, Symbol::intern("unused_qualifications"));
+            cx.attribute(self.span, cx.meta_list(self.span, Symbol::intern("allow"), vec![word]))
+        };
+
         let mut a = vec![attr, unused_qual];
         a.extend(self.attributes.iter().cloned());
 
@@ -1460,8 +1460,9 @@ impl<'a> MethodDef<'a> {
             .iter()
             .map(|v| {
                 let ident = v.node.name;
+                let sp = Span { expn_id: trait_.span.expn_id, ..v.span };
                 let summary = trait_.summarise_struct(cx, &v.node.data);
-                (ident, v.span, summary)
+                (ident, sp, summary)
             })
             .collect();
         self.call_substructure_method(cx,
@@ -1545,7 +1546,7 @@ impl<'a> TraitDef<'a> {
                             cx.span_bug(sp, "a braced struct with unnamed fields in `derive`");
                         }
                         codemap::Spanned {
-                            span: pat.span,
+                            span: Span { expn_id: self.span.expn_id, ..pat.span },
                             node: ast::FieldPat {
                                 ident: ident.unwrap(),
                                 pat: pat,
@@ -1576,7 +1577,8 @@ impl<'a> TraitDef<'a> {
          mutbl: ast::Mutability)
          -> (P<ast::Pat>, Vec<(Span, Option<Ident>, P<Expr>, &'a [ast::Attribute])>) {
         let variant_ident = variant.node.name;
-        let variant_path = cx.path(variant.span, vec![enum_ident, variant_ident]);
+        let sp = Span { expn_id: self.span.expn_id, ..variant.span };
+        let variant_path = cx.path(sp, vec![enum_ident, variant_ident]);
         self.create_struct_pattern(cx, variant_path, &variant.node.data, prefix, mutbl)
     }
 }

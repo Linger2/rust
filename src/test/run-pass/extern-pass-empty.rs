@@ -12,6 +12,7 @@
 
 // pretty-expanded FIXME #23616
 // ignore-msvc
+// ignore-emscripten
 
 struct TwoU8s {
     one: u8,
@@ -29,7 +30,7 @@ struct ManyInts {
 
 struct Empty;
 
-#[link(name = "rust_test_helpers")]
+#[link(name = "rust_test_helpers", kind = "static")]
 extern {
     fn rust_dbg_extern_empty_struct(v1: ManyInts, e: Empty, v2: ManyInts);
 }

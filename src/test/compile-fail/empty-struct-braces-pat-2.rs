@@ -12,8 +12,6 @@
 
 // aux-build:empty-struct.rs
 
-#![feature(relaxed_adts)]
-
 extern crate empty_struct;
 use empty_struct::*;
 
@@ -24,15 +22,15 @@ fn main() {
     let xe1 = XEmpty1 {};
 
     match e1 {
-        Empty1() => () //~ ERROR unresolved variant or struct `Empty1`
+        Empty1() => () //~ ERROR unresolved tuple struct/variant `Empty1`
     }
     match xe1 {
-        XEmpty1() => () //~ ERROR unresolved variant or struct `XEmpty1`
+        XEmpty1() => () //~ ERROR unresolved tuple struct/variant `XEmpty1`
     }
     match e1 {
-        Empty1(..) => () //~ ERROR unresolved variant or struct `Empty1`
+        Empty1(..) => () //~ ERROR unresolved tuple struct/variant `Empty1`
     }
     match xe1 {
-        XEmpty1(..) => () //~ ERROR unresolved variant or struct `XEmpty1`
+        XEmpty1(..) => () //~ ERROR unresolved tuple struct/variant `XEmpty1`
     }
 }

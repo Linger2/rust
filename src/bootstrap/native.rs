@@ -18,16 +18,17 @@
 //! LLVM and compiler-rt are essentially just wired up to everything else to
 //! ensure that they're always in place if needed.
 
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
-use std::fs::{self, File};
 
 use build_helper::output;
 use cmake;
 use gcc;
 
 use Build;
-use util::up_to_date;
+use util::{self, up_to_date};
 
 /// Compile LLVM for `target`.
 pub fn llvm(build: &Build, target: &str) {
@@ -43,14 +44,21 @@ pub fn llvm(build: &Build, target: &str) {
     // artifacts are missing) then we keep going, otherwise we bail out.
     let dst = build.llvm_out(target);
     let stamp = build.src.join("src/rustllvm/llvm-auto-clean-trigger");
+    let mut stamp_contents = String::new();
+    t!(t!(File::open(&stamp)).read_to_string(&mut stamp_contents));
     let done_stamp = dst.join("llvm-finished-building");
-    build.clear_if_dirty(&dst, &stamp);
-    if fs::metadata(&done_stamp).is_ok() {
-        return
+    if done_stamp.exists() {
+        let mut done_contents = String::new();
+        t!(t!(File::open(&done_stamp)).read_to_string(&mut done_contents));
+        if done_contents == stamp_contents {
+            return
+        }
     }
+    drop(fs::remove_dir_all(&dst));
 
     println!("Building LLVM for {}", target);
 
+    let _time = util::timeit();
     let _ = fs::remove_dir_all(&dst.join("build"));
     t!(fs::create_dir_all(&dst.join("build")));
     let assertions = if build.config.llvm_assertions {"ON"} else {"OFF"};
@@ -60,12 +68,20 @@ pub fn llvm(build: &Build, target: &str) {
     if build.config.ninja {
         cfg.generator("Ninja");
     }
+
+    let profile = match (build.config.llvm_optimize, build.config.llvm_release_debuginfo) {
+        (false, _) => "Debug",
+        (true, false) => "Release",
+        (true, true) => "RelWithDebInfo",
+    };
+
     cfg.target(target)
        .host(&build.config.build)
        .out_dir(&dst)
-       .profile(if build.config.llvm_optimize {"Release"} else {"Debug"})
+       .profile(profile)
        .define("LLVM_ENABLE_ASSERTIONS", assertions)
-       .define("LLVM_TARGETS_TO_BUILD", "X86;ARM;AArch64;Mips;PowerPC;SystemZ")
+       .define("LLVM_TARGETS_TO_BUILD",
+               "X86;ARM;AArch64;Mips;PowerPC;SystemZ;JSBackend;MSP430")
        .define("LLVM_INCLUDE_EXAMPLES", "OFF")
        .define("LLVM_INCLUDE_TESTS", "OFF")
        .define("LLVM_INCLUDE_DOCS", "OFF")
@@ -73,7 +89,9 @@ pub fn llvm(build: &Build, target: &str) {
        .define("WITH_POLLY", "OFF")
        .define("LLVM_ENABLE_TERMINFO", "OFF")
        .define("LLVM_ENABLE_LIBEDIT", "OFF")
-       .define("LLVM_PARALLEL_COMPILE_JOBS", build.jobs().to_string());
+       .define("LLVM_PARALLEL_COMPILE_JOBS", build.jobs().to_string())
+       .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
+       .define("LLVM_DEFAULT_TARGET_TRIPLE", target);
 
     if target.starts_with("i686") {
         cfg.define("LLVM_BUILD_32_BITS", "ON");
@@ -86,9 +104,7 @@ pub fn llvm(build: &Build, target: &str) {
         //        actually exists most of the time in normal installs of LLVM.
         let host = build.llvm_out(&build.config.build).join("bin/llvm-tblgen");
         cfg.define("CMAKE_CROSSCOMPILING", "True")
-           .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
-           .define("LLVM_TABLEGEN", &host)
-           .define("LLVM_DEFAULT_TARGET_TRIPLE", target);
+           .define("LLVM_TABLEGEN", &host);
     }
 
     // MSVC handles compiler business itself
@@ -114,7 +130,7 @@ pub fn llvm(build: &Build, target: &str) {
     //        tools and libs on all platforms.
     cfg.build();
 
-    t!(File::create(&done_stamp));
+    t!(t!(File::create(&done_stamp)).write_all(stamp_contents.as_bytes()));
 }
 
 fn check_llvm_version(build: &Build, llvm_config: &Path) {
@@ -143,6 +159,17 @@ pub fn test_helpers(build: &Build, target: &str) {
     println!("Building test helpers");
     t!(fs::create_dir_all(&dst));
     let mut cfg = gcc::Config::new();
+
+    // We may have found various cross-compilers a little differently due to our
+    // extra configuration, so inform gcc of these compilers. Note, though, that
+    // on MSVC we still need gcc's detection of env vars (ugh).
+    if !target.contains("msvc") {
+        if let Some(ar) = build.ar(target) {
+            cfg.archiver(ar);
+        }
+        cfg.compiler(build.cc(target));
+    }
+
     cfg.cargo_metadata(false)
        .out_dir(&dst)
        .target(target)

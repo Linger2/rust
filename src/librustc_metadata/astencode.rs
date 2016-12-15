@@ -10,7 +10,7 @@
 
 use rustc::hir::map as ast_map;
 
-use rustc::hir::intravisit::{Visitor, IdRangeComputingVisitor, IdRange};
+use rustc::hir::intravisit::{Visitor, IdRangeComputingVisitor, IdRange, NestedVisitorMap};
 
 use cstore::CrateMetadata;
 use encoder::EncodeContext;
@@ -18,7 +18,7 @@ use schema::*;
 
 use rustc::middle::cstore::{InlinedItem, InlinedItemRef};
 use rustc::middle::const_qualif::ConstQualif;
-use rustc::hir::def::{self, Def};
+use rustc::hir::def::Def;
 use rustc::hir::def_id::DefId;
 use rustc::ty::{self, TyCtxt, Ty};
 
@@ -30,26 +30,22 @@ use rustc_serialize::Encodable;
 pub struct Ast<'tcx> {
     id_range: IdRange,
     item: Lazy<InlinedItem>,
-    side_tables: LazySeq<(ast::NodeId, TableEntry<'tcx>)>
+    side_tables: LazySeq<(ast::NodeId, TableEntry<'tcx>)>,
 }
 
 #[derive(RustcEncodable, RustcDecodable)]
 enum TableEntry<'tcx> {
-    Def(Def),
+    TypeRelativeDef(Def),
     NodeType(Ty<'tcx>),
     ItemSubsts(ty::ItemSubsts<'tcx>),
-    Adjustment(ty::adjustment::AutoAdjustment<'tcx>),
-    ConstQualif(ConstQualif)
+    Adjustment(ty::adjustment::Adjustment<'tcx>),
+    ConstQualif(ConstQualif),
 }
 
 impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
-    pub fn encode_inlined_item(&mut self, ii: InlinedItemRef) -> Lazy<Ast<'tcx>> {
-        let mut id_visitor = IdRangeComputingVisitor::new();
-        match ii {
-            InlinedItemRef::Item(_, i) => id_visitor.visit_item(i),
-            InlinedItemRef::TraitItem(_, ti) => id_visitor.visit_trait_item(ti),
-            InlinedItemRef::ImplItem(_, ii) => id_visitor.visit_impl_item(ii)
-        }
+    pub fn encode_inlined_item(&mut self, ii: InlinedItemRef<'tcx>) -> Lazy<Ast<'tcx>> {
+        let mut id_visitor = IdRangeComputingVisitor::new(&self.tcx.map);
+        ii.visit(&mut id_visitor);
 
         let ii_pos = self.position();
         ii.encode(self).unwrap();
@@ -58,30 +54,30 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let tables_count = {
             let mut visitor = SideTableEncodingIdVisitor {
                 ecx: self,
-                count: 0
+                count: 0,
             };
-            match ii {
-                InlinedItemRef::Item(_, i) => visitor.visit_item(i),
-                InlinedItemRef::TraitItem(_, ti) => visitor.visit_trait_item(ti),
-                InlinedItemRef::ImplItem(_, ii) => visitor.visit_impl_item(ii)
-            }
+            ii.visit(&mut visitor);
             visitor.count
         };
 
         self.lazy(&Ast {
             id_range: id_visitor.result(),
             item: Lazy::with_position(ii_pos),
-            side_tables: LazySeq::with_position_and_length(tables_pos, tables_count)
+            side_tables: LazySeq::with_position_and_length(tables_pos, tables_count),
         })
     }
 }
 
-struct SideTableEncodingIdVisitor<'a, 'b:'a, 'tcx:'b> {
+struct SideTableEncodingIdVisitor<'a, 'b: 'a, 'tcx: 'b> {
     ecx: &'a mut EncodeContext<'b, 'tcx>,
-    count: usize
+    count: usize,
 }
 
-impl<'a, 'b, 'tcx, 'v> Visitor<'v> for SideTableEncodingIdVisitor<'a, 'b, 'tcx> {
+impl<'a, 'b, 'tcx> Visitor<'tcx> for SideTableEncodingIdVisitor<'a, 'b, 'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::OnlyBodies(&self.ecx.tcx.map)
+    }
+
     fn visit_id(&mut self, id: ast::NodeId) {
         debug!("Encoding side tables for id {}", id);
 
@@ -93,10 +89,11 @@ impl<'a, 'b, 'tcx, 'v> Visitor<'v> for SideTableEncodingIdVisitor<'a, 'b, 'tcx> 
             }
         };
 
-        encode(tcx.expect_def_or_none(id).map(TableEntry::Def));
-        encode(tcx.node_types().get(&id).cloned().map(TableEntry::NodeType));
-        encode(tcx.tables.borrow().item_substs.get(&id).cloned().map(TableEntry::ItemSubsts));
-        encode(tcx.tables.borrow().adjustments.get(&id).cloned().map(TableEntry::Adjustment));
+        encode(tcx.tables().type_relative_path_defs.get(&id).cloned()
+                  .map(TableEntry::TypeRelativeDef));
+        encode(tcx.tables().node_types.get(&id).cloned().map(TableEntry::NodeType));
+        encode(tcx.tables().item_substs.get(&id).cloned().map(TableEntry::ItemSubsts));
+        encode(tcx.tables().adjustments.get(&id).cloned().map(TableEntry::Adjustment));
         encode(tcx.const_qualif_map.borrow().get(&id).cloned().map(TableEntry::ConstQualif));
     }
 }
@@ -114,33 +111,33 @@ pub fn decode_inlined_item<'a, 'tcx>(cdata: &CrateMetadata,
 
     let cnt = ast.id_range.max.as_usize() - ast.id_range.min.as_usize();
     let start = tcx.sess.reserve_node_ids(cnt);
-    let id_ranges = [ast.id_range, IdRange {
-        min: start,
-        max: ast::NodeId::new(start.as_usize() + cnt)
-    }];
+    let id_ranges = [ast.id_range,
+                     IdRange {
+                         min: start,
+                         max: ast::NodeId::new(start.as_usize() + cnt),
+                     }];
 
     let ii = ast.item.decode((cdata, tcx, id_ranges));
+    let item_node_id = tcx.sess.next_node_id();
     let ii = ast_map::map_decoded_item(&tcx.map,
                                        parent_def_path,
                                        parent_did,
                                        ii,
-                                       tcx.sess.next_node_id());
+                                       item_node_id);
 
-    let item_node_id = match ii {
-        &InlinedItem::Item(_, ref i) => i.id,
-        &InlinedItem::TraitItem(_, ref ti) => ti.id,
-        &InlinedItem::ImplItem(_, ref ii) => ii.id
-    };
     let inlined_did = tcx.map.local_def_id(item_node_id);
-    tcx.register_item_type(inlined_did, tcx.lookup_item_type(orig_did));
+    let ty = tcx.item_type(orig_did);
+    let generics = tcx.item_generics(orig_did);
+    tcx.item_types.borrow_mut().insert(inlined_did, ty);
+    tcx.generics.borrow_mut().insert(inlined_did, generics);
 
     for (id, entry) in ast.side_tables.decode((cdata, tcx, id_ranges)) {
         match entry {
-            TableEntry::Def(def) => {
-                tcx.def_map.borrow_mut().insert(id, def::PathResolution::new(def));
+            TableEntry::TypeRelativeDef(def) => {
+                tcx.tables.borrow_mut().type_relative_path_defs.insert(id, def);
             }
             TableEntry::NodeType(ty) => {
-                tcx.node_type_insert(id, ty);
+                tcx.tables.borrow_mut().node_types.insert(id, ty);
             }
             TableEntry::ItemSubsts(item_substs) => {
                 tcx.tables.borrow_mut().item_substs.insert(id, item_substs);

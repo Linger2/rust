@@ -13,7 +13,7 @@
 ######################################################################
 
 # The version number
-CFG_RELEASE_NUM=1.14.0
+CFG_RELEASE_NUM=1.15.0
 
 # An optional number to put after the label, e.g. '.2' -> '-beta.2'
 # NB Make sure it starts with a dot to conform to semver pre-release
@@ -53,32 +53,14 @@ endif
 # versions in the same place
 CFG_FILENAME_EXTRA=$(shell printf '%s' $(CFG_RELEASE)$(CFG_EXTRA_FILENAME) | $(CFG_HASH_COMMAND))
 
-# A magic value that allows the compiler to use unstable features during the
-# bootstrap even when doing so would normally be an error because of feature
-# staging or because the build turns on warnings-as-errors and unstable features
-# default to warnings. The build has to match this key in an env var.
-#
-# This value is keyed off the release to ensure that all compilers for one
-# particular release have the same bootstrap key. Note that this is
-# intentionally not "secure" by any definition, this is largely just a deterrent
-# from users enabling unstable features on the stable compiler.
-CFG_BOOTSTRAP_KEY=$(CFG_FILENAME_EXTRA)
-
-# If local-rust is the same as the current version, then force a local-rebuild
+# If local-rust is the same major.minor as the current version, then force a local-rebuild
 ifdef CFG_ENABLE_LOCAL_RUST
-ifeq ($(CFG_RELEASE),\
-      $(shell $(S)src/etc/local_stage0.sh --print-rustc-release $(CFG_LOCAL_RUST_ROOT)))
-    CFG_INFO := $(info cfg: auto-detected local-rebuild $(CFG_RELEASE))
+SEMVER_PREFIX=$(shell echo $(CFG_RELEASE_NUM) | grep -E -o '^[[:digit:]]+\.[[:digit:]]+')
+LOCAL_RELEASE=$(shell $(S)src/etc/local_stage0.sh --print-rustc-release $(CFG_LOCAL_RUST_ROOT))
+ifneq (,$(filter $(SEMVER_PREFIX).%,$(LOCAL_RELEASE)))
+    CFG_INFO := $(info cfg: auto-detected local-rebuild using $(LOCAL_RELEASE))
     CFG_ENABLE_LOCAL_REBUILD = 1
 endif
-endif
-
-# The stage0 compiler needs to use the previous key recorded in src/stage0.txt,
-# except for local-rebuild when it just uses the same current key.
-ifdef CFG_ENABLE_LOCAL_REBUILD
-CFG_BOOTSTRAP_KEY_STAGE0=$(CFG_BOOTSTRAP_KEY)
-else
-CFG_BOOTSTRAP_KEY_STAGE0=$(shell sed -ne 's/^rustc_key: //p' $(S)src/stage0.txt)
 endif
 
 # The name of the package to use for creating tarballs, installers etc.
@@ -160,6 +142,9 @@ endif
 ifdef CFG_ENABLE_DEBUGINFO
   $(info cfg: enabling debuginfo (CFG_ENABLE_DEBUGINFO))
   CFG_RUSTC_FLAGS += -g
+else ifdef CFG_ENABLE_DEBUGINFO_LINES
+  $(info cfg: enabling line number debuginfo (CFG_ENABLE_DEBUGINFO_LINES))
+  CFG_RUSTC_FLAGS += -Cdebuginfo=1
 endif
 
 ifdef SAVE_TEMPS
@@ -300,7 +285,7 @@ endif
 # LLVM macros
 ######################################################################
 
-LLVM_OPTIONAL_COMPONENTS=x86 arm aarch64 mips powerpc pnacl systemz
+LLVM_OPTIONAL_COMPONENTS=x86 arm aarch64 mips powerpc pnacl systemz jsbackend msp430
 LLVM_REQUIRED_COMPONENTS=ipo bitreader bitwriter linker asmparser mcjit \
                 interpreter instrumentation
 
@@ -387,12 +372,12 @@ CFG_INFO := $(info cfg: disabling unstable features (CFG_DISABLE_UNSTABLE_FEATUR
 # Turn on feature-staging
 export CFG_DISABLE_UNSTABLE_FEATURES
 # Subvert unstable feature lints to do the self-build
-export RUSTC_BOOTSTRAP_KEY:=$(CFG_BOOTSTRAP_KEY)
 endif
-export CFG_BOOTSTRAP_KEY
 ifdef CFG_MUSL_ROOT
 export CFG_MUSL_ROOT
 endif
+
+export RUSTC_BOOTSTRAP := 1
 
 ######################################################################
 # Per-stage targets and runner
@@ -455,10 +440,7 @@ endif
 TSREQ$(1)_T_$(2)_H_$(3) = \
 	$$(HSREQ$(1)_H_$(3)) \
 	$$(foreach obj,$$(REQUIRED_OBJECTS_$(2)),\
-		$$(TLIB$(1)_T_$(2)_H_$(3))/$$(obj)) \
-	$$(TLIB0_T_$(2)_H_$(3))/$$(call CFG_STATIC_LIB_NAME_$(2),compiler-rt)
-# ^ This copies `libcompiler-rt.a` to the stage0 sysroot
-# ^ TODO(stage0) update this to not copy `libcompiler-rt.a` to stage0
+		$$(TLIB$(1)_T_$(2)_H_$(3))/$$(obj))
 
 # Prerequisites for a working stageN compiler and libraries, for a specific
 # target

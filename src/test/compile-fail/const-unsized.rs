@@ -11,26 +11,26 @@
 use std::fmt::Debug;
 
 const CONST_0: Debug+Sync = *(&0 as &(Debug+Sync));
-//~^ ERROR `std::fmt::Debug + Sync + 'static: std::marker::Sized` is not satisfied
-//~| NOTE `std::fmt::Debug + Sync + 'static: std::marker::Sized` not satisfied
+//~^ ERROR `std::fmt::Debug + std::marker::Sync + 'static: std::marker::Sized` is not satisfied
+//~| NOTE the trait `std::marker::Sized` is not implemented for `std::fmt::Debug + std::marker::Syn
 //~| NOTE does not have a constant size known at compile-time
 //~| NOTE constant expressions must have a statically known size
 
 const CONST_FOO: str = *"foo";
 //~^ ERROR `str: std::marker::Sized` is not satisfied
-//~| NOTE `str: std::marker::Sized` not satisfied
+//~| NOTE the trait `std::marker::Sized` is not implemented for `str`
 //~| NOTE does not have a constant size known at compile-time
 //~| NOTE constant expressions must have a statically known size
 
 static STATIC_1: Debug+Sync = *(&1 as &(Debug+Sync));
-//~^ ERROR `std::fmt::Debug + Sync + 'static: std::marker::Sized` is not satisfied
-//~| NOTE `std::fmt::Debug + Sync + 'static: std::marker::Sized` not satisfied
+//~^ ERROR `std::fmt::Debug + std::marker::Sync + 'static: std::marker::Sized` is not satisfied
+//~| NOTE the trait `std::marker::Sized` is not implemented for `std::fmt::Debug + std::marker::Syn
 //~| NOTE does not have a constant size known at compile-time
 //~| NOTE constant expressions must have a statically known size
 
 static STATIC_BAR: str = *"bar";
 //~^ ERROR `str: std::marker::Sized` is not satisfied
-//~| NOTE `str: std::marker::Sized` not satisfied
+//~| NOTE the trait `std::marker::Sized` is not implemented for `str`
 //~| NOTE does not have a constant size known at compile-time
 //~| NOTE constant expressions must have a statically known size
 
