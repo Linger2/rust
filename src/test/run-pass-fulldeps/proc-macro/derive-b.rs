@@ -13,11 +13,10 @@
 
 #![feature(proc_macro)]
 
-#[macro_use]
 extern crate derive_b;
 
-#[derive(Debug, PartialEq, B, Eq, Copy, Clone)]
-#[B]
+#[derive(Debug, PartialEq, derive_b::B, Eq, Copy, Clone)]
+#[cfg_attr(all(), B arbitrary tokens)]
 struct B {
     #[C]
     a: u64

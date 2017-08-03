@@ -9,16 +9,14 @@
 // except according to those terms.
 
 #![crate_type = "proc-macro"]
-#![feature(proc_macro, proc_macro_lib)]
 #![allow(warnings)]
 
 extern crate proc_macro;
 
 #[proc_macro_derive(A)]
-unsafe extern fn foo(a: i32, b: u32) -> u32 {
+pub unsafe extern fn foo(a: i32, b: u32) -> u32 {
     //~^ ERROR: mismatched types
     //~| NOTE: expected normal fn, found unsafe fn
     //~| NOTE: expected type `fn(proc_macro::TokenStream) -> proc_macro::TokenStream`
-    //~| NOTE: found type `unsafe extern "C" fn(i32, u32) -> u32 {foo}`
     loop {}
 }

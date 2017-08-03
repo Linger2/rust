@@ -27,11 +27,13 @@ pub trait Encoder {
     // Primitive types:
     fn emit_nil(&mut self) -> Result<(), Self::Error>;
     fn emit_usize(&mut self, v: usize) -> Result<(), Self::Error>;
+    fn emit_u128(&mut self, v: u128) -> Result<(), Self::Error>;
     fn emit_u64(&mut self, v: u64) -> Result<(), Self::Error>;
     fn emit_u32(&mut self, v: u32) -> Result<(), Self::Error>;
     fn emit_u16(&mut self, v: u16) -> Result<(), Self::Error>;
     fn emit_u8(&mut self, v: u8) -> Result<(), Self::Error>;
     fn emit_isize(&mut self, v: isize) -> Result<(), Self::Error>;
+    fn emit_i128(&mut self, v: i128) -> Result<(), Self::Error>;
     fn emit_i64(&mut self, v: i64) -> Result<(), Self::Error>;
     fn emit_i32(&mut self, v: i32) -> Result<(), Self::Error>;
     fn emit_i16(&mut self, v: i16) -> Result<(), Self::Error>;
@@ -144,11 +146,13 @@ pub trait Decoder {
     // Primitive types:
     fn read_nil(&mut self) -> Result<(), Self::Error>;
     fn read_usize(&mut self) -> Result<usize, Self::Error>;
+    fn read_u128(&mut self) -> Result<u128, Self::Error>;
     fn read_u64(&mut self) -> Result<u64, Self::Error>;
     fn read_u32(&mut self) -> Result<u32, Self::Error>;
     fn read_u16(&mut self) -> Result<u16, Self::Error>;
     fn read_u8(&mut self) -> Result<u8, Self::Error>;
     fn read_isize(&mut self) -> Result<isize, Self::Error>;
+    fn read_i128(&mut self) -> Result<i128, Self::Error>;
     fn read_i64(&mut self) -> Result<i64, Self::Error>;
     fn read_i32(&mut self) -> Result<i32, Self::Error>;
     fn read_i16(&mut self) -> Result<i16, Self::Error>;
@@ -328,6 +332,18 @@ impl Decodable for u64 {
     }
 }
 
+impl Encodable for u128 {
+    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.emit_u128(*self)
+    }
+}
+
+impl Decodable for u128 {
+    fn decode<D: Decoder>(d: &mut D) -> Result<u128, D::Error> {
+        d.read_u128()
+    }
+}
+
 impl Encodable for isize {
     fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
         s.emit_isize(*self)
@@ -385,6 +401,18 @@ impl Encodable for i64 {
 impl Decodable for i64 {
     fn decode<D: Decoder>(d: &mut D) -> Result<i64, D::Error> {
         d.read_i64()
+    }
+}
+
+impl Encodable for i128 {
+    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.emit_i128(*self)
+    }
+}
+
+impl Decodable for i128 {
+    fn decode<D: Decoder>(d: &mut D) -> Result<i128, D::Error> {
+        d.read_i128()
     }
 }
 
@@ -539,6 +567,34 @@ impl<T:Decodable> Decodable for Vec<T> {
     }
 }
 
+impl<'a, T:Encodable> Encodable for Cow<'a, [T]>
+where [T]: ToOwned<Owned = Vec<T>>
+{
+    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.emit_seq(self.len(), |s| {
+            for (i, e) in self.iter().enumerate() {
+                s.emit_seq_elt(i, |s| e.encode(s))?
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<T:Decodable+ToOwned> Decodable for Cow<'static, [T]>
+where [T]: ToOwned<Owned = Vec<T>>
+{
+    fn decode<D: Decoder>(d: &mut D) -> Result<Cow<'static, [T]>, D::Error> {
+        d.read_seq(|d, len| {
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                v.push(d.read_seq_elt(i, |d| Decodable::decode(d))?);
+            }
+            Ok(Cow::Owned(v))
+        })
+    }
+}
+
+
 impl<T:Encodable> Encodable for Option<T> {
     fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
         s.emit_option(|s| {
@@ -673,7 +729,7 @@ pub trait SpecializationError {
     /// `S` is the encoder/decoder state type,
     /// `T` is the type being encoded/decoded, and
     /// the arguments are the names of the trait
-    /// and method that should've been overriden.
+    /// and method that should've been overridden.
     fn not_found<S, T: ?Sized>(trait_name: &'static str,
                                method_name: &'static str) -> Self;
 }
@@ -681,7 +737,7 @@ pub trait SpecializationError {
 impl<E> SpecializationError for E {
     default fn not_found<S, T: ?Sized>(trait_name: &'static str,
                                        method_name: &'static str) -> E {
-        panic!("missing specializaiton: `<{} as {}<{}>>::{}` not overriden",
+        panic!("missing specialization: `<{} as {}<{}>>::{}` not overridden",
                unsafe { intrinsics::type_name::<S>() },
                trait_name,
                unsafe { intrinsics::type_name::<T>() },

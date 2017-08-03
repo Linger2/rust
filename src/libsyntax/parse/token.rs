@@ -16,10 +16,12 @@ pub use self::Token::*;
 
 use ast::{self};
 use ptr::P;
+use serialize::{Decodable, Decoder, Encodable, Encoder};
 use symbol::keywords;
-use tokenstream;
+use tokenstream::{TokenStream, TokenTree};
 
-use std::fmt;
+use std::cell::Cell;
+use std::{cmp, fmt};
 use std::rc::Rc;
 
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug, Copy)]
@@ -49,6 +51,16 @@ pub enum DelimToken {
     NoDelim,
 }
 
+impl DelimToken {
+    pub fn len(self) -> usize {
+        if self == NoDelim { 0 } else { 1 }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == NoDelim
+    }
+}
+
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug, Copy)]
 pub enum Lit {
     Byte(ast::Name),
@@ -72,6 +84,44 @@ impl Lit {
             ByteStr(_) | ByteStrRaw(..) => "byte string"
         }
     }
+}
+
+fn ident_can_begin_expr(ident: ast::Ident) -> bool {
+    let ident_token: Token = Ident(ident);
+
+    !ident_token.is_reserved_ident() ||
+    ident_token.is_path_segment_keyword() ||
+    [
+        keywords::Do.name(),
+        keywords::Box.name(),
+        keywords::Break.name(),
+        keywords::Continue.name(),
+        keywords::False.name(),
+        keywords::For.name(),
+        keywords::If.name(),
+        keywords::Loop.name(),
+        keywords::Match.name(),
+        keywords::Move.name(),
+        keywords::Return.name(),
+        keywords::True.name(),
+        keywords::Unsafe.name(),
+        keywords::While.name(),
+    ].contains(&ident.name)
+}
+
+fn ident_can_begin_type(ident: ast::Ident) -> bool {
+    let ident_token: Token = Ident(ident);
+
+    !ident_token.is_reserved_ident() ||
+    ident_token.is_path_segment_keyword() ||
+    [
+        keywords::For.name(),
+        keywords::Impl.name(),
+        keywords::Fn.name(),
+        keywords::Unsafe.name(),
+        keywords::Extern.name(),
+        keywords::Typeof.name(),
+    ].contains(&ident.name)
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Eq, Hash, Debug)]
@@ -119,17 +169,12 @@ pub enum Token {
     Underscore,
     Lifetime(ast::Ident),
 
-    /* For interpolation */
-    Interpolated(Rc<Nonterminal>),
+    // The `LazyTokenStream` is a pure function of the `Nonterminal`,
+    // and so the `LazyTokenStream` can be ignored by Eq, Hash, etc.
+    Interpolated(Rc<(Nonterminal, LazyTokenStream)>),
     // Can be expanded into several tokens.
     /// Doc comment
     DocComment(ast::Name),
-    // In left-hand-sides of MBE macros:
-    /// Parse a nonterminal (name to bind, name of NT)
-    MatchNt(ast::Ident, ast::Ident),
-    // In right-hand-sides of MBE macros:
-    /// A syntactic variable that will be filled in by macro expansion.
-    SubstNt(ast::Ident),
 
     // Junk. These carry no data because we don't really care about the data
     // they *would* carry, and don't really want to allocate a new ident for
@@ -145,6 +190,10 @@ pub enum Token {
 }
 
 impl Token {
+    pub fn interpolated(nt: Nonterminal) -> Token {
+        Token::Interpolated(Rc::new((nt, LazyTokenStream::new())))
+    }
+
     /// Returns `true` if the token starts with '>'.
     pub fn is_like_gt(&self) -> bool {
         match *self {
@@ -156,25 +205,44 @@ impl Token {
     /// Returns `true` if the token can appear at the start of an expression.
     pub fn can_begin_expr(&self) -> bool {
         match *self {
-            OpenDelim(..)               => true,
-            Ident(..)                   => true,
-            Literal(..)                 => true,
-            Not                         => true,
-            BinOp(Minus)                => true,
-            BinOp(Star)                 => true,
-            BinOp(And)                  => true,
-            BinOp(Or)                   => true, // in lambda syntax
-            OrOr                        => true, // in lambda syntax
-            AndAnd                      => true, // double borrow
-            DotDot | DotDotDot          => true, // range notation
-            Lt | BinOp(Shl)             => true, // associated path
-            ModSep                      => true,
-            Pound                       => true, // for expression attributes
-            Interpolated(ref nt) => match **nt {
-                NtExpr(..) => true,
-                NtIdent(..) => true,
-                NtBlock(..) => true,
-                NtPath(..) => true,
+            Ident(ident)                => ident_can_begin_expr(ident), // value name or keyword
+            OpenDelim(..)               | // tuple, array or block
+            Literal(..)                 | // literal
+            Not                         | // operator not
+            BinOp(Minus)                | // unary minus
+            BinOp(Star)                 | // dereference
+            BinOp(Or) | OrOr            | // closure
+            BinOp(And)                  | // reference
+            AndAnd                      | // double reference
+            DotDot | DotDotDot          | // range notation
+            Lt | BinOp(Shl)             | // associated path
+            ModSep                      | // global path
+            Pound                       => true, // expression attributes
+            Interpolated(ref nt) => match nt.0 {
+                NtIdent(..) | NtExpr(..) | NtBlock(..) | NtPath(..) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the token can appear at the start of a type.
+    pub fn can_begin_type(&self) -> bool {
+        match *self {
+            Ident(ident)                => ident_can_begin_type(ident), // type name or keyword
+            OpenDelim(Paren)            | // tuple
+            OpenDelim(Bracket)          | // array
+            Underscore                  | // placeholder
+            Not                         | // never
+            BinOp(Star)                 | // raw pointer
+            BinOp(And)                  | // reference
+            AndAnd                      | // double reference
+            Question                    | // maybe bound in trait object
+            Lifetime(..)                | // lifetime bound in trait object
+            Lt | BinOp(Shl)             | // associated path
+            ModSep                      => true, // global path
+            Interpolated(ref nt) => match nt.0 {
+                NtIdent(..) | NtTy(..) | NtPath(..) => true,
                 _ => false,
             },
             _ => false,
@@ -189,12 +257,20 @@ impl Token {
         }
     }
 
+    pub fn ident(&self) -> Option<ast::Ident> {
+        match *self {
+            Ident(ident) => Some(ident),
+            Interpolated(ref nt) => match nt.0 {
+                NtIdent(ident) => Some(ident.node),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns `true` if the token is an identifier.
     pub fn is_ident(&self) -> bool {
-        match *self {
-            Ident(..)   => true,
-            _           => false,
-        }
+        self.ident().is_some()
     }
 
     /// Returns `true` if the token is a documentation comment.
@@ -216,7 +292,7 @@ impl Token {
     /// Returns `true` if the token is an interpolated path.
     pub fn is_path(&self) -> bool {
         if let Interpolated(ref nt) = *self {
-            if let NtPath(..) = **nt {
+            if let NtPath(..) = nt.0 {
                 return true;
             }
         }
@@ -243,47 +319,106 @@ impl Token {
 
     pub fn is_path_start(&self) -> bool {
         self == &ModSep || self.is_qpath_start() || self.is_path() ||
-        self.is_path_segment_keyword() || self.is_ident() && !self.is_any_keyword()
+        self.is_path_segment_keyword() || self.is_ident() && !self.is_reserved_ident()
     }
 
     /// Returns `true` if the token is a given keyword, `kw`.
     pub fn is_keyword(&self, kw: keywords::Keyword) -> bool {
-        match *self {
-            Ident(id) => id.name == kw.name(),
-            _ => false,
-        }
+        self.ident().map(|ident| ident.name == kw.name()).unwrap_or(false)
     }
 
     pub fn is_path_segment_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name == keywords::Super.name() ||
-                         id.name == keywords::SelfValue.name() ||
-                         id.name == keywords::SelfType.name(),
+        match self.ident() {
+            Some(id) => id.name == keywords::Super.name() ||
+                        id.name == keywords::SelfValue.name() ||
+                        id.name == keywords::SelfType.name() ||
+                        id.name == keywords::DollarCrate.name(),
+            None => false,
+        }
+    }
+
+    // Returns true for reserved identifiers used internally for elided lifetimes,
+    // unnamed method parameters, crate root module, error recovery etc.
+    pub fn is_special_ident(&self) -> bool {
+        match self.ident() {
+            Some(id) => id.name <= keywords::DollarCrate.name(),
             _ => false,
         }
     }
 
-    /// Returns `true` if the token is either a strict or reserved keyword.
-    pub fn is_any_keyword(&self) -> bool {
-        self.is_strict_keyword() || self.is_reserved_keyword()
-    }
-
-    /// Returns `true` if the token is a strict keyword.
-    pub fn is_strict_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name >= keywords::As.name() &&
-                         id.name <= keywords::While.name(),
+    /// Returns `true` if the token is a keyword used in the language.
+    pub fn is_used_keyword(&self) -> bool {
+        match self.ident() {
+            Some(id) => id.name >= keywords::As.name() && id.name <= keywords::While.name(),
             _ => false,
         }
     }
 
     /// Returns `true` if the token is a keyword reserved for possible future use.
-    pub fn is_reserved_keyword(&self) -> bool {
-        match *self {
-            Ident(id) => id.name >= keywords::Abstract.name() &&
-                         id.name <= keywords::Yield.name(),
+    pub fn is_unused_keyword(&self) -> bool {
+        match self.ident() {
+            Some(id) => id.name >= keywords::Abstract.name() && id.name <= keywords::Yield.name(),
             _ => false,
         }
+    }
+
+    pub fn glue(self, joint: Token) -> Option<Token> {
+        Some(match self {
+            Eq => match joint {
+                Eq => EqEq,
+                Gt => FatArrow,
+                _ => return None,
+            },
+            Lt => match joint {
+                Eq => Le,
+                Lt => BinOp(Shl),
+                Le => BinOpEq(Shl),
+                BinOp(Minus) => LArrow,
+                _ => return None,
+            },
+            Gt => match joint {
+                Eq => Ge,
+                Gt => BinOp(Shr),
+                Ge => BinOpEq(Shr),
+                _ => return None,
+            },
+            Not => match joint {
+                Eq => Ne,
+                _ => return None,
+            },
+            BinOp(op) => match joint {
+                Eq => BinOpEq(op),
+                BinOp(And) if op == And => AndAnd,
+                BinOp(Or) if op == Or => OrOr,
+                Gt if op == Minus => RArrow,
+                _ => return None,
+            },
+            Dot => match joint {
+                Dot => DotDot,
+                DotDot => DotDotDot,
+                _ => return None,
+            },
+            DotDot => match joint {
+                Dot => DotDotDot,
+                _ => return None,
+            },
+            Colon => match joint {
+                Colon => ModSep,
+                _ => return None,
+            },
+
+            Le | EqEq | Ne | Ge | AndAnd | OrOr | Tilde | BinOpEq(..) | At | DotDotDot | Comma |
+            Semi | ModSep | RArrow | LArrow | FatArrow | Pound | Dollar | Question |
+            OpenDelim(..) | CloseDelim(..) | Underscore => return None,
+
+            Literal(..) | Ident(..) | Lifetime(..) | Interpolated(..) | DocComment(..) |
+            Whitespace | Comment | Shebang(..) | Eof => return None,
+        })
+    }
+
+    /// Returns `true` if the token is either a special identifier or a keyword.
+    pub fn is_reserved_ident(&self) -> bool {
+        self.is_special_ident() || self.is_used_keyword() || self.is_unused_keyword()
     }
 }
 
@@ -300,7 +435,8 @@ pub enum Nonterminal {
     /// Stuff inside brackets for attributes
     NtMeta(ast::MetaItem),
     NtPath(ast::Path),
-    NtTT(tokenstream::TokenTree),
+    NtVis(ast::Visibility),
+    NtTT(TokenTree),
     // These are not exposed to macros, but are used by quasiquote.
     NtArm(ast::Arm),
     NtImplItem(ast::ImplItem),
@@ -329,6 +465,70 @@ impl fmt::Debug for Nonterminal {
             NtGenerics(..) => f.pad("NtGenerics(..)"),
             NtWhereClause(..) => f.pad("NtWhereClause(..)"),
             NtArg(..) => f.pad("NtArg(..)"),
+            NtVis(..) => f.pad("NtVis(..)"),
         }
     }
+}
+
+pub fn is_op(tok: &Token) -> bool {
+    match *tok {
+        OpenDelim(..) | CloseDelim(..) | Literal(..) | DocComment(..) |
+        Ident(..) | Underscore | Lifetime(..) | Interpolated(..) |
+        Whitespace | Comment | Shebang(..) | Eof => false,
+        _ => true,
+    }
+}
+
+pub struct LazyTokenStream(Cell<Option<TokenStream>>);
+
+impl Clone for LazyTokenStream {
+    fn clone(&self) -> Self {
+        let opt_stream = self.0.take();
+        self.0.set(opt_stream.clone());
+        LazyTokenStream(Cell::new(opt_stream))
+    }
+}
+
+impl cmp::Eq for LazyTokenStream {}
+impl PartialEq for LazyTokenStream {
+    fn eq(&self, _other: &LazyTokenStream) -> bool {
+        true
+    }
+}
+
+impl fmt::Debug for LazyTokenStream {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.clone().0.into_inner(), f)
+    }
+}
+
+impl LazyTokenStream {
+    pub fn new() -> Self {
+        LazyTokenStream(Cell::new(None))
+    }
+
+    pub fn force<F: FnOnce() -> TokenStream>(&self, f: F) -> TokenStream {
+        let mut opt_stream = self.0.take();
+        if opt_stream.is_none() {
+            opt_stream = Some(f());
+        }
+        self.0.set(opt_stream.clone());
+        opt_stream.clone().unwrap()
+    }
+}
+
+impl Encodable for LazyTokenStream {
+    fn encode<S: Encoder>(&self, _: &mut S) -> Result<(), S::Error> {
+        Ok(())
+    }
+}
+
+impl Decodable for LazyTokenStream {
+    fn decode<D: Decoder>(_: &mut D) -> Result<LazyTokenStream, D::Error> {
+        Ok(LazyTokenStream::new())
+    }
+}
+
+impl ::std::hash::Hash for LazyTokenStream {
+    fn hash<H: ::std::hash::Hasher>(&self, _hasher: &mut H) {}
 }

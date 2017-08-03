@@ -25,7 +25,10 @@ pub struct VariantInfo {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-pub enum SizeKind { Exact, Min }
+pub enum SizeKind {
+    Exact,
+    Min,
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FieldInfo {
@@ -79,12 +82,12 @@ impl CodeStats {
                                          opt_discr_size: Option<Size>,
                                          variants: Vec<VariantInfo>) {
         let info = TypeSizeInfo {
-            kind: kind,
+            kind,
             type_description: type_desc.to_string(),
             align: align.abi(),
             overall_size: overall_size.bytes(),
             opt_discr_size: opt_discr_size.map(|s| s.bytes()),
-            variants: variants,
+            variants,
         };
         self.type_sizes.insert(info);
     }
@@ -142,7 +145,12 @@ impl CodeStats {
                 max_variant_size = cmp::max(max_variant_size, size);
 
                 let mut min_offset = discr_size;
-                for field in fields {
+
+                // We want to print fields by increasing offset.
+                let mut fields = fields.clone();
+                fields.sort_by_key(|f| f.offset);
+
+                for field in fields.iter() {
                     let FieldInfo { ref name, offset, size, align } = *field;
 
                     // Include field alignment in output only if it caused padding injection

@@ -15,7 +15,6 @@
 use convert::TryFrom;
 use fmt;
 use intrinsics;
-use mem::size_of;
 use str::FromStr;
 
 /// Provides intentionally-wrapped arithmetic on `T`.
@@ -90,94 +89,15 @@ impl<T: fmt::UpperHex> fmt::UpperHex for Wrapping<T> {
 
 mod wrapping;
 
-// All these modules are technically private and only exposed for libcoretest:
+// All these modules are technically private and only exposed for coretests:
 pub mod flt2dec;
 pub mod dec2flt;
 pub mod bignum;
 pub mod diy_float;
 
-/// Types that have a "zero" value.
-///
-/// This trait is intended for use in conjunction with `Add`, as an identity:
-/// `x + T::zero() == x`.
-#[unstable(feature = "zero_one",
-           reason = "unsure of placement, wants to use associated constants",
-           issue = "27739")]
-#[rustc_deprecated(since = "1.11.0", reason = "no longer used for \
-                                               Iterator::sum")]
-pub trait Zero: Sized {
-    /// The "zero" (usually, additive identity) for this type.
-    fn zero() -> Self;
-}
-
-/// Types that have a "one" value.
-///
-/// This trait is intended for use in conjunction with `Mul`, as an identity:
-/// `x * T::one() == x`.
-#[unstable(feature = "zero_one",
-           reason = "unsure of placement, wants to use associated constants",
-           issue = "27739")]
-#[rustc_deprecated(since = "1.11.0", reason = "no longer used for \
-                                               Iterator::product")]
-pub trait One: Sized {
-    /// The "one" (usually, multiplicative identity) for this type.
-    fn one() -> Self;
-}
-
-macro_rules! zero_one_impl {
-    ($($t:ty)*) => ($(
-        #[unstable(feature = "zero_one",
-                   reason = "unsure of placement, wants to use associated constants",
-                   issue = "27739")]
-        #[allow(deprecated)]
-        impl Zero for $t {
-            #[inline]
-            fn zero() -> Self { 0 }
-        }
-        #[unstable(feature = "zero_one",
-                   reason = "unsure of placement, wants to use associated constants",
-                   issue = "27739")]
-        #[allow(deprecated)]
-        impl One for $t {
-            #[inline]
-            fn one() -> Self { 1 }
-        }
-    )*)
-}
-zero_one_impl! { u8 u16 u32 u64 usize i8 i16 i32 i64 isize }
-
-macro_rules! zero_one_impl_float {
-    ($($t:ty)*) => ($(
-        #[unstable(feature = "zero_one",
-                   reason = "unsure of placement, wants to use associated constants",
-                   issue = "27739")]
-        #[allow(deprecated)]
-        impl Zero for $t {
-            #[inline]
-            fn zero() -> Self { 0.0 }
-        }
-        #[unstable(feature = "zero_one",
-                   reason = "unsure of placement, wants to use associated constants",
-                   issue = "27739")]
-        #[allow(deprecated)]
-        impl One for $t {
-            #[inline]
-            fn one() -> Self { 1.0 }
-        }
-    )*)
-}
-zero_one_impl_float! { f32 f64 }
-
-macro_rules! checked_op {
-    ($U:ty, $op:path, $x:expr, $y:expr) => {{
-        let (result, overflowed) = unsafe { $op($x as $U, $y as $U) };
-        if overflowed { None } else { Some(result as Self) }
-    }}
-}
-
 // `Int` + `SignedInt` implemented for signed integers
 macro_rules! int_impl {
-    ($ActualT:ident, $UnsignedT:ty, $BITS:expr,
+    ($SelfT:ty, $ActualT:ident, $UnsignedT:ty, $BITS:expr,
      $add_with_overflow:path,
      $sub_with_overflow:path,
      $mul_with_overflow:path) => {
@@ -191,7 +111,7 @@ macro_rules! int_impl {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub const fn min_value() -> Self {
-            (-1 as Self) << ($BITS - 1)
+            !0 ^ ((!0 as $UnsignedT) >> 1) as Self
         }
 
         /// Returns the largest value that can be represented by this integer type.
@@ -210,6 +130,10 @@ macro_rules! int_impl {
         /// Converts a string slice in a given base to an integer.
         ///
         /// Leading and trailing whitespace represent an error.
+        ///
+        /// # Panics
+        ///
+        /// This function panics if `radix` is not in the range from 2 to 36.
         ///
         /// # Examples
         ///
@@ -775,7 +699,7 @@ macro_rules! int_impl {
         /// assert_eq!((-128i8).wrapping_div(-1), -128);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_div(self, rhs: Self) -> Self {
             self.overflowing_div(rhs).0
         }
@@ -801,7 +725,7 @@ macro_rules! int_impl {
         /// assert_eq!((-128i8).wrapping_rem(-1), 0);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_rem(self, rhs: Self) -> Self {
             self.overflowing_rem(rhs).0
         }
@@ -824,7 +748,7 @@ macro_rules! int_impl {
         /// assert_eq!((-128i8).wrapping_neg(), -128);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_neg(self) -> Self {
             self.overflowing_neg().0
         }
@@ -849,9 +773,11 @@ macro_rules! int_impl {
         /// assert_eq!((-1i8).wrapping_shl(8), -1);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_shl(self, rhs: u32) -> Self {
-            self.overflowing_shl(rhs).0
+            unsafe {
+                intrinsics::unchecked_shl(self, (rhs & ($BITS - 1)) as $SelfT)
+            }
         }
 
         /// Panic-free bitwise shift-right; yields `self >> mask(rhs)`,
@@ -874,9 +800,11 @@ macro_rules! int_impl {
         /// assert_eq!((-128i8).wrapping_shr(8), -128);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_shr(self, rhs: u32) -> Self {
-            self.overflowing_shr(rhs).0
+            unsafe {
+                intrinsics::unchecked_shr(self, (rhs & ($BITS - 1)) as $SelfT)
+            }
         }
 
         /// Wrapping (modular) absolute value. Computes `self.abs()`,
@@ -898,7 +826,7 @@ macro_rules! int_impl {
         /// assert_eq!((-128i8).wrapping_abs() as u8, 128);
         /// ```
         #[stable(feature = "no_panic_abs", since = "1.13.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_abs(self) -> Self {
             if self.is_negative() {
                 self.wrapping_neg()
@@ -1090,7 +1018,7 @@ macro_rules! int_impl {
         #[inline]
         #[stable(feature = "wrapping", since = "1.7.0")]
         pub fn overflowing_shl(self, rhs: u32) -> (Self, bool) {
-            (self << (rhs & ($BITS - 1)), (rhs > ($BITS - 1)))
+            (self.wrapping_shl(rhs), (rhs > ($BITS - 1)))
         }
 
         /// Shifts self right by `rhs` bits.
@@ -1112,7 +1040,7 @@ macro_rules! int_impl {
         #[inline]
         #[stable(feature = "wrapping", since = "1.7.0")]
         pub fn overflowing_shr(self, rhs: u32) -> (Self, bool) {
-            (self >> (rhs & ($BITS - 1)), (rhs > ($BITS - 1)))
+            (self.wrapping_shr(rhs), (rhs > ($BITS - 1)))
         }
 
         /// Computes the absolute value of `self`.
@@ -1268,7 +1196,7 @@ macro_rules! int_impl {
 
 #[lang = "i8"]
 impl i8 {
-    int_impl! { i8, u8, 8,
+    int_impl! { i8, i8, u8, 8,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1276,7 +1204,7 @@ impl i8 {
 
 #[lang = "i16"]
 impl i16 {
-    int_impl! { i16, u16, 16,
+    int_impl! { i16, i16, u16, 16,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1284,7 +1212,7 @@ impl i16 {
 
 #[lang = "i32"]
 impl i32 {
-    int_impl! { i32, u32, 32,
+    int_impl! { i32, i32, u32, 32,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1292,7 +1220,15 @@ impl i32 {
 
 #[lang = "i64"]
 impl i64 {
-    int_impl! { i64, u64, 64,
+    int_impl! { i64, i64, u64, 64,
+        intrinsics::add_with_overflow,
+        intrinsics::sub_with_overflow,
+        intrinsics::mul_with_overflow }
+}
+
+#[lang = "i128"]
+impl i128 {
+    int_impl! { i128, i128, u128, 128,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1301,7 +1237,7 @@ impl i64 {
 #[cfg(target_pointer_width = "16")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { i16, u16, 16,
+    int_impl! { isize, i16, u16, 16,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1310,7 +1246,7 @@ impl isize {
 #[cfg(target_pointer_width = "32")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { i32, u32, 32,
+    int_impl! { isize, i32, u32, 32,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1319,7 +1255,7 @@ impl isize {
 #[cfg(target_pointer_width = "64")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { i64, u64, 64,
+    int_impl! { isize, i64, u64, 64,
         intrinsics::add_with_overflow,
         intrinsics::sub_with_overflow,
         intrinsics::mul_with_overflow }
@@ -1327,9 +1263,10 @@ impl isize {
 
 // `Int` + `UnsignedInt` implemented for unsigned integers
 macro_rules! uint_impl {
-    ($ActualT:ty, $BITS:expr,
+    ($SelfT:ty, $ActualT:ty, $BITS:expr,
      $ctpop:path,
      $ctlz:path,
+     $ctlz_nonzero:path,
      $cttz:path,
      $bswap:path,
      $add_with_overflow:path,
@@ -1898,7 +1835,7 @@ macro_rules! uint_impl {
         /// assert_eq!(100u8.wrapping_div(10), 10);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_div(self, rhs: Self) -> Self {
             self / rhs
         }
@@ -1918,7 +1855,7 @@ macro_rules! uint_impl {
         /// assert_eq!(100u8.wrapping_rem(10), 0);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_rem(self, rhs: Self) -> Self {
             self % rhs
         }
@@ -1944,7 +1881,7 @@ macro_rules! uint_impl {
         /// assert_eq!(180u8.wrapping_neg(), (127 + 1) - (180u8 - (127 + 1)));
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_neg(self) -> Self {
             self.overflowing_neg().0
         }
@@ -1969,9 +1906,11 @@ macro_rules! uint_impl {
         /// assert_eq!(1u8.wrapping_shl(8), 1);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_shl(self, rhs: u32) -> Self {
-            self.overflowing_shl(rhs).0
+            unsafe {
+                intrinsics::unchecked_shl(self, (rhs & ($BITS - 1)) as $SelfT)
+            }
         }
 
         /// Panic-free bitwise shift-right; yields `self >> mask(rhs)`,
@@ -1994,9 +1933,11 @@ macro_rules! uint_impl {
         /// assert_eq!(128u8.wrapping_shr(8), 128);
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
-        #[inline(always)]
+        #[inline]
         pub fn wrapping_shr(self, rhs: u32) -> Self {
-            self.overflowing_shr(rhs).0
+            unsafe {
+                intrinsics::unchecked_shr(self, (rhs & ($BITS - 1)) as $SelfT)
+            }
         }
 
         /// Calculates `self` + `rhs`
@@ -2163,7 +2104,7 @@ macro_rules! uint_impl {
         #[inline]
         #[stable(feature = "wrapping", since = "1.7.0")]
         pub fn overflowing_shl(self, rhs: u32) -> (Self, bool) {
-            (self << (rhs & ($BITS - 1)), (rhs > ($BITS - 1)))
+            (self.wrapping_shl(rhs), (rhs > ($BITS - 1)))
         }
 
         /// Shifts self right by `rhs` bits.
@@ -2185,7 +2126,8 @@ macro_rules! uint_impl {
         #[inline]
         #[stable(feature = "wrapping", since = "1.7.0")]
         pub fn overflowing_shr(self, rhs: u32) -> (Self, bool) {
-            (self >> (rhs & ($BITS - 1)), (rhs > ($BITS - 1)))
+            (self.wrapping_shr(rhs), (rhs > ($BITS - 1)))
+
         }
 
         /// Raises self to the power of `exp`, using exponentiation by squaring.
@@ -2238,8 +2180,33 @@ macro_rules! uint_impl {
             (self.wrapping_sub(1)) & self == 0 && !(self == 0)
         }
 
+        // Returns one less than next power of two.
+        // (For 8u8 next power of two is 8u8 and for 6u8 it is 8u8)
+        //
+        // 8u8.one_less_than_next_power_of_two() == 7
+        // 6u8.one_less_than_next_power_of_two() == 7
+        //
+        // This method cannot overflow, as in the `next_power_of_two`
+        // overflow cases it instead ends up returning the maximum value
+        // of the type, and can return 0 for 0.
+        #[inline]
+        fn one_less_than_next_power_of_two(self) -> Self {
+            if self <= 1 { return 0; }
+
+            // Because `p > 0`, it cannot consist entirely of leading zeros.
+            // That means the shift is always in-bounds, and some processors
+            // (such as intel pre-haswell) have more efficient ctlz
+            // intrinsics when the argument is non-zero.
+            let p = self - 1;
+            let z = unsafe { $ctlz_nonzero(p) };
+            <$SelfT>::max_value() >> z
+        }
+
         /// Returns the smallest power of two greater than or equal to `self`.
-        /// Unspecified behavior on overflow.
+        ///
+        /// When return value overflows (i.e. `self > (1 << (N-1))` for type
+        /// `uN`), it panics in debug mode and return value is wrapped to 0 in
+        /// release mode (the only situation in which method can return 0).
         ///
         /// # Examples
         ///
@@ -2252,9 +2219,7 @@ macro_rules! uint_impl {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub fn next_power_of_two(self) -> Self {
-            let bits = size_of::<Self>() * 8;
-            let one: Self = 1;
-            one << ((bits - self.wrapping_sub(one).leading_zeros() as usize) % bits)
+            self.one_less_than_next_power_of_two() + 1
         }
 
         /// Returns the smallest power of two greater than or equal to `n`. If
@@ -2272,21 +2237,17 @@ macro_rules! uint_impl {
         /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
         pub fn checked_next_power_of_two(self) -> Option<Self> {
-            let npot = self.next_power_of_two();
-            if npot >= self {
-                Some(npot)
-            } else {
-                None
-            }
+            self.one_less_than_next_power_of_two().checked_add(1)
         }
     }
 }
 
 #[lang = "u8"]
 impl u8 {
-    uint_impl! { u8, 8,
+    uint_impl! { u8, u8, 8,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2296,9 +2257,10 @@ impl u8 {
 
 #[lang = "u16"]
 impl u16 {
-    uint_impl! { u16, 16,
+    uint_impl! { u16, u16, 16,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2308,9 +2270,10 @@ impl u16 {
 
 #[lang = "u32"]
 impl u32 {
-    uint_impl! { u32, 32,
+    uint_impl! { u32, u32, 32,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2320,9 +2283,23 @@ impl u32 {
 
 #[lang = "u64"]
 impl u64 {
-    uint_impl! { u64, 64,
+    uint_impl! { u64, u64, 64,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
+        intrinsics::cttz,
+        intrinsics::bswap,
+        intrinsics::add_with_overflow,
+        intrinsics::sub_with_overflow,
+        intrinsics::mul_with_overflow }
+}
+
+#[lang = "u128"]
+impl u128 {
+    uint_impl! { u128, u128, 128,
+        intrinsics::ctpop,
+        intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2333,9 +2310,10 @@ impl u64 {
 #[cfg(target_pointer_width = "16")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { u16, 16,
+    uint_impl! { usize, u16, 16,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2345,9 +2323,10 @@ impl usize {
 #[cfg(target_pointer_width = "32")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { u32, 32,
+    uint_impl! { usize, u32, 32,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2358,9 +2337,10 @@ impl usize {
 #[cfg(target_pointer_width = "64")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { u64, 64,
+    uint_impl! { usize, u64, 64,
         intrinsics::ctpop,
         intrinsics::ctlz,
+        intrinsics::ctlz_nonzero,
         intrinsics::cttz,
         intrinsics::bswap,
         intrinsics::add_with_overflow,
@@ -2370,11 +2350,11 @@ impl usize {
 
 /// A classification of floating point numbers.
 ///
-/// This `enum` is used as the return type for [`f32::classify()`] and [`f64::classify()`]. See
+/// This `enum` is used as the return type for [`f32::classify`] and [`f64::classify`]. See
 /// their documentation for more.
 ///
-/// [`f32::classify()`]: ../../std/primitive.f32.html#method.classify
-/// [`f64::classify()`]: ../../std/primitive.f64.html#method.classify
+/// [`f32::classify`]: ../../std/primitive.f32.html#method.classify
+/// [`f64::classify`]: ../../std/primitive.f64.html#method.classify
 ///
 /// # Examples
 ///
@@ -2424,73 +2404,22 @@ pub enum FpCategory {
            reason = "stable interface is via `impl f{32,64}` in later crates",
            issue = "32110")]
 pub trait Float: Sized {
-    /// Returns the NaN value.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn nan() -> Self;
-    /// Returns the infinite value.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn infinity() -> Self;
-    /// Returns the negative infinite value.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn neg_infinity() -> Self;
-    /// Returns -0.0.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn neg_zero() -> Self;
-    /// Returns 0.0.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn zero() -> Self;
-    /// Returns 1.0.
-    #[unstable(feature = "float_extras", reason = "needs removal",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn one() -> Self;
-
-    /// Returns true if this value is NaN and false otherwise.
+    /// Returns `true` if this value is NaN and false otherwise.
     #[stable(feature = "core", since = "1.6.0")]
     fn is_nan(self) -> bool;
-    /// Returns true if this value is positive infinity or negative infinity and
+    /// Returns `true` if this value is positive infinity or negative infinity and
     /// false otherwise.
     #[stable(feature = "core", since = "1.6.0")]
     fn is_infinite(self) -> bool;
-    /// Returns true if this number is neither infinite nor NaN.
+    /// Returns `true` if this number is neither infinite nor NaN.
     #[stable(feature = "core", since = "1.6.0")]
     fn is_finite(self) -> bool;
-    /// Returns true if this number is neither zero, infinite, denormal, or NaN.
+    /// Returns `true` if this number is neither zero, infinite, denormal, or NaN.
     #[stable(feature = "core", since = "1.6.0")]
     fn is_normal(self) -> bool;
     /// Returns the category that this number falls into.
     #[stable(feature = "core", since = "1.6.0")]
     fn classify(self) -> FpCategory;
-
-    /// Returns the mantissa, exponent and sign as integers, respectively.
-    #[unstable(feature = "float_extras", reason = "signature is undecided",
-               issue = "27752")]
-    #[rustc_deprecated(since = "1.11.0",
-                       reason = "never really came to fruition and easily \
-                                 implementable outside the standard library")]
-    fn integer_decode(self) -> (u64, i16, i8);
 
     /// Computes the absolute value of `self`. Returns `Float::nan()` if the
     /// number is `Float::nan()`.
@@ -2529,6 +2458,13 @@ pub trait Float: Sized {
     /// Convert degrees to radians.
     #[stable(feature = "deg_rad_conversions", since="1.7.0")]
     fn to_radians(self) -> Self;
+
+    /// Returns the maximum of the two numbers.
+    #[stable(feature = "core_float_min_max", since="1.20.0")]
+    fn max(self, other: Self) -> Self;
+    /// Returns the minimum of the two numbers.
+    #[stable(feature = "core_float_min_max", since="1.20.0")]
+    fn min(self, other: Self) -> Self;
 }
 
 macro_rules! from_str_radix_int_impl {
@@ -2542,7 +2478,7 @@ macro_rules! from_str_radix_int_impl {
         }
     )*}
 }
-from_str_radix_int_impl! { isize i8 i16 i32 i64 usize u8 u16 u32 u64 }
+from_str_radix_int_impl! { isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 }
 
 /// The error type returned when a checked integral type conversion fails.
 #[unstable(feature = "try_from", issue = "33417")]
@@ -2567,16 +2503,50 @@ impl fmt::Display for TryFromIntError {
     }
 }
 
-macro_rules! same_sign_from_int_impl {
-    ($storage:ty, $target:ty, $($source:ty),*) => {$(
+// no possible bounds violation
+macro_rules! try_from_unbounded {
+    ($source:ty, $($target:ty),*) => {$(
         #[unstable(feature = "try_from", issue = "33417")]
         impl TryFrom<$source> for $target {
-            type Err = TryFromIntError;
+            type Error = TryFromIntError;
 
+            #[inline]
             fn try_from(u: $source) -> Result<$target, TryFromIntError> {
-                let min = <$target as FromStrRadixHelper>::min_value() as $storage;
-                let max = <$target as FromStrRadixHelper>::max_value() as $storage;
-                if u as $storage < min || u as $storage > max {
+                Ok(u as $target)
+            }
+        }
+    )*}
+}
+
+// only negative bounds
+macro_rules! try_from_lower_bounded {
+    ($source:ty, $($target:ty),*) => {$(
+        #[unstable(feature = "try_from", issue = "33417")]
+        impl TryFrom<$source> for $target {
+            type Error = TryFromIntError;
+
+            #[inline]
+            fn try_from(u: $source) -> Result<$target, TryFromIntError> {
+                if u >= 0 {
+                    Ok(u as $target)
+                } else {
+                    Err(TryFromIntError(()))
+                }
+            }
+        }
+    )*}
+}
+
+// unsigned to signed (only positive bound)
+macro_rules! try_from_upper_bounded {
+    ($source:ty, $($target:ty),*) => {$(
+        #[unstable(feature = "try_from", issue = "33417")]
+        impl TryFrom<$source> for $target {
+            type Error = TryFromIntError;
+
+            #[inline]
+            fn try_from(u: $source) -> Result<$target, TryFromIntError> {
+                if u > (<$target>::max_value() as $source) {
                     Err(TryFromIntError(()))
                 } else {
                     Ok(u as $target)
@@ -2586,54 +2556,159 @@ macro_rules! same_sign_from_int_impl {
     )*}
 }
 
-same_sign_from_int_impl!(u64, u8, u8, u16, u32, u64, usize);
-same_sign_from_int_impl!(i64, i8, i8, i16, i32, i64, isize);
-same_sign_from_int_impl!(u64, u16, u8, u16, u32, u64, usize);
-same_sign_from_int_impl!(i64, i16, i8, i16, i32, i64, isize);
-same_sign_from_int_impl!(u64, u32, u8, u16, u32, u64, usize);
-same_sign_from_int_impl!(i64, i32, i8, i16, i32, i64, isize);
-same_sign_from_int_impl!(u64, u64, u8, u16, u32, u64, usize);
-same_sign_from_int_impl!(i64, i64, i8, i16, i32, i64, isize);
-same_sign_from_int_impl!(u64, usize, u8, u16, u32, u64, usize);
-same_sign_from_int_impl!(i64, isize, i8, i16, i32, i64, isize);
-
-macro_rules! cross_sign_from_int_impl {
-    ($unsigned:ty, $($signed:ty),*) => {$(
+// all other cases
+macro_rules! try_from_both_bounded {
+    ($source:ty, $($target:ty),*) => {$(
         #[unstable(feature = "try_from", issue = "33417")]
-        impl TryFrom<$unsigned> for $signed {
-            type Err = TryFromIntError;
+        impl TryFrom<$source> for $target {
+            type Error = TryFromIntError;
 
-            fn try_from(u: $unsigned) -> Result<$signed, TryFromIntError> {
-                let max = <$signed as FromStrRadixHelper>::max_value() as u64;
-                if u as u64 > max {
+            #[inline]
+            fn try_from(u: $source) -> Result<$target, TryFromIntError> {
+                let min = <$target>::min_value() as $source;
+                let max = <$target>::max_value() as $source;
+                if u < min || u > max {
                     Err(TryFromIntError(()))
                 } else {
-                    Ok(u as $signed)
-                }
-            }
-        }
-
-        #[unstable(feature = "try_from", issue = "33417")]
-        impl TryFrom<$signed> for $unsigned {
-            type Err = TryFromIntError;
-
-            fn try_from(u: $signed) -> Result<$unsigned, TryFromIntError> {
-                let max = <$unsigned as FromStrRadixHelper>::max_value() as u64;
-                if u < 0 || u as u64 > max {
-                    Err(TryFromIntError(()))
-                } else {
-                    Ok(u as $unsigned)
+                    Ok(u as $target)
                 }
             }
         }
     )*}
 }
 
-cross_sign_from_int_impl!(u8, i8, i16, i32, i64, isize);
-cross_sign_from_int_impl!(u16, i8, i16, i32, i64, isize);
-cross_sign_from_int_impl!(u32, i8, i16, i32, i64, isize);
-cross_sign_from_int_impl!(u64, i8, i16, i32, i64, isize);
-cross_sign_from_int_impl!(usize, i8, i16, i32, i64, isize);
+macro_rules! rev {
+    ($mac:ident, $source:ty, $($target:ty),*) => {$(
+        $mac!($target, $source);
+    )*}
+}
+
+/// intra-sign conversions
+try_from_unbounded!(u8, u8, u16, u32, u64, u128);
+try_from_unbounded!(u16, u16, u32, u64, u128);
+try_from_unbounded!(u32, u32, u64, u128);
+try_from_unbounded!(u64, u64, u128);
+try_from_unbounded!(u128, u128);
+try_from_upper_bounded!(u16, u8);
+try_from_upper_bounded!(u32, u16, u8);
+try_from_upper_bounded!(u64, u32, u16, u8);
+try_from_upper_bounded!(u128, u64, u32, u16, u8);
+
+try_from_unbounded!(i8, i8, i16, i32, i64, i128);
+try_from_unbounded!(i16, i16, i32, i64, i128);
+try_from_unbounded!(i32, i32, i64, i128);
+try_from_unbounded!(i64, i64, i128);
+try_from_unbounded!(i128, i128);
+try_from_both_bounded!(i16, i8);
+try_from_both_bounded!(i32, i16, i8);
+try_from_both_bounded!(i64, i32, i16, i8);
+try_from_both_bounded!(i128, i64, i32, i16, i8);
+
+// unsigned-to-signed
+try_from_unbounded!(u8, i16, i32, i64, i128);
+try_from_unbounded!(u16, i32, i64, i128);
+try_from_unbounded!(u32, i64, i128);
+try_from_unbounded!(u64, i128);
+try_from_upper_bounded!(u8, i8);
+try_from_upper_bounded!(u16, i8, i16);
+try_from_upper_bounded!(u32, i8, i16, i32);
+try_from_upper_bounded!(u64, i8, i16, i32, i64);
+try_from_upper_bounded!(u128, i8, i16, i32, i64, i128);
+
+// signed-to-unsigned
+try_from_lower_bounded!(i8, u8, u16, u32, u64, u128);
+try_from_lower_bounded!(i16, u16, u32, u64, u128);
+try_from_lower_bounded!(i32, u32, u64, u128);
+try_from_lower_bounded!(i64, u64, u128);
+try_from_lower_bounded!(i128, u128);
+try_from_both_bounded!(i16, u8);
+try_from_both_bounded!(i32, u16, u8);
+try_from_both_bounded!(i64, u32, u16, u8);
+try_from_both_bounded!(i128, u64, u32, u16, u8);
+
+// usize/isize
+try_from_unbounded!(usize, usize);
+try_from_upper_bounded!(usize, isize);
+try_from_lower_bounded!(isize, usize);
+try_from_unbounded!(isize, isize);
+
+#[cfg(target_pointer_width = "16")]
+mod ptr_try_from_impls {
+    use super::TryFromIntError;
+    use convert::TryFrom;
+
+    try_from_upper_bounded!(usize, u8);
+    try_from_unbounded!(usize, u16, u32, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16);
+    try_from_unbounded!(usize, i32, i64, i128);
+
+    try_from_both_bounded!(isize, u8);
+    try_from_lower_bounded!(isize, u16, u32, u64, u128);
+    try_from_both_bounded!(isize, i8);
+    try_from_unbounded!(isize, i16, i32, i64, i128);
+
+    rev!(try_from_unbounded, usize, u8, u16);
+    rev!(try_from_upper_bounded, usize, u32, u64, u128);
+    rev!(try_from_lower_bounded, usize, i8, i16);
+    rev!(try_from_both_bounded, usize, i32, i64, i128);
+
+    rev!(try_from_unbounded, isize, u8);
+    rev!(try_from_upper_bounded, isize, u16, u32, u64, u128);
+    rev!(try_from_unbounded, isize, i8, i16);
+    rev!(try_from_both_bounded, isize, i32, i64, i128);
+}
+
+#[cfg(target_pointer_width = "32")]
+mod ptr_try_from_impls {
+    use super::TryFromIntError;
+    use convert::TryFrom;
+
+    try_from_upper_bounded!(usize, u8, u16);
+    try_from_unbounded!(usize, u32, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16, i32);
+    try_from_unbounded!(usize, i64, i128);
+
+    try_from_both_bounded!(isize, u8, u16);
+    try_from_lower_bounded!(isize, u32, u64, u128);
+    try_from_both_bounded!(isize, i8, i16);
+    try_from_unbounded!(isize, i32, i64, i128);
+
+    rev!(try_from_unbounded, usize, u8, u16, u32);
+    rev!(try_from_upper_bounded, usize, u64, u128);
+    rev!(try_from_lower_bounded, usize, i8, i16, i32);
+    rev!(try_from_both_bounded, usize, i64, i128);
+
+    rev!(try_from_unbounded, isize, u8, u16);
+    rev!(try_from_upper_bounded, isize, u32, u64, u128);
+    rev!(try_from_unbounded, isize, i8, i16, i32);
+    rev!(try_from_both_bounded, isize, i64, i128);
+}
+
+#[cfg(target_pointer_width = "64")]
+mod ptr_try_from_impls {
+    use super::TryFromIntError;
+    use convert::TryFrom;
+
+    try_from_upper_bounded!(usize, u8, u16, u32);
+    try_from_unbounded!(usize, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16, i32, i64);
+    try_from_unbounded!(usize, i128);
+
+    try_from_both_bounded!(isize, u8, u16, u32);
+    try_from_lower_bounded!(isize, u64, u128);
+    try_from_both_bounded!(isize, i8, i16, i32);
+    try_from_unbounded!(isize, i64, i128);
+
+    rev!(try_from_unbounded, usize, u8, u16, u32, u64);
+    rev!(try_from_upper_bounded, usize, u128);
+    rev!(try_from_lower_bounded, usize, i8, i16, i32, i64);
+    rev!(try_from_both_bounded, usize, i128);
+
+    rev!(try_from_unbounded, isize, u8, u16, u32);
+    rev!(try_from_upper_bounded, isize, u64, u128);
+    rev!(try_from_unbounded, isize, i8, i16, i32, i64);
+    rev!(try_from_both_bounded, isize, i128);
+}
 
 #[doc(hidden)]
 trait FromStrRadixHelper: PartialOrd + Copy {
@@ -2647,21 +2722,27 @@ trait FromStrRadixHelper: PartialOrd + Copy {
 
 macro_rules! doit {
     ($($t:ty)*) => ($(impl FromStrRadixHelper for $t {
+        #[inline]
         fn min_value() -> Self { Self::min_value() }
+        #[inline]
         fn max_value() -> Self { Self::max_value() }
+        #[inline]
         fn from_u32(u: u32) -> Self { u as Self }
+        #[inline]
         fn checked_mul(&self, other: u32) -> Option<Self> {
             Self::checked_mul(*self, other as Self)
         }
+        #[inline]
         fn checked_sub(&self, other: u32) -> Option<Self> {
             Self::checked_sub(*self, other as Self)
         }
+        #[inline]
         fn checked_add(&self, other: u32) -> Option<Self> {
             Self::checked_add(*self, other as Self)
         }
     })*)
 }
-doit! { i8 i16 i32 i64 isize u8 u16 u32 u64 usize }
+doit! { i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize }
 
 fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32) -> Result<T, ParseIntError> {
     use self::IntErrorKind::*;
@@ -2733,9 +2814,9 @@ fn from_str_radix<T: FromStrRadixHelper>(src: &str, radix: u32) -> Result<T, Par
 /// An error which can be returned when parsing an integer.
 ///
 /// This error is used as the error type for the `from_str_radix()` functions
-/// on the primitive integer types, such as [`i8::from_str_radix()`].
+/// on the primitive integer types, such as [`i8::from_str_radix`].
 ///
-/// [`i8::from_str_radix()`]: ../../std/primitive.i8.html#method.from_str_radix
+/// [`i8::from_str_radix`]: ../../std/primitive.i8.html#method.from_str_radix
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct ParseIntError {
@@ -2780,8 +2861,8 @@ pub use num::dec2flt::ParseFloatError;
 // Conversions T -> T are covered by a blanket impl and therefore excluded
 // Some conversions from and to usize/isize are not implemented due to portability concerns
 macro_rules! impl_from {
-    ($Small: ty, $Large: ty) => {
-        #[stable(feature = "lossless_prim_conv", since = "1.5.0")]
+    ($Small: ty, $Large: ty, #[$attr:meta]) => {
+        #[$attr]
         impl From<$Small> for $Large {
             #[inline]
             fn from(small: $Small) -> $Large {
@@ -2792,48 +2873,60 @@ macro_rules! impl_from {
 }
 
 // Unsigned -> Unsigned
-impl_from! { u8, u16 }
-impl_from! { u8, u32 }
-impl_from! { u8, u64 }
-impl_from! { u8, usize }
-impl_from! { u16, u32 }
-impl_from! { u16, u64 }
-impl_from! { u32, u64 }
+impl_from! { u8, u16, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, u32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, u64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, u128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u8, usize, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u16, u32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u16, u64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u16, u128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u32, u64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u32, u128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u64, u128, #[unstable(feature = "i128", issue = "35118")] }
 
 // Signed -> Signed
-impl_from! { i8, i16 }
-impl_from! { i8, i32 }
-impl_from! { i8, i64 }
-impl_from! { i8, isize }
-impl_from! { i16, i32 }
-impl_from! { i16, i64 }
-impl_from! { i32, i64 }
+impl_from! { i8, i16, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i8, i32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i8, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i8, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { i8, isize, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i16, i32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i16, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i16, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { i32, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { i32, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { i64, i128, #[unstable(feature = "i128", issue = "35118")] }
 
 // Unsigned -> Signed
-impl_from! { u8, i16 }
-impl_from! { u8, i32 }
-impl_from! { u8, i64 }
-impl_from! { u16, i32 }
-impl_from! { u16, i64 }
-impl_from! { u32, i64 }
+impl_from! { u8, i16, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, i32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u8, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u16, i32, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u16, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u16, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u32, i64, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }
+impl_from! { u32, i128, #[unstable(feature = "i128", issue = "35118")] }
+impl_from! { u64, i128, #[unstable(feature = "i128", issue = "35118")] }
 
 // Note: integers can only be represented with full precision in a float if
 // they fit in the significand, which is 24 bits in f32 and 53 bits in f64.
 // Lossy float conversions are not implemented at this time.
 
 // Signed -> Float
-impl_from! { i8, f32 }
-impl_from! { i8, f64 }
-impl_from! { i16, f32 }
-impl_from! { i16, f64 }
-impl_from! { i32, f64 }
+impl_from! { i8, f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { i8, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { i16, f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { i16, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { i32, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
 
 // Unsigned -> Float
-impl_from! { u8, f32 }
-impl_from! { u8, f64 }
-impl_from! { u16, f32 }
-impl_from! { u16, f64 }
-impl_from! { u32, f64 }
+impl_from! { u8, f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { u8, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { u16, f32, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { u16, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
+impl_from! { u32, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }
 
 // Float -> Float
-impl_from! { f32, f64 }
+impl_from! { f32, f64, #[stable(feature = "lossless_float_conv", since = "1.6.0")] }

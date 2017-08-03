@@ -244,6 +244,39 @@ let baz: bool = { (&FOO as *const i32) == (&BAR as *const i32) };
 ```
 "##,
 
+E0161: r##"
+A value was moved. However, its size was not known at compile time, and only
+values of a known size can be moved.
+
+Erroneous code example:
+
+```compile_fail
+#![feature(box_syntax)]
+
+fn main() {
+    let array: &[isize] = &[1, 2, 3];
+    let _x: Box<[isize]> = box *array;
+    // error: cannot move a value of type [isize]: the size of [isize] cannot
+    //        be statically determined
+}
+```
+
+In Rust, you can only move a value when its size is known at compile time.
+
+To work around this restriction, consider "hiding" the value behind a reference:
+either `&x` or `&mut x`. Since a reference has a fixed size, this lets you move
+it around as usual. Example:
+
+```
+#![feature(box_syntax)]
+
+fn main() {
+    let array: &[isize] = &[1, 2, 3];
+    let _x: Box<&[isize]> = box array; // ok!
+}
+```
+"##,
+
 E0396: r##"
 The value behind a raw pointer can't be determined at compile-time
 (or even link-time), which means it can't be used in a constant
@@ -276,8 +309,8 @@ use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
 
 const A: AtomicUsize = ATOMIC_USIZE_INIT;
 static B: &'static AtomicUsize = &A;
-// error: cannot borrow a constant which contains interior mutability, create a
-//        static instead
+// error: cannot borrow a constant which may contain interior mutability,
+//        create a static instead
 ```
 
 A `const` represents a constant value that should never change. If one takes
@@ -305,8 +338,8 @@ use std::cell::Cell;
 
 const A: Cell<usize> = Cell::new(1);
 const B: &'static Cell<usize> = &A;
-// error: cannot borrow a constant which contains interior mutability, create
-//        a static instead
+// error: cannot borrow a constant which may contain interior mutability,
+//        create a static instead
 
 // or:
 struct C { a: Cell<usize> }

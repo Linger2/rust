@@ -9,10 +9,13 @@ path = "lib.rs"
 test = false
 bench = false
 
+[dev-dependencies]
+rand = { path = "../librand" }
+
 [[test]]
-name = "coretest"
-path = "../libcoretest/lib.rs"
+name = "coretests"
+path = "../libcore/tests/lib.rs"
 
 [[bench]]
-name = "coretest"
-path = "../libcoretest/lib.rs"
+name = "corebenches"
+path = "../libcore/benches/lib.rs"

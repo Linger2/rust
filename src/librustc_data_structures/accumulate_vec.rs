@@ -19,12 +19,13 @@ use std::ops::{Deref, DerefMut};
 use std::iter::{self, IntoIterator, FromIterator};
 use std::slice;
 use std::vec;
+use std::collections::range::RangeArgument;
 
 use rustc_serialize::{Encodable, Encoder, Decodable, Decoder};
 
 use array_vec::{self, Array, ArrayVec};
 
-#[derive(PartialEq, Eq, Hash, Debug)]
+#[derive(Hash, Debug)]
 pub enum AccumulateVec<A: Array> {
     Array(ArrayVec<A>),
     Heap(Vec<A::Element>)
@@ -71,14 +72,27 @@ impl<A: Array> AccumulateVec<A> {
             AccumulateVec::Heap(ref mut vec) => vec.pop(),
         }
     }
+
+    pub fn drain<R>(&mut self, range: R) -> Drain<A>
+        where R: RangeArgument<usize>
+    {
+        match *self {
+            AccumulateVec::Array(ref mut v) => {
+                Drain::Array(v.drain(range))
+            },
+            AccumulateVec::Heap(ref mut v) => {
+                Drain::Heap(v.drain(range))
+            },
+        }
+    }
 }
 
 impl<A: Array> Deref for AccumulateVec<A> {
     type Target = [A::Element];
     fn deref(&self) -> &Self::Target {
         match *self {
-            AccumulateVec::Array(ref v) => &v[..],
-            AccumulateVec::Heap(ref v) => &v[..],
+            AccumulateVec::Array(ref v) => v,
+            AccumulateVec::Heap(ref v) => v,
         }
     }
 }
@@ -86,8 +100,8 @@ impl<A: Array> Deref for AccumulateVec<A> {
 impl<A: Array> DerefMut for AccumulateVec<A> {
     fn deref_mut(&mut self) -> &mut [A::Element] {
         match *self {
-            AccumulateVec::Array(ref mut v) => &mut v[..],
-            AccumulateVec::Heap(ref mut v) => &mut v[..],
+            AccumulateVec::Array(ref mut v) => v,
+            AccumulateVec::Heap(ref mut v) => v,
         }
     }
 }
@@ -128,6 +142,31 @@ impl<A: Array> Iterator for IntoIter<A> {
         match self.repr {
             IntoIterRepr::Array(ref iter) => iter.size_hint(),
             IntoIterRepr::Heap(ref iter) => iter.size_hint(),
+        }
+    }
+}
+
+pub enum Drain<'a, A: Array>
+        where A::Element: 'a
+{
+    Array(array_vec::Drain<'a, A>),
+    Heap(vec::Drain<'a, A::Element>),
+}
+
+impl<'a, A: Array> Iterator for Drain<'a, A> {
+    type Item = A::Element;
+
+    fn next(&mut self) -> Option<A::Element> {
+        match *self {
+            Drain::Array(ref mut drain) => drain.next(),
+            Drain::Heap(ref mut drain) => drain.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match *self {
+            Drain::Array(ref drain) => drain.size_hint(),
+            Drain::Heap(ref drain) => drain.size_hint(),
         }
     }
 }

@@ -21,9 +21,10 @@ mod c {
 }
 
 mod d {
-    use a::foo; //~ NOTE previous import
-    use a::foo; //~ ERROR `foo` has already been imported
-                //~| NOTE already imported
+    use a::foo; //~ NOTE previous import of the value `foo` here
+    use a::foo; //~ ERROR the name `foo` is defined multiple times
+                //~| NOTE `foo` reimported here
+                //~| NOTE `foo` must be defined only once in the value namespace of this module
 }
 
 mod e {
@@ -32,13 +33,13 @@ mod e {
 }
 
 mod f {
-    pub use a::*; //~ NOTE `foo` could resolve to the name imported here
-    pub use b::*; //~ NOTE `foo` could also resolve to the name imported here
+    pub use a::*; //~ NOTE `foo` could refer to the name imported here
+    pub use b::*; //~ NOTE `foo` could also refer to the name imported here
 }
 
 mod g {
-    pub use a::*; //~ NOTE `foo` could resolve to the name imported here
-    pub use f::*; //~ NOTE `foo` could also resolve to the name imported here
+    pub use a::*; //~ NOTE `foo` could refer to the name imported here
+    pub use f::*; //~ NOTE `foo` could also refer to the name imported here
 }
 
 fn main() {

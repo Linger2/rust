@@ -58,7 +58,7 @@ pub struct DirEntry {
     data: c::WIN32_FIND_DATAW,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
     // generic
     read: bool,
@@ -79,6 +79,7 @@ pub struct OpenOptions {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions { attrs: c::DWORD }
 
+#[derive(Debug)]
 pub struct DirBuilder;
 
 impl fmt::Debug for ReadDir {
@@ -321,10 +322,6 @@ impl File {
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.handle.read_at(buf, offset)
-    }
-
-    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.handle.read_to_end(buf)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -645,9 +642,25 @@ pub fn symlink_inner(src: &Path, dst: &Path, dir: bool) -> io::Result<()> {
     let src = to_u16s(src)?;
     let dst = to_u16s(dst)?;
     let flags = if dir { c::SYMBOLIC_LINK_FLAG_DIRECTORY } else { 0 };
-    cvt(unsafe {
-        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
-    })?;
+    // Formerly, symlink creation required the SeCreateSymbolicLink privilege. For the Windows 10
+    // Creators Update, Microsoft loosened this to allow unprivileged symlink creation if the
+    // computer is in Developer Mode, but SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE must be
+    // added to dwFlags to opt into this behaviour.
+    let result = cvt(unsafe {
+        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(),
+                               flags | c::SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) as c::BOOL
+    });
+    if let Err(err) = result {
+        if err.raw_os_error() == Some(c::ERROR_INVALID_PARAMETER as i32) {
+            // Older Windows objects to SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            // so if we encounter ERROR_INVALID_PARAMETER, retry without that flag.
+            cvt(unsafe {
+                c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
+            })?;
+        } else {
+            return Err(err);
+        }
+    }
     Ok(())
 }
 

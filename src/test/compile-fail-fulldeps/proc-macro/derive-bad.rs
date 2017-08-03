@@ -10,16 +10,13 @@
 
 // aux-build:derive-bad.rs
 
-#![feature(proc_macro)]
-
 #[macro_use]
 extern crate derive_bad;
 
 #[derive(
     A
 )]
-//~^^ ERROR: custom derive attribute panicked
-//~| HELP: called `Result::unwrap()` on an `Err` value: LexError
+//~^^ ERROR: proc-macro derive produced unparseable tokens
 struct A;
 
 fn main() {}

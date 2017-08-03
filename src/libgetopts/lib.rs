@@ -78,9 +78,6 @@
 //! ```
 
 #![crate_name = "getopts"]
-#![unstable(feature = "rustc_private",
-            reason = "use the crates.io `getopts` library instead",
-            issue = "27812")]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -90,7 +87,7 @@
        test(attr(deny(warnings))))]
 
 #![deny(missing_docs)]
-#![feature(staged_api)]
+#![deny(warnings)]
 
 use self::Name::*;
 use self::HasArg::*;
@@ -968,7 +965,6 @@ fn test_split_within() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::Fail::*;
 
     use std::result::Result::{Err, Ok};
     use std::result;

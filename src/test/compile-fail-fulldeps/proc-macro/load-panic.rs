@@ -10,13 +10,11 @@
 
 // aux-build:derive-panic.rs
 
-#![feature(proc_macro)]
-
 #[macro_use]
 extern crate derive_panic;
 
 #[derive(A)]
-//~^ ERROR: custom derive attribute panicked
+//~^ ERROR: proc-macro derive panicked
 //~| HELP: message: nope!
 struct Foo;
 

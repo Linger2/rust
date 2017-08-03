@@ -24,6 +24,11 @@
 /// The multi-argument form of this macro panics with a string and has the
 /// `format!` syntax for building a string.
 ///
+/// # Current implementation
+///
+/// If the main thread panics it will terminate all your threads and end your
+/// program with code `101`.
+///
 /// # Examples
 ///
 /// ```should_panic
@@ -43,8 +48,8 @@ macro_rules! panic {
     ($msg:expr) => ({
         $crate::rt::begin_panic($msg, {
             // static requires less code at runtime, more constant data
-            static _FILE_LINE: (&'static str, u32) = (file!(), line!());
-            &_FILE_LINE
+            static _FILE_LINE_COL: (&'static str, u32, u32) = (file!(), line!(), column!());
+            &_FILE_LINE_COL
         })
     });
     ($fmt:expr, $($arg:tt)+) => ({
@@ -53,8 +58,8 @@ macro_rules! panic {
             // used inside a dead function. Just `#[allow(dead_code)]` is
             // insufficient, since the user may have
             // `#[forbid(dead_code)]` and which cannot be overridden.
-            static _FILE_LINE: (&'static str, u32) = (file!(), line!());
-            &_FILE_LINE
+            static _FILE_LINE_COL: (&'static str, u32, u32) = (file!(), line!(), column!());
+            &_FILE_LINE_COL
         })
     });
 }
@@ -67,6 +72,9 @@ macro_rules! panic {
 /// Note that stdout is frequently line-buffered by default so it may be
 /// necessary to use `io::stdout().flush()` to ensure the output is emitted
 /// immediately.
+///
+/// Use `print!` only for the primary output of your program.  Use
+/// `eprint!` instead to print error and progress messages.
 ///
 /// # Panics
 ///
@@ -105,14 +113,17 @@ macro_rules! print {
 /// Use the `format!` syntax to write data to the standard output.
 /// See `std::fmt` for more information.
 ///
+/// Use `println!` only for the primary output of your program.  Use
+/// `eprintln!` instead to print error and progress messages.
+///
 /// # Panics
 ///
-/// Panics if writing to `io::stdout()` fails.
+/// Panics if writing to `io::stdout` fails.
 ///
 /// # Examples
 ///
 /// ```
-/// println!();
+/// println!(); // prints just a newline
 /// println!("hello there!");
 /// println!("format {} arguments", "some");
 /// ```
@@ -122,6 +133,45 @@ macro_rules! println {
     () => (print!("\n"));
     ($fmt:expr) => (print!(concat!($fmt, "\n")));
     ($fmt:expr, $($arg:tt)*) => (print!(concat!($fmt, "\n"), $($arg)*));
+}
+
+/// Macro for printing to the standard error.
+///
+/// Equivalent to the `print!` macro, except that output goes to
+/// `io::stderr` instead of `io::stdout`.  See `print!` for
+/// example usage.
+///
+/// Use `eprint!` only for error and progress messages.  Use `print!`
+/// instead for the primary output of your program.
+///
+/// # Panics
+///
+/// Panics if writing to `io::stderr` fails.
+#[macro_export]
+#[stable(feature = "eprint", since = "1.19.0")]
+#[allow_internal_unstable]
+macro_rules! eprint {
+    ($($arg:tt)*) => ($crate::io::_eprint(format_args!($($arg)*)));
+}
+
+/// Macro for printing to the standard error, with a newline.
+///
+/// Equivalent to the `println!` macro, except that output goes to
+/// `io::stderr` instead of `io::stdout`.  See `println!` for
+/// example usage.
+///
+/// Use `eprintln!` only for error and progress messages.  Use `println!`
+/// instead for the primary output of your program.
+///
+/// # Panics
+///
+/// Panics if writing to `io::stderr` fails.
+#[macro_export]
+#[stable(feature = "eprint", since = "1.19.0")]
+macro_rules! eprintln {
+    () => (eprint!("\n"));
+    ($fmt:expr) => (eprint!(concat!($fmt, "\n")));
+    ($fmt:expr, $($arg:tt)*) => (eprint!(concat!($fmt, "\n"), $($arg)*));
 }
 
 /// A macro to select an event from a number of receivers.
@@ -193,6 +243,16 @@ macro_rules! assert_approx_eq {
 /// into libsyntax itself.
 #[cfg(dox)]
 pub mod builtin {
+
+    /// Unconditionally causes compilation to fail with the given error message when encountered.
+    ///
+    /// For more information, see the [RFC].
+    ///
+    /// [RFC]: https://github.com/rust-lang/rfcs/blob/master/text/1695-add-error-macro.md
+    #[stable(feature = "compile_error_macro", since = "1.20.0")]
+    #[macro_export]
+    macro_rules! compile_error { ($msg:expr) => ({ /* compiler built-in */ }) }
+
     /// The core macro for formatted string creation & output.
     ///
     /// This macro produces a value of type [`fmt::Arguments`]. This value can be
@@ -389,7 +449,7 @@ pub mod builtin {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```ignore (cannot-doctest-external-file-dependency)
     /// let secret_key = include_str!("secret-key.ascii");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -406,7 +466,7 @@ pub mod builtin {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```ignore (cannot-doctest-external-file-dependency)
     /// let secret_key = include_bytes!("secret-key.bin");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -441,7 +501,7 @@ pub mod builtin {
     /// leads to less duplicated code.
     ///
     /// The syntax given to this macro is the same syntax as [the `cfg`
-    /// attribute](../reference.html#conditional-compilation).
+    /// attribute](../book/first-edition/conditional-compilation.html).
     ///
     /// # Examples
     ///
@@ -458,23 +518,38 @@ pub mod builtin {
 
     /// Parse a file as an expression or an item according to the context.
     ///
-    /// The file is located relative to the current file. (similarly to how
-    /// modules are found)
+    /// The file is located relative to the current file (similarly to how
+    /// modules are found).
     ///
     /// Using this macro is often a bad idea, because if the file is
     /// parsed as an expression, it is going to be placed in the
-    /// surrounding code unhygenically. This could result in variables
+    /// surrounding code unhygienically. This could result in variables
     /// or functions being different from what the file expected if
     /// there are variables or functions that have the same name in
     /// the current file.
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// fn foo() {
-    ///     include!("/path/to/a/file")
+    /// Assume there are two files in the same directory with the following
+    /// contents:
+    ///
+    /// File 'my_str.in':
+    ///
+    /// ```ignore (only-for-syntax-highlight)
+    /// "Hello World!"
+    /// ```
+    ///
+    /// File 'main.rs':
+    ///
+    /// ```ignore (cannot-doctest-external-file-dependency)
+    /// fn main() {
+    ///     let my_str = include!("my_str.in");
+    ///     println!("{}", my_str);
     /// }
     /// ```
+    ///
+    /// Compiling 'main.rs' and running the resulting binary will print "Hello
+    /// World!".
     #[stable(feature = "rust1", since = "1.0.0")]
     #[macro_export]
     macro_rules! include { ($file:expr) => ({ /* compiler built-in */ }) }

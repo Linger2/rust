@@ -27,33 +27,24 @@
 //! at the end of compilation would be different from those computed
 //! at the beginning.
 
-use syntax::ast;
 use std::cell::RefCell;
 use std::hash::Hash;
-use rustc::dep_graph::DepNode;
+use rustc::dep_graph::{DepNode, DepKind};
 use rustc::hir;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, DefId};
-use rustc::hir::intravisit as visit;
-use rustc::hir::intravisit::{Visitor, NestedVisitorMap};
+use rustc::hir::map::DefPathHash;
+use rustc::hir::itemlikevisit::ItemLikeVisitor;
+use rustc::ich::{Fingerprint, StableHashingContext};
 use rustc::ty::TyCtxt;
-use rustc_data_structures::fx::FxHashMap;
 use rustc::util::common::record_time;
-use rustc::session::config::DebugInfoLevel::NoDebugInfo;
+use rustc_data_structures::stable_hasher::{StableHasher, HashStable};
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::accumulate_vec::AccumulateVec;
 
-use self::def_path_hash::DefPathHashes;
-use self::svh_visitor::StrictVersionHashVisitor;
-use self::caching_codemap_view::CachingCodemapView;
-use self::hasher::IchHasher;
-use ich::Fingerprint;
-
-
-mod def_path_hash;
-mod svh_visitor;
-mod caching_codemap_view;
-pub mod hasher;
+pub type IchHasher = StableHasher<Fingerprint>;
 
 pub struct IncrementalHashesMap {
-    hashes: FxHashMap<DepNode<DefId>, Fingerprint>,
+    hashes: FxHashMap<DepNode, Fingerprint>,
 
     // These are the metadata hashes for the current crate as they were stored
     // during the last compilation session. They are only loaded if
@@ -71,12 +62,16 @@ impl IncrementalHashesMap {
         }
     }
 
-    pub fn insert(&mut self, k: DepNode<DefId>, v: Fingerprint) -> Option<Fingerprint> {
-        self.hashes.insert(k, v)
+    pub fn get(&self, k: &DepNode) -> Option<&Fingerprint> {
+        self.hashes.get(k)
+    }
+
+    pub fn insert(&mut self, k: DepNode, v: Fingerprint) {
+        assert!(self.hashes.insert(k, v).is_none());
     }
 
     pub fn iter<'a>(&'a self)
-                    -> ::std::collections::hash_map::Iter<'a, DepNode<DefId>, Fingerprint> {
+                    -> ::std::collections::hash_map::Iter<'a, DepNode, Fingerprint> {
         self.hashes.iter()
     }
 
@@ -85,10 +80,10 @@ impl IncrementalHashesMap {
     }
 }
 
-impl<'a> ::std::ops::Index<&'a DepNode<DefId>> for IncrementalHashesMap {
+impl<'a> ::std::ops::Index<&'a DepNode> for IncrementalHashesMap {
     type Output = Fingerprint;
 
-    fn index(&self, index: &'a DepNode<DefId>) -> &Fingerprint {
+    fn index(&self, index: &'a DepNode) -> &Fingerprint {
         match self.hashes.get(index) {
             Some(fingerprint) => fingerprint,
             None => {
@@ -98,91 +93,49 @@ impl<'a> ::std::ops::Index<&'a DepNode<DefId>> for IncrementalHashesMap {
     }
 }
 
-
-pub fn compute_incremental_hashes_map<'a, 'tcx: 'a>(tcx: TyCtxt<'a, 'tcx, 'tcx>)
-                                                    -> IncrementalHashesMap {
-    let _ignore = tcx.dep_graph.in_ignore();
-    let krate = tcx.map.krate();
-    let hash_spans = tcx.sess.opts.debuginfo != NoDebugInfo;
-    let mut visitor = HashItemsVisitor {
-        tcx: tcx,
-        hashes: IncrementalHashesMap::new(),
-        def_path_hashes: DefPathHashes::new(tcx),
-        codemap: CachingCodemapView::new(tcx),
-        hash_spans: hash_spans,
-    };
-    record_time(&tcx.sess.perf_stats.incr_comp_hashes_time, || {
-        visitor.calculate_def_id(DefId::local(CRATE_DEF_INDEX), |v| {
-            v.hash_crate_root_module(krate);
-        });
-        krate.visit_all_item_likes(&mut visitor.as_deep_visitor());
-
-        for macro_def in krate.exported_macros.iter() {
-            visitor.calculate_node_id(macro_def.id,
-                                      |v| v.visit_macro_def(macro_def));
-        }
-    });
-
-    tcx.sess.perf_stats.incr_comp_hashes_count.set(visitor.hashes.len() as u64);
-
-    record_time(&tcx.sess.perf_stats.svh_time, || visitor.compute_crate_hash());
-    visitor.hashes
-}
-
-struct HashItemsVisitor<'a, 'tcx: 'a> {
-    tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    def_path_hashes: DefPathHashes<'a, 'tcx>,
-    codemap: CachingCodemapView<'tcx>,
+struct ComputeItemHashesVisitor<'a, 'tcx: 'a> {
+    hcx: StableHashingContext<'a, 'tcx, 'tcx>,
     hashes: IncrementalHashesMap,
-    hash_spans: bool,
 }
 
-impl<'a, 'tcx> HashItemsVisitor<'a, 'tcx> {
-    fn calculate_node_id<W>(&mut self, id: ast::NodeId, walk_op: W)
-        where W: for<'v> FnMut(&mut StrictVersionHashVisitor<'v, 'a, 'tcx>)
+impl<'a, 'tcx: 'a> ComputeItemHashesVisitor<'a, 'tcx> {
+    fn compute_and_store_ich_for_item_like<T>(&mut self,
+                                              dep_node: DepNode,
+                                              hash_bodies: bool,
+                                              item_like: T)
+        where T: HashStable<StableHashingContext<'a, 'tcx, 'tcx>>
     {
-        let def_id = self.tcx.map.local_def_id(id);
-        self.calculate_def_id(def_id, walk_op)
-    }
+        if !hash_bodies && !self.hcx.tcx().sess.opts.build_dep_graph() {
+            // If we just need the hashes in order to compute the SVH, we don't
+            // need have two hashes per item. Just the one containing also the
+            // item's body is sufficient.
+            return
+        }
 
-    fn calculate_def_id<W>(&mut self, def_id: DefId, mut walk_op: W)
-        where W: for<'v> FnMut(&mut StrictVersionHashVisitor<'v, 'a, 'tcx>)
-    {
-        assert!(def_id.is_local());
-        debug!("HashItemsVisitor::calculate(def_id={:?})", def_id);
-        self.calculate_def_hash(DepNode::Hir(def_id), false, &mut walk_op);
-        self.calculate_def_hash(DepNode::HirBody(def_id), true, &mut walk_op);
-    }
+        let mut hasher = IchHasher::new();
+        self.hcx.while_hashing_hir_bodies(hash_bodies, |hcx| {
+            item_like.hash_stable(hcx, &mut hasher);
+        });
 
-    fn calculate_def_hash<W>(&mut self,
-                             dep_node: DepNode<DefId>,
-                             hash_bodies: bool,
-                             walk_op: &mut W)
-        where W: for<'v> FnMut(&mut StrictVersionHashVisitor<'v, 'a, 'tcx>)
-    {
-        let mut state = IchHasher::new();
-        walk_op(&mut StrictVersionHashVisitor::new(&mut state,
-                                                   self.tcx,
-                                                   &mut self.def_path_hashes,
-                                                   &mut self.codemap,
-                                                   self.hash_spans,
-                                                   hash_bodies));
-        let bytes_hashed = state.bytes_hashed();
-        let item_hash = state.finish();
+        let bytes_hashed = hasher.bytes_hashed();
+        let item_hash = hasher.finish();
         debug!("calculate_def_hash: dep_node={:?} hash={:?}", dep_node, item_hash);
         self.hashes.insert(dep_node, item_hash);
 
-        let bytes_hashed = self.tcx.sess.perf_stats.incr_comp_bytes_hashed.get() +
+        let tcx = self.hcx.tcx();
+        let bytes_hashed =
+            tcx.sess.perf_stats.incr_comp_bytes_hashed.get() +
             bytes_hashed;
-        self.tcx.sess.perf_stats.incr_comp_bytes_hashed.set(bytes_hashed);
+        tcx.sess.perf_stats.incr_comp_bytes_hashed.set(bytes_hashed);
     }
 
     fn compute_crate_hash(&mut self) {
-        let krate = self.tcx.map.krate();
+        let tcx = self.hcx.tcx();
+        let krate = tcx.hir.krate();
 
         let mut crate_state = IchHasher::new();
 
-        let crate_disambiguator = self.tcx.sess.local_crate_disambiguator();
+        let crate_disambiguator = tcx.sess.local_crate_disambiguator();
         "crate_disambiguator".hash(&mut crate_state);
         crate_disambiguator.as_str().len().hash(&mut crate_state);
         crate_disambiguator.as_str().hash(&mut crate_state);
@@ -190,58 +143,183 @@ impl<'a, 'tcx> HashItemsVisitor<'a, 'tcx> {
         // add each item (in some deterministic order) to the overall
         // crate hash.
         {
-            let def_path_hashes = &mut self.def_path_hashes;
             let mut item_hashes: Vec<_> =
                 self.hashes.iter()
-                           .map(|(item_dep_node, &item_hash)| {
-                               // convert from a DepNode<DefId> tp a
-                               // DepNode<u64> where the u64 is the
-                               // hash of the def-id's def-path:
-                               let item_dep_node =
-                                   item_dep_node.map_def(|&did| Some(def_path_hashes.hash(did)))
-                                                .unwrap();
-                               (item_dep_node, item_hash)
+                           .filter_map(|(&item_dep_node, &item_hash)| {
+                                // This `match` determines what kinds of nodes
+                                // go into the SVH:
+                                match item_dep_node.kind {
+                                    DepKind::Hir |
+                                    DepKind::HirBody => {
+                                        // We want to incoporate these into the
+                                        // SVH.
+                                    }
+                                    DepKind::AllLocalTraitImpls => {
+                                        // These are already covered by hashing
+                                        // the HIR.
+                                        return None
+                                    }
+                                    ref other => {
+                                        bug!("Found unexpected DepKind during \
+                                              SVH computation: {:?}",
+                                             other)
+                                    }
+                                }
+
+                                Some((item_dep_node, item_hash))
                            })
                            .collect();
-            item_hashes.sort(); // avoid artificial dependencies on item ordering
+            item_hashes.sort_unstable(); // avoid artificial dependencies on item ordering
             item_hashes.hash(&mut crate_state);
         }
 
-        {
-            let mut visitor = StrictVersionHashVisitor::new(&mut crate_state,
-                                                            self.tcx,
-                                                            &mut self.def_path_hashes,
-                                                            &mut self.codemap,
-                                                            self.hash_spans,
-                                                            false);
-            visitor.hash_attributes(&krate.attrs);
-        }
+        krate.attrs.hash_stable(&mut self.hcx, &mut crate_state);
 
         let crate_hash = crate_state.finish();
-        self.hashes.insert(DepNode::Krate, crate_hash);
+        self.hashes.insert(DepNode::new_no_params(DepKind::Krate), crate_hash);
         debug!("calculate_crate_hash: crate_hash={:?}", crate_hash);
     }
-}
 
+    fn hash_crate_root_module(&mut self, krate: &'tcx hir::Crate) {
+        let hir::Crate {
+            ref module,
+            // Crate attributes are not copied over to the root `Mod`, so hash
+            // them explicitly here.
+            ref attrs,
+            span,
 
-impl<'a, 'tcx> Visitor<'tcx> for HashItemsVisitor<'a, 'tcx> {
-    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
-        NestedVisitorMap::None
+            // These fields are handled separately:
+            exported_macros: _,
+            items: _,
+            trait_items: _,
+            impl_items: _,
+            bodies: _,
+            trait_impls: _,
+            trait_default_impl: _,
+            body_ids: _,
+        } = *krate;
+
+        let def_path_hash = self.hcx.tcx().hir.definitions().def_path_hash(CRATE_DEF_INDEX);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::Hir),
+                                                 false,
+                                                 (module, (span, attrs)));
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::HirBody),
+                                                 true,
+                                                 (module, (span, attrs)));
     }
 
+    fn compute_and_store_ich_for_trait_impls(&mut self, krate: &'tcx hir::Crate)
+    {
+        let tcx = self.hcx.tcx();
+
+        let mut impls: Vec<(DefPathHash, Fingerprint)> = krate
+            .trait_impls
+            .iter()
+            .map(|(&trait_id, impls)| {
+                let trait_id = tcx.def_path_hash(trait_id);
+                let mut impls: AccumulateVec<[_; 32]> = impls
+                    .iter()
+                    .map(|&node_id| {
+                        let def_id = tcx.hir.local_def_id(node_id);
+                        tcx.def_path_hash(def_id)
+                    })
+                    .collect();
+
+                impls.sort_unstable();
+                let mut hasher = StableHasher::new();
+                impls.hash_stable(&mut self.hcx, &mut hasher);
+                (trait_id, hasher.finish())
+            })
+            .collect();
+
+        impls.sort_unstable();
+
+        let mut default_impls: AccumulateVec<[_; 32]> = krate
+            .trait_default_impl
+            .iter()
+            .map(|(&trait_def_id, &impl_node_id)| {
+                let impl_def_id = tcx.hir.local_def_id(impl_node_id);
+                (tcx.def_path_hash(trait_def_id), tcx.def_path_hash(impl_def_id))
+            })
+            .collect();
+
+        default_impls.sort_unstable();
+
+        let mut hasher = StableHasher::new();
+        impls.hash_stable(&mut self.hcx, &mut hasher);
+
+        self.hashes.insert(DepNode::new_no_params(DepKind::AllLocalTraitImpls),
+                           hasher.finish());
+    }
+}
+
+impl<'a, 'tcx: 'a> ItemLikeVisitor<'tcx> for ComputeItemHashesVisitor<'a, 'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item) {
-        self.calculate_node_id(item.id, |v| v.visit_item(item));
-        visit::walk_item(self, item);
+        let def_id = self.hcx.tcx().hir.local_def_id(item.id);
+        let def_path_hash = self.hcx.tcx().def_path_hash(def_id);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::Hir),
+                                                 false,
+                                                 item);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::HirBody),
+                                                 true,
+                                                 item);
     }
 
-    fn visit_impl_item(&mut self, impl_item: &'tcx hir::ImplItem) {
-        self.calculate_node_id(impl_item.id, |v| v.visit_impl_item(impl_item));
-        visit::walk_impl_item(self, impl_item);
+    fn visit_trait_item(&mut self, item: &'tcx hir::TraitItem) {
+        let def_id = self.hcx.tcx().hir.local_def_id(item.id);
+        let def_path_hash = self.hcx.tcx().def_path_hash(def_id);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::Hir),
+                                                 false,
+                                                 item);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::HirBody),
+                                                 true,
+                                                 item);
     }
 
-    fn visit_foreign_item(&mut self, item: &'tcx hir::ForeignItem) {
-        self.calculate_node_id(item.id, |v| v.visit_foreign_item(item));
-        visit::walk_foreign_item(self, item);
+    fn visit_impl_item(&mut self, item: &'tcx hir::ImplItem) {
+        let def_id = self.hcx.tcx().hir.local_def_id(item.id);
+        let def_path_hash = self.hcx.tcx().def_path_hash(def_id);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::Hir),
+                                                 false,
+                                                 item);
+        self.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::HirBody),
+                                                 true,
+                                                 item);
     }
 }
 
+
+
+pub fn compute_incremental_hashes_map<'a, 'tcx: 'a>(tcx: TyCtxt<'a, 'tcx, 'tcx>)
+                                                    -> IncrementalHashesMap {
+    let _ignore = tcx.dep_graph.in_ignore();
+    let krate = tcx.hir.krate();
+
+    let mut visitor = ComputeItemHashesVisitor {
+        hcx: StableHashingContext::new(tcx),
+        hashes: IncrementalHashesMap::new(),
+    };
+
+    record_time(&tcx.sess.perf_stats.incr_comp_hashes_time, || {
+        visitor.hash_crate_root_module(krate);
+        krate.visit_all_item_likes(&mut visitor);
+
+        for macro_def in krate.exported_macros.iter() {
+            let def_id = tcx.hir.local_def_id(macro_def.id);
+            let def_path_hash = tcx.def_path_hash(def_id);
+            visitor.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::Hir),
+                                                        false,
+                                                        macro_def);
+            visitor.compute_and_store_ich_for_item_like(def_path_hash.to_dep_node(DepKind::HirBody),
+                                                        true,
+                                                        macro_def);
+        }
+
+        visitor.compute_and_store_ich_for_trait_impls(krate);
+    });
+
+    tcx.sess.perf_stats.incr_comp_hashes_count.set(visitor.hashes.len() as u64);
+
+    record_time(&tcx.sess.perf_stats.svh_time, || visitor.compute_crate_hash());
+    visitor.hashes
+}

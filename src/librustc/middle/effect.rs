@@ -12,9 +12,7 @@
 //! `unsafe`.
 use self::RootUnsafeContext::*;
 
-use dep_graph::DepNode;
-use ty::{self, Ty, TyCtxt};
-use ty::MethodCall;
+use ty::{self, TyCtxt};
 use lint;
 
 use syntax::ast;
@@ -42,16 +40,10 @@ enum RootUnsafeContext {
     UnsafeBlock(ast::NodeId),
 }
 
-fn type_is_unsafe_function(ty: Ty) -> bool {
-    match ty.sty {
-        ty::TyFnDef(.., ref f) |
-        ty::TyFnPtr(ref f) => f.unsafety == hir::Unsafety::Unsafe,
-        _ => false,
-    }
-}
-
 struct EffectCheckVisitor<'a, 'tcx: 'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    tables: &'a ty::TypeckTables<'tcx>,
+    body_id: hir::BodyId,
 
     /// Whether we're in an unsafe context.
     unsafe_context: UnsafeContext,
@@ -74,7 +66,7 @@ impl<'a, 'tcx> EffectCheckVisitor<'a, 'tcx> {
                     struct_span_err!(
                         self.tcx.sess, span, E0133,
                         "{} requires unsafe function or block", description)
-                        .span_label(span, &description)
+                        .span_label(span, description)
                         .emit();
                 }
             }
@@ -94,11 +86,22 @@ impl<'a, 'tcx> EffectCheckVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> Visitor<'tcx> for EffectCheckVisitor<'a, 'tcx> {
     fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
-        NestedVisitorMap::OnlyBodies(&self.tcx.map)
+        NestedVisitorMap::None
+    }
+
+    fn visit_nested_body(&mut self, body: hir::BodyId) {
+        let old_tables = self.tables;
+        let old_body_id = self.body_id;
+        self.tables = self.tcx.body_tables(body);
+        self.body_id = body;
+        let body = self.tcx.hir.body(body);
+        self.visit_body(body);
+        self.tables = old_tables;
+        self.body_id = old_body_id;
     }
 
     fn visit_fn(&mut self, fn_kind: FnKind<'tcx>, fn_decl: &'tcx hir::FnDecl,
-                body_id: hir::ExprId, span: Span, id: ast::NodeId) {
+                body_id: hir::BodyId, span: Span, id: ast::NodeId) {
 
         let (is_item_fn, is_unsafe_fn) = match fn_kind {
             FnKind::ItemFn(_, _, unsafety, ..) =>
@@ -162,25 +165,31 @@ impl<'a, 'tcx> Visitor<'tcx> for EffectCheckVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr) {
         match expr.node {
             hir::ExprMethodCall(..) => {
-                let method_call = MethodCall::expr(expr.id);
-                let base_type = self.tcx.tables().method_map[&method_call].ty;
-                debug!("effect: method call case, base type is {:?}",
-                        base_type);
-                if type_is_unsafe_function(base_type) {
+                let def_id = self.tables.type_dependent_defs[&expr.id].def_id();
+                let sig = self.tcx.fn_sig(def_id);
+                debug!("effect: method call case, signature is {:?}",
+                        sig);
+
+                if sig.0.unsafety == hir::Unsafety::Unsafe {
                     self.require_unsafe(expr.span,
                                         "invocation of unsafe method")
                 }
             }
             hir::ExprCall(ref base, _) => {
-                let base_type = self.tcx.tables().expr_ty_adjusted(base);
+                let base_type = self.tables.expr_ty_adjusted(base);
                 debug!("effect: call case, base type is {:?}",
                         base_type);
-                if type_is_unsafe_function(base_type) {
-                    self.require_unsafe(expr.span, "call to unsafe function")
+                match base_type.sty {
+                    ty::TyFnDef(..) | ty::TyFnPtr(_) => {
+                        if base_type.fn_sig(self.tcx).unsafety() == hir::Unsafety::Unsafe {
+                            self.require_unsafe(expr.span, "call to unsafe function")
+                        }
+                    }
+                    _ => {}
                 }
             }
             hir::ExprUnary(hir::UnDeref, ref base) => {
-                let base_type = self.tcx.tables().expr_ty_adjusted(base);
+                let base_type = self.tables.expr_ty_adjusted(base);
                 debug!("effect: unary case, base type is {:?}",
                         base_type);
                 if let ty::TyRawPtr(_) = base_type.sty {
@@ -194,19 +203,38 @@ impl<'a, 'tcx> Visitor<'tcx> for EffectCheckVisitor<'a, 'tcx> {
                 if let Def::Static(def_id, mutbl) = path.def {
                     if mutbl {
                         self.require_unsafe(expr.span, "use of mutable static");
-                    } else if match self.tcx.map.get_if_local(def_id) {
+                    } else if match self.tcx.hir.get_if_local(def_id) {
                         Some(hir::map::NodeForeignItem(..)) => true,
                         Some(..) => false,
-                        None => self.tcx.sess.cstore.is_foreign_item(def_id),
+                        None => self.tcx.is_foreign_item(def_id),
                     } {
                         self.require_unsafe_ext(expr.id, expr.span, "use of extern static", true);
                     }
                 }
             }
             hir::ExprField(ref base_expr, field) => {
-                if let ty::TyAdt(adt, ..) = self.tcx.tables().expr_ty_adjusted(base_expr).sty {
+                if let ty::TyAdt(adt, ..) = self.tables.expr_ty_adjusted(base_expr).sty {
                     if adt.is_union() {
                         self.require_unsafe(field.span, "access to union field");
+                    }
+                }
+            }
+            hir::ExprAssign(ref lhs, ref rhs) => {
+                if let hir::ExprField(ref base_expr, field) = lhs.node {
+                    if let ty::TyAdt(adt, ..) = self.tables.expr_ty_adjusted(base_expr).sty {
+                        if adt.is_union() {
+                            let field_ty = self.tables.expr_ty_adjusted(lhs);
+                            let owner_def_id = self.tcx.hir.body_owner_def_id(self.body_id);
+                            let param_env = self.tcx.param_env(owner_def_id);
+                            if field_ty.moves_by_default(self.tcx, param_env, field.span) {
+                                self.require_unsafe(field.span,
+                                                    "assignment to non-`Copy` union field");
+                            }
+                            // Do not walk the field expr again.
+                            intravisit::walk_expr(self, base_expr);
+                            intravisit::walk_expr(self, rhs);
+                            return
+                        }
                     }
                 }
             }
@@ -218,7 +246,7 @@ impl<'a, 'tcx> Visitor<'tcx> for EffectCheckVisitor<'a, 'tcx> {
 
     fn visit_pat(&mut self, pat: &'tcx hir::Pat) {
         if let PatKind::Struct(_, ref fields, _) = pat.node {
-            if let ty::TyAdt(adt, ..) = self.tcx.tables().pat_ty(pat).sty {
+            if let ty::TyAdt(adt, ..) = self.tables.pat_ty(pat).sty {
                 if adt.is_union() {
                     for field in fields {
                         self.require_unsafe(field.span, "matching on union field");
@@ -232,12 +260,12 @@ impl<'a, 'tcx> Visitor<'tcx> for EffectCheckVisitor<'a, 'tcx> {
 }
 
 pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let _task = tcx.dep_graph.in_task(DepNode::EffectCheck);
-
     let mut visitor = EffectCheckVisitor {
-        tcx: tcx,
+        tcx,
+        tables: &ty::TypeckTables::empty(),
+        body_id: hir::BodyId { node_id: ast::CRATE_NODE_ID },
         unsafe_context: UnsafeContext::new(SafeContext),
     };
 
-    tcx.map.krate().visit_all_item_likes(&mut visitor.as_deep_visitor());
+    tcx.hir.krate().visit_all_item_likes(&mut visitor.as_deep_visitor());
 }

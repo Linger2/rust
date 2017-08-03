@@ -435,8 +435,8 @@ fn copy_files(target_dir: &Path,
     }
 
     if print_stats_on_success {
-        println!("incremental: session directory: {} files hard-linked", files_linked);
-        println!("incremental: session directory: {} files copied", files_copied);
+        eprintln!("incremental: session directory: {} files hard-linked", files_linked);
+        eprintln!("incremental: session directory: {} files copied", files_copied);
     }
 
     Ok(files_linked > 0 || files_copied == 0)
@@ -461,7 +461,7 @@ fn generate_session_dir_path(crate_dir: &Path) -> PathBuf {
 }
 
 fn create_dir(sess: &Session, path: &Path, dir_tag: &str) -> Result<(),()> {
-    match fs_util::create_dir_racy(path) {
+    match std_fs::create_dir_all(path) {
         Ok(()) => {
             debug!("{} directory created successfully", dir_tag);
             Ok(())

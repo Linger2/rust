@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use LinkerFlavor;
 use target::{Target, TargetOptions, TargetResult};
 
 pub fn target() -> TargetResult {
@@ -21,9 +22,10 @@ pub fn target() -> TargetResult {
         target_os: "linux".to_string(),
         target_env: "gnu".to_string(),
         target_vendor: "unknown".to_string(),
+        linker_flavor: LinkerFlavor::Gcc,
 
         options: TargetOptions {
-            features: "+soft-float".to_string(),
+            features: "+soft-float,+strict-align".to_string(),
             // No atomic instructions on ARMv5
             max_atomic_width: Some(0),
             abi_blacklist: super::arm_base::abi_blacklist(),
@@ -31,4 +33,3 @@ pub fn target() -> TargetResult {
         }
     })
 }
-

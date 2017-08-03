@@ -15,9 +15,6 @@ Core encoding and decoding interfaces.
 */
 
 #![crate_name = "serialize"]
-#![unstable(feature = "rustc_private",
-            reason = "deprecated in favor of rustc-serialize on crates.io",
-            issue = "27812")]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -25,24 +22,13 @@ Core encoding and decoding interfaces.
        html_root_url = "https://doc.rust-lang.org/nightly/",
        html_playground_url = "https://play.rust-lang.org/",
        test(attr(allow(unused_variables), deny(warnings))))]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(box_syntax)]
-#![feature(collections)]
 #![feature(core_intrinsics)]
-#![feature(enumset)]
-#![feature(rustc_private)]
+#![feature(i128_type)]
 #![feature(specialization)]
-#![feature(staged_api)]
-#![feature(unicode)]
 #![cfg_attr(test, feature(test))]
-
-// test harness access
-#[cfg(test)] extern crate test;
-#[macro_use] extern crate log;
-
-extern crate std_unicode;
-extern crate collections;
 
 pub use self::serialize::{Decoder, Encoder, Decodable, Encodable};
 

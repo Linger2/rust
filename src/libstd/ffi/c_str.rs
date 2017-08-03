@@ -23,19 +23,19 @@ use ptr;
 use slice;
 use str::{self, Utf8Error};
 
-/// A type representing an owned C-compatible string
+/// A type representing an owned C-compatible string.
 ///
 /// This type serves the primary purpose of being able to safely generate a
 /// C-compatible string from a Rust byte slice or vector. An instance of this
 /// type is a static guarantee that the underlying bytes contain no interior 0
 /// bytes and the final byte is 0.
 ///
-/// A `CString` is created from either a byte slice or a byte vector. After
-/// being created, a `CString` predominately inherits all of its methods from
-/// the `Deref` implementation to `[c_char]`. Note that the underlying array
-/// is represented as an array of `c_char` as opposed to `u8`. A `u8` slice
-/// can be obtained with the `as_bytes` method.  Slices produced from a `CString`
-/// do *not* contain the trailing nul terminator unless otherwise specified.
+/// A `CString` is created from either a byte slice or a byte vector. A [`u8`]
+/// slice can be obtained with the `as_bytes` method. Slices produced from a
+/// `CString` do *not* contain the trailing nul terminator unless otherwise
+/// specified.
+///
+/// [`u8`]: ../primitive.u8.html
 ///
 /// # Examples
 ///
@@ -83,12 +83,14 @@ pub struct CString {
 ///
 /// Note that this structure is **not** `repr(C)` and is not recommended to be
 /// placed in the signatures of FFI functions. Instead safe wrappers of FFI
-/// functions may leverage the unsafe `from_ptr` constructor to provide a safe
+/// functions may leverage the unsafe [`from_ptr`] constructor to provide a safe
 /// interface to other consumers.
+///
+/// [`from_ptr`]: #method.from_ptr
 ///
 /// # Examples
 ///
-/// Inspecting a foreign C string
+/// Inspecting a foreign C string:
 ///
 /// ```no_run
 /// use std::ffi::CStr;
@@ -102,7 +104,7 @@ pub struct CString {
 /// }
 /// ```
 ///
-/// Passing a Rust-originating C string
+/// Passing a Rust-originating C string:
 ///
 /// ```no_run
 /// use std::ffi::{CString, CStr};
@@ -118,7 +120,9 @@ pub struct CString {
 /// work(&s);
 /// ```
 ///
-/// Converting a foreign C string into a Rust `String`
+/// Converting a foreign C string into a Rust [`String`]:
+///
+/// [`String`]: ../string/struct.String.html
 ///
 /// ```no_run
 /// use std::ffi::CStr;
@@ -144,20 +148,63 @@ pub struct CStr {
     inner: [c_char]
 }
 
-/// An error returned from `CString::new` to indicate that a nul byte was found
+/// An error returned from [`CString::new`] to indicate that a nul byte was found
 /// in the vector provided.
+///
+/// [`CString::new`]: struct.CString.html#method.new
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::{CString, NulError};
+///
+/// let _: NulError = CString::new(b"f\0oo".to_vec()).unwrap_err();
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct NulError(usize, Vec<u8>);
 
-/// An error returned from `CStr::from_bytes_with_nul` to indicate that a nul
+/// An error returned from [`CStr::from_bytes_with_nul`] to indicate that a nul
 /// byte was found too early in the slice provided or one wasn't found at all.
+///
+/// [`CStr::from_bytes_with_nul`]: struct.CStr.html#method.from_bytes_with_nul
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::{CStr, FromBytesWithNulError};
+///
+/// let _: FromBytesWithNulError = CStr::from_bytes_with_nul(b"f\0oo").unwrap_err();
+/// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "cstr_from_bytes", since = "1.10.0")]
-pub struct FromBytesWithNulError { _a: () }
+pub struct FromBytesWithNulError {
+    kind: FromBytesWithNulErrorKind,
+}
 
-/// An error returned from `CString::into_string` to indicate that a UTF-8 error
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum FromBytesWithNulErrorKind {
+    InteriorNul(usize),
+    NotNulTerminated,
+}
+
+impl FromBytesWithNulError {
+    fn interior_nul(pos: usize) -> FromBytesWithNulError {
+        FromBytesWithNulError {
+            kind: FromBytesWithNulErrorKind::InteriorNul(pos),
+        }
+    }
+    fn not_nul_terminated() -> FromBytesWithNulError {
+        FromBytesWithNulError {
+            kind: FromBytesWithNulErrorKind::NotNulTerminated,
+        }
+    }
+}
+
+/// An error returned from [`CString::into_string`] to indicate that a UTF-8 error
 /// was encountered during the conversion.
+///
+/// [`CString::into_string`]: struct.CString.html#method.into_string
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "cstring_into", since = "1.7.0")]
 pub struct IntoStringError {
@@ -205,9 +252,11 @@ impl CString {
     /// Creates a C-compatible string from a byte vector without checking for
     /// interior 0 bytes.
     ///
-    /// This method is equivalent to `new` except that no runtime assertion
+    /// This method is equivalent to [`new`] except that no runtime assertion
     /// is made that `v` contains no 0 bytes, and it requires an actual
     /// byte vector, not anything that can be converted to one with Into.
+    ///
+    /// [`new`]: #method.new
     ///
     /// # Examples
     ///
@@ -233,9 +282,32 @@ impl CString {
     /// # Safety
     ///
     /// This should only ever be called with a pointer that was earlier
-    /// obtained by calling `into_raw` on a `CString`. Other usage (e.g. trying to take
+    /// obtained by calling [`into_raw`] on a `CString`. Other usage (e.g. trying to take
     /// ownership of a string that was allocated by foreign code) is likely to lead
     /// to undefined behavior or allocator corruption.
+    ///
+    /// [`into_raw`]: #method.into_raw
+    ///
+    /// # Examples
+    ///
+    /// Create a `CString`, pass ownership to an `extern` function (via raw pointer), then retake
+    /// ownership with `from_raw`:
+    ///
+    /// ```no_run
+    /// use std::ffi::CString;
+    /// use std::os::raw::c_char;
+    ///
+    /// extern {
+    ///     fn some_extern_function(s: *mut c_char);
+    /// }
+    ///
+    /// let c_string = CString::new("Hello!").unwrap();
+    /// let raw = c_string.into_raw();
+    /// unsafe {
+    ///     some_extern_function(raw);
+    ///     let c_string = CString::from_raw(raw);
+    /// }
+    /// ```
     #[stable(feature = "cstr_memory", since = "1.4.0")]
     pub unsafe fn from_raw(ptr: *mut c_char) -> CString {
         let len = libc::strlen(ptr) + 1; // Including the NUL byte
@@ -246,19 +318,44 @@ impl CString {
     /// Transfers ownership of the string to a C caller.
     ///
     /// The pointer must be returned to Rust and reconstituted using
-    /// `from_raw` to be properly deallocated. Specifically, one
+    /// [`from_raw`] to be properly deallocated. Specifically, one
     /// should *not* use the standard C `free` function to deallocate
     /// this string.
     ///
-    /// Failure to call `from_raw` will lead to a memory leak.
+    /// Failure to call [`from_raw`] will lead to a memory leak.
+    ///
+    /// [`from_raw`]: #method.from_raw
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new("foo").unwrap();
+    ///
+    /// let ptr = c_string.into_raw();
+    ///
+    /// unsafe {
+    ///     assert_eq!(b'f', *ptr as u8);
+    ///     assert_eq!(b'o', *ptr.offset(1) as u8);
+    ///     assert_eq!(b'o', *ptr.offset(2) as u8);
+    ///     assert_eq!(b'\0', *ptr.offset(3) as u8);
+    ///
+    ///     // retake pointer to free memory
+    ///     let _ = CString::from_raw(ptr);
+    /// }
+    /// ```
+    #[inline]
     #[stable(feature = "cstr_memory", since = "1.4.0")]
     pub fn into_raw(self) -> *mut c_char {
         Box::into_raw(self.into_inner()) as *mut c_char
     }
 
-    /// Converts the `CString` into a `String` if it contains valid Unicode data.
+    /// Converts the `CString` into a [`String`] if it contains valid Unicode data.
     ///
     /// On failure, ownership of the original `CString` is returned.
+    ///
+    /// [`String`]: ../string/struct.String.html
     #[stable(feature = "cstring_into", since = "1.7.0")]
     pub fn into_string(self) -> Result<String, IntoStringError> {
         String::from_utf8(self.into_bytes())
@@ -272,6 +369,16 @@ impl CString {
     ///
     /// The returned buffer does **not** contain the trailing nul separator and
     /// it is guaranteed to not have any interior nul bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new("foo").unwrap();
+    /// let bytes = c_string.into_bytes();
+    /// assert_eq!(bytes, vec![b'f', b'o', b'o']);
+    /// ```
     #[stable(feature = "cstring_into", since = "1.7.0")]
     pub fn into_bytes(self) -> Vec<u8> {
         let mut vec = self.into_inner().into_vec();
@@ -280,8 +387,20 @@ impl CString {
         vec
     }
 
-    /// Equivalent to the `into_bytes` function except that the returned vector
+    /// Equivalent to the [`into_bytes`] function except that the returned vector
     /// includes the trailing nul byte.
+    ///
+    /// [`into_bytes`]: #method.into_bytes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new("foo").unwrap();
+    /// let bytes = c_string.into_bytes_with_nul();
+    /// assert_eq!(bytes, vec![b'f', b'o', b'o', b'\0']);
+    /// ```
     #[stable(feature = "cstring_into", since = "1.7.0")]
     pub fn into_bytes_with_nul(self) -> Vec<u8> {
         self.into_inner().into_vec()
@@ -291,19 +410,82 @@ impl CString {
     ///
     /// The returned slice does **not** contain the trailing nul separator and
     /// it is guaranteed to not have any interior nul bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new("foo").unwrap();
+    /// let bytes = c_string.as_bytes();
+    /// assert_eq!(bytes, &[b'f', b'o', b'o']);
+    /// ```
+    #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn as_bytes(&self) -> &[u8] {
         &self.inner[..self.inner.len() - 1]
     }
 
-    /// Equivalent to the `as_bytes` function except that the returned slice
+    /// Equivalent to the [`as_bytes`] function except that the returned slice
     /// includes the trailing nul byte.
+    ///
+    /// [`as_bytes`]: #method.as_bytes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new("foo").unwrap();
+    /// let bytes = c_string.as_bytes_with_nul();
+    /// assert_eq!(bytes, &[b'f', b'o', b'o', b'\0']);
+    /// ```
+    #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn as_bytes_with_nul(&self) -> &[u8] {
         &self.inner
     }
 
-    // Bypass "move out of struct which implements `Drop` trait" restriction.
+    /// Extracts a [`CStr`] slice containing the entire string.
+    ///
+    /// [`CStr`]: struct.CStr.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::{CString, CStr};
+    ///
+    /// let c_string = CString::new(b"foo".to_vec()).unwrap();
+    /// let c_str = c_string.as_c_str();
+    /// assert_eq!(c_str, CStr::from_bytes_with_nul(b"foo\0").unwrap());
+    /// ```
+    #[inline]
+    #[stable(feature = "as_c_str", since = "1.20.0")]
+    pub fn as_c_str(&self) -> &CStr {
+        &*self
+    }
+
+    /// Converts this `CString` into a boxed [`CStr`].
+    ///
+    /// [`CStr`]: struct.CStr.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::{CString, CStr};
+    ///
+    /// let c_string = CString::new(b"foo".to_vec()).unwrap();
+    /// let boxed = c_string.into_boxed_c_str();
+    /// assert_eq!(&*boxed, CStr::from_bytes_with_nul(b"foo\0").unwrap());
+    /// ```
+    #[stable(feature = "into_boxed_c_str", since = "1.20.0")]
+    pub fn into_boxed_c_str(self) -> Box<CStr> {
+        unsafe { mem::transmute(self.into_inner()) }
+    }
+
+    // Bypass "move out of struct which implements [`Drop`] trait" restriction.
+    ///
+    /// [`Drop`]: ../ops/trait.Drop.html
     fn into_inner(self) -> Box<[u8]> {
         unsafe {
             let result = ptr::read(&self.inner);
@@ -328,8 +510,9 @@ impl Drop for CString {
 impl ops::Deref for CString {
     type Target = CStr;
 
+    #[inline]
     fn deref(&self) -> &CStr {
-        unsafe { mem::transmute(self.as_bytes_with_nul()) }
+        unsafe { CStr::from_bytes_with_nul_unchecked(self.as_bytes_with_nul()) }
     }
 }
 
@@ -342,6 +525,7 @@ impl fmt::Debug for CString {
 
 #[stable(feature = "cstring_into", since = "1.7.0")]
 impl From<CString> for Vec<u8> {
+    #[inline]
     fn from(s: CString) -> Vec<u8> {
         s.into_bytes()
     }
@@ -377,12 +561,47 @@ impl Default for CString {
 
 #[stable(feature = "cstr_borrow", since = "1.3.0")]
 impl Borrow<CStr> for CString {
+    #[inline]
     fn borrow(&self) -> &CStr { self }
+}
+
+#[stable(feature = "box_from_c_str", since = "1.17.0")]
+impl<'a> From<&'a CStr> for Box<CStr> {
+    fn from(s: &'a CStr) -> Box<CStr> {
+        let boxed: Box<[u8]> = Box::from(s.to_bytes_with_nul());
+        unsafe { mem::transmute(boxed) }
+    }
+}
+
+#[stable(feature = "c_string_from_box", since = "1.18.0")]
+impl From<Box<CStr>> for CString {
+    #[inline]
+    fn from(s: Box<CStr>) -> CString {
+        s.into_c_string()
+    }
+}
+
+#[stable(feature = "box_from_c_string", since = "1.20.0")]
+impl From<CString> for Box<CStr> {
+    #[inline]
+    fn from(s: CString) -> Box<CStr> {
+        s.into_boxed_c_str()
+    }
+}
+
+#[stable(feature = "default_box_extra", since = "1.17.0")]
+impl Default for Box<CStr> {
+    fn default() -> Box<CStr> {
+        let boxed: Box<[u8]> = Box::from([0]);
+        unsafe { mem::transmute(boxed) }
+    }
 }
 
 impl NulError {
     /// Returns the position of the nul byte in the slice that was provided to
-    /// `CString::new`.
+    /// [`CString::new`].
+    ///
+    /// [`CString::new`]: struct.CString.html#method.new
     ///
     /// # Examples
     ///
@@ -433,9 +652,34 @@ impl From<NulError> for io::Error {
     }
 }
 
+#[stable(feature = "frombyteswithnulerror_impls", since = "1.17.0")]
+impl Error for FromBytesWithNulError {
+    fn description(&self) -> &str {
+        match self.kind {
+            FromBytesWithNulErrorKind::InteriorNul(..) =>
+                "data provided contains an interior nul byte",
+            FromBytesWithNulErrorKind::NotNulTerminated =>
+                "data provided is not nul terminated",
+        }
+    }
+}
+
+#[stable(feature = "frombyteswithnulerror_impls", since = "1.17.0")]
+impl fmt::Display for FromBytesWithNulError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(self.description())?;
+        if let FromBytesWithNulErrorKind::InteriorNul(pos) = self.kind {
+            write!(f, " at byte pos {}", pos)?;
+        }
+        Ok(())
+    }
+}
+
 impl IntoStringError {
-    /// Consumes this error, returning original `CString` which generated the
+    /// Consumes this error, returning original [`CString`] which generated the
     /// error.
+    ///
+    /// [`CString`]: struct.CString.html
     #[stable(feature = "cstring_into", since = "1.7.0")]
     pub fn into_cstring(self) -> CString {
         self.inner
@@ -473,9 +717,9 @@ impl CStr {
     /// allows inspection and interoperation of non-owned C strings. This method
     /// is unsafe for a number of reasons:
     ///
-    /// * There is no guarantee to the validity of `ptr`
+    /// * There is no guarantee to the validity of `ptr`.
     /// * The returned lifetime is not guaranteed to be the actual lifetime of
-    ///   `ptr`
+    ///   `ptr`.
     /// * There is no guarantee that the memory pointed to by `ptr` contains a
     ///   valid nul terminator byte at the end of the string.
     ///
@@ -503,7 +747,8 @@ impl CStr {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub unsafe fn from_ptr<'a>(ptr: *const c_char) -> &'a CStr {
         let len = libc::strlen(ptr);
-        mem::transmute(slice::from_raw_parts(ptr, len as usize + 1))
+        let ptr = ptr as *const u8;
+        CStr::from_bytes_with_nul_unchecked(slice::from_raw_parts(ptr, len as usize + 1))
     }
 
     /// Creates a C string wrapper from a byte slice.
@@ -520,13 +765,35 @@ impl CStr {
     /// let cstr = CStr::from_bytes_with_nul(b"hello\0");
     /// assert!(cstr.is_ok());
     /// ```
+    ///
+    /// Creating a `CStr` without a trailing nul byte is an error:
+    ///
+    /// ```
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"hello");
+    /// assert!(c_str.is_err());
+    /// ```
+    ///
+    /// Creating a `CStr` with an interior nul byte is an error:
+    ///
+    /// ```
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"he\0llo\0");
+    /// assert!(c_str.is_err());
+    /// ```
     #[stable(feature = "cstr_from_bytes", since = "1.10.0")]
     pub fn from_bytes_with_nul(bytes: &[u8])
                                -> Result<&CStr, FromBytesWithNulError> {
-        if bytes.is_empty() || memchr::memchr(0, &bytes) != Some(bytes.len() - 1) {
-            Err(FromBytesWithNulError { _a: () })
+        let nul_pos = memchr::memchr(0, bytes);
+        if let Some(nul_pos) = nul_pos {
+            if nul_pos + 1 != bytes.len() {
+                return Err(FromBytesWithNulError::interior_nul(nul_pos));
+            }
+            Ok(unsafe { CStr::from_bytes_with_nul_unchecked(bytes) })
         } else {
-            Ok(unsafe { Self::from_bytes_with_nul_unchecked(bytes) })
+            Err(FromBytesWithNulError::not_nul_terminated())
         }
     }
 
@@ -547,6 +814,7 @@ impl CStr {
     ///     assert_eq!(cstr, &*cstring);
     /// }
     /// ```
+    #[inline]
     #[stable(feature = "cstr_from_bytes", since = "1.10.0")]
     pub unsafe fn from_bytes_with_nul_unchecked(bytes: &[u8]) -> &CStr {
         mem::transmute(bytes)
@@ -589,6 +857,7 @@ impl CStr {
     ///     *ptr;
     /// }
     /// ```
+    #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn as_ptr(&self) -> *const c_char {
         self.inner.as_ptr()
@@ -606,6 +875,16 @@ impl CStr {
     /// > **Note**: This method is currently implemented as a 0-cost cast, but
     /// > it is planned to alter its definition in the future to perform the
     /// > length calculation whenever this method is called.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"foo\0").unwrap();
+    /// assert_eq!(c_str.to_bytes(), b"foo");
+    /// ```
+    #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn to_bytes(&self) -> &[u8] {
         let bytes = self.to_bytes_with_nul();
@@ -614,26 +893,49 @@ impl CStr {
 
     /// Converts this C string to a byte slice containing the trailing 0 byte.
     ///
-    /// This function is the equivalent of `to_bytes` except that it will retain
+    /// This function is the equivalent of [`to_bytes`] except that it will retain
     /// the trailing nul instead of chopping it off.
     ///
     /// > **Note**: This method is currently implemented as a 0-cost cast, but
     /// > it is planned to alter its definition in the future to perform the
     /// > length calculation whenever this method is called.
+    ///
+    /// [`to_bytes`]: #method.to_bytes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"foo\0").unwrap();
+    /// assert_eq!(c_str.to_bytes_with_nul(), b"foo\0");
+    /// ```
+    #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn to_bytes_with_nul(&self) -> &[u8] {
         unsafe { mem::transmute(&self.inner) }
     }
 
-    /// Yields a `&str` slice if the `CStr` contains valid UTF-8.
+    /// Yields a [`&str`] slice if the `CStr` contains valid UTF-8.
     ///
     /// This function will calculate the length of this string and check for
-    /// UTF-8 validity, and then return the `&str` if it's valid.
+    /// UTF-8 validity, and then return the [`&str`] if it's valid.
     ///
     /// > **Note**: This method is currently implemented to check for validity
     /// > after a 0-cost cast, but it is planned to alter its definition in the
     /// > future to perform the length calculation in addition to the UTF-8
     /// > check whenever this method is called.
+    ///
+    /// [`&str`]: ../primitive.str.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"foo\0").unwrap();
+    /// assert_eq!(c_str.to_str(), Ok("foo"));
+    /// ```
     #[stable(feature = "cstr_to_str", since = "1.4.0")]
     pub fn to_str(&self) -> Result<&str, str::Utf8Error> {
         // NB: When CStr is changed to perform the length check in .to_bytes()
@@ -643,20 +945,67 @@ impl CStr {
         str::from_utf8(self.to_bytes())
     }
 
-    /// Converts a `CStr` into a `Cow<str>`.
+    /// Converts a `CStr` into a [`Cow`]`<`[`str`]`>`.
     ///
     /// This function will calculate the length of this string (which normally
     /// requires a linear amount of work to be done) and then return the
-    /// resulting slice as a `Cow<str>`, replacing any invalid UTF-8 sequences
+    /// resulting slice as a [`Cow`]`<`[`str`]`>`, replacing any invalid UTF-8 sequences
     /// with `U+FFFD REPLACEMENT CHARACTER`.
     ///
     /// > **Note**: This method is currently implemented to check for validity
     /// > after a 0-cost cast, but it is planned to alter its definition in the
     /// > future to perform the length calculation in addition to the UTF-8
     /// > check whenever this method is called.
+    ///
+    /// [`Cow`]: ../borrow/enum.Cow.html
+    /// [`str`]: ../primitive.str.html
+    ///
+    /// # Examples
+    ///
+    /// Calling `to_string_lossy` on a `CStr` containing valid UTF-8:
+    ///
+    /// ```
+    /// use std::borrow::Cow;
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"Hello World\0").unwrap();
+    /// assert_eq!(c_str.to_string_lossy(), Cow::Borrowed("Hello World"));
+    /// ```
+    ///
+    /// Calling `to_string_lossy` on a `CStr` containing invalid UTF-8:
+    ///
+    /// ```
+    /// use std::borrow::Cow;
+    /// use std::ffi::CStr;
+    ///
+    /// let c_str = CStr::from_bytes_with_nul(b"Hello \xF0\x90\x80World\0").unwrap();
+    /// assert_eq!(
+    ///     c_str.to_string_lossy(),
+    ///     Cow::Owned(String::from("Hello �World")) as Cow<str>
+    /// );
+    /// ```
     #[stable(feature = "cstr_to_str", since = "1.4.0")]
     pub fn to_string_lossy(&self) -> Cow<str> {
         String::from_utf8_lossy(self.to_bytes())
+    }
+
+    /// Converts a [`Box`]`<CStr>` into a [`CString`] without copying or allocating.
+    ///
+    /// [`Box`]: ../boxed/struct.Box.html
+    /// [`CString`]: struct.CString.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let c_string = CString::new(b"foo".to_vec()).unwrap();
+    /// let boxed = c_string.into_boxed_c_str();
+    /// assert_eq!(boxed.into_c_string(), CString::new("foo").unwrap());
+    /// ```
+    #[stable(feature = "into_boxed_c_str", since = "1.20.0")]
+    pub fn into_c_string(self: Box<CStr>) -> CString {
+        unsafe { mem::transmute(self) }
     }
 }
 
@@ -686,7 +1035,7 @@ impl ToOwned for CStr {
     type Owned = CString;
 
     fn to_owned(&self) -> CString {
-        CString { inner: self.to_bytes_with_nul().to_vec().into_boxed_slice() }
+        CString { inner: self.to_bytes_with_nul().into() }
     }
 }
 
@@ -709,6 +1058,7 @@ impl ops::Index<ops::RangeFull> for CString {
 
 #[stable(feature = "cstring_asref", since = "1.7.0")]
 impl AsRef<CStr> for CStr {
+    #[inline]
     fn as_ref(&self) -> &CStr {
         self
     }
@@ -716,6 +1066,7 @@ impl AsRef<CStr> for CStr {
 
 #[stable(feature = "cstring_asref", since = "1.7.0")]
 impl AsRef<CStr> for CString {
+    #[inline]
     fn as_ref(&self) -> &CStr {
         self
     }
@@ -846,5 +1197,22 @@ mod tests {
         let data = b"1\023\0";
         let cstr = CStr::from_bytes_with_nul(data);
         assert!(cstr.is_err());
+    }
+
+    #[test]
+    fn into_boxed() {
+        let orig: &[u8] = b"Hello, world!\0";
+        let cstr = CStr::from_bytes_with_nul(orig).unwrap();
+        let boxed: Box<CStr> = Box::from(cstr);
+        let cstring = cstr.to_owned().into_boxed_c_str().into_c_string();
+        assert_eq!(cstr, &*boxed);
+        assert_eq!(&*boxed, &*cstring);
+        assert_eq!(&*cstring, cstr);
+    }
+
+    #[test]
+    fn boxed_default() {
+        let boxed = <Box<CStr>>::default();
+        assert_eq!(boxed.to_bytes_with_nul(), &[0]);
     }
 }

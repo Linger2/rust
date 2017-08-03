@@ -138,7 +138,7 @@ impl FlagComputation {
                 self.add_region(r);
             }
 
-            &ty::TyBox(tt) | &ty::TyArray(tt, _) | &ty::TySlice(tt) => {
+            &ty::TyArray(tt, _) | &ty::TySlice(tt) => {
                 self.add_ty(tt)
             }
 
@@ -151,23 +151,22 @@ impl FlagComputation {
                 self.add_ty(m.ty);
             }
 
-            &ty::TyTuple(ref ts) => {
+            &ty::TyTuple(ref ts, _) => {
                 self.add_tys(&ts[..]);
             }
 
-            &ty::TyFnDef(_, substs, ref f) => {
+            &ty::TyFnDef(_, substs) => {
                 self.add_substs(substs);
-                self.add_fn_sig(&f.sig);
             }
 
-            &ty::TyFnPtr(ref f) => {
-                self.add_fn_sig(&f.sig);
+            &ty::TyFnPtr(f) => {
+                self.add_fn_sig(f);
             }
         }
     }
 
     fn add_ty(&mut self, ty: Ty) {
-        self.add_flags(ty.flags.get());
+        self.add_flags(ty.flags);
         self.add_depth(ty.region_depth);
     }
 
@@ -177,7 +176,7 @@ impl FlagComputation {
         }
     }
 
-    fn add_fn_sig(&mut self, fn_sig: &ty::PolyFnSig) {
+    fn add_fn_sig(&mut self, fn_sig: ty::PolyFnSig) {
         let mut computation = FlagComputation::new();
 
         computation.add_tys(fn_sig.skip_binder().inputs());
@@ -186,7 +185,7 @@ impl FlagComputation {
         self.add_bound_computation(&computation);
     }
 
-    fn add_region(&mut self, r: &ty::Region) {
+    fn add_region(&mut self, r: ty::Region) {
         self.add_flags(r.type_flags());
         if let ty::ReLateBound(debruijn, _) = *r {
             self.add_depth(debruijn.depth);
@@ -194,12 +193,12 @@ impl FlagComputation {
     }
 
     fn add_existential_projection(&mut self, projection: &ty::ExistentialProjection) {
-        self.add_substs(projection.trait_ref.substs);
+        self.add_substs(projection.substs);
         self.add_ty(projection.ty);
     }
 
     fn add_projection_ty(&mut self, projection_ty: &ty::ProjectionTy) {
-        self.add_substs(projection_ty.trait_ref.substs);
+        self.add_substs(projection_ty.substs);
     }
 
     fn add_substs(&mut self, substs: &Substs) {

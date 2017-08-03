@@ -32,17 +32,27 @@ use syntax::ast;
 
 use {ModuleSource, ModuleTranslation};
 
-const PARTITION_REUSED: &'static str = "rustc_partition_reused";
-const PARTITION_TRANSLATED: &'static str = "rustc_partition_translated";
+use rustc::ich::{ATTR_PARTITION_REUSED, ATTR_PARTITION_TRANSLATED};
 
 const MODULE: &'static str = "module";
 const CFG: &'static str = "cfg";
 
-#[derive(Debug, PartialEq)]
-enum Disposition { Reused, Translated }
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Disposition { Reused, Translated }
 
-pub fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                       modules: &[ModuleTranslation]) {
+impl ModuleTranslation {
+    pub fn disposition(&self) -> (String, Disposition) {
+        let disposition = match self.source {
+            ModuleSource::Preexisting(_) => Disposition::Reused,
+            ModuleSource::Translated(_) => Disposition::Translated,
+        };
+
+        (self.name.clone(), disposition)
+    }
+}
+
+pub(crate) fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                              modules: &[(String, Disposition)]) {
     let _ignore = tcx.dep_graph.in_ignore();
 
     if tcx.sess.opts.incremental.is_none() {
@@ -50,21 +60,21 @@ pub fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
 
     let ams = AssertModuleSource { tcx: tcx, modules: modules };
-    for attr in &tcx.map.krate().attrs {
+    for attr in &tcx.hir.krate().attrs {
         ams.check_attr(attr);
     }
 }
 
 struct AssertModuleSource<'a, 'tcx: 'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    modules: &'a [ModuleTranslation],
+    modules: &'a [(String, Disposition)],
 }
 
 impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
     fn check_attr(&self, attr: &ast::Attribute) {
-        let disposition = if attr.check_name(PARTITION_REUSED) {
+        let disposition = if attr.check_name(ATTR_PARTITION_REUSED) {
             Disposition::Reused
-        } else if attr.check_name(PARTITION_TRANSLATED) {
+        } else if attr.check_name(ATTR_PARTITION_TRANSLATED) {
             Disposition::Translated
         } else {
             return;
@@ -76,15 +86,15 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
         }
 
         let mname = self.field(attr, MODULE);
-        let mtrans = self.modules.iter().find(|mtrans| *mtrans.name == *mname.as_str());
+        let mtrans = self.modules.iter().find(|&&(ref name, _)| name == mname.as_str());
         let mtrans = match mtrans {
             Some(m) => m,
             None => {
                 debug!("module name `{}` not found amongst:", mname);
-                for mtrans in self.modules {
+                for &(ref name, ref disposition) in self.modules {
                     debug!("module named `{}` with disposition {:?}",
-                           mtrans.name,
-                           self.disposition(mtrans));
+                           name,
+                           disposition);
                 }
 
                 self.tcx.sess.span_err(
@@ -94,7 +104,7 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
             }
         };
 
-        let mtrans_disposition = self.disposition(mtrans);
+        let mtrans_disposition = mtrans.1;
         if disposition != mtrans_disposition {
             self.tcx.sess.span_err(
                 attr.span,
@@ -105,15 +115,8 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
         }
     }
 
-    fn disposition(&self, mtrans: &ModuleTranslation) -> Disposition {
-        match mtrans.source {
-            ModuleSource::Preexisting(_) => Disposition::Reused,
-            ModuleSource::Translated(_) => Disposition::Translated,
-        }
-    }
-
     fn field(&self, attr: &ast::Attribute, name: &str) -> ast::Name {
-        for item in attr.meta_item_list().unwrap_or(&[]) {
+        for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
             if item.check_name(name) {
                 if let Some(value) = item.value_str() {
                     return value;

@@ -17,7 +17,7 @@ use std::env;
 use std::path::Path;
 
 use syntax::ast;
-use syntax::parse::lexer::{self, Reader, StringReader};
+use syntax::parse::lexer::{self, StringReader};
 use syntax::parse::token::{self, Token};
 use syntax::symbol::keywords;
 use syntax_pos::*;
@@ -47,23 +47,6 @@ impl<'a> SpanUtils<'a> {
         }
     }
 
-    // sub_span starts at span.lo, so we need to adjust the positions etc.
-    // If sub_span is None, we don't need to adjust.
-    pub fn make_sub_span(&self, span: Span, sub_span: Option<Span>) -> Option<Span> {
-        match sub_span {
-            None => None,
-            Some(sub) => {
-                let FileMapAndBytePos {fm, pos} = self.sess.codemap().lookup_byte_offset(span.lo);
-                let base = pos + fm.start_pos;
-                Some(Span {
-                    lo: base + self.sess.codemap().lookup_byte_offset(sub.lo).pos,
-                    hi: base + self.sess.codemap().lookup_byte_offset(sub.hi).pos,
-                    expn_id: span.expn_id,
-                })
-            }
-        }
-    }
-
     pub fn snippet(&self, span: Span) -> String {
         match self.sess.codemap().span_to_snippet(span) {
             Ok(s) => s,
@@ -72,19 +55,7 @@ impl<'a> SpanUtils<'a> {
     }
 
     pub fn retokenise_span(&self, span: Span) -> StringReader<'a> {
-        // sadness - we don't have spans for sub-expressions nor access to the tokens
-        // so in order to get extents for the function name itself (which dxr expects)
-        // we need to re-tokenise the fn definition
-
-        // Note: this is a bit awful - it adds the contents of span to the end of
-        // the codemap as a new filemap. This is mostly OK, but means we should
-        // not iterate over the codemap. Also, any spans over the new filemap
-        // are incompatible with spans over other filemaps.
-        let filemap = self.sess
-                          .codemap()
-                          .new_filemap(String::from("<anon-dxr>"), None, self.snippet(span));
-        let s = self.sess;
-        lexer::StringReader::new(s.diagnostic(), filemap)
+        lexer::StringReader::retokenize(&self.sess.parse_sess, span)
     }
 
     // Re-parses a path and returns the span for the last identifier in the path
@@ -96,7 +67,7 @@ impl<'a> SpanUtils<'a> {
         loop {
             let ts = toks.real_token();
             if ts.tok == token::Eof {
-                return self.make_sub_span(span, result)
+                return result
             }
             if bracket_count == 0 && (ts.tok.is_ident() || ts.tok.is_keyword(keywords::SelfValue)) {
                 result = Some(ts.sp);
@@ -121,7 +92,7 @@ impl<'a> SpanUtils<'a> {
                 return None;
             }
             if bracket_count == 0 && (ts.tok.is_ident() || ts.tok.is_keyword(keywords::SelfValue)) {
-                return self.make_sub_span(span, Some(ts.sp));
+                return Some(ts.sp);
             }
 
             bracket_count += match ts.tok {
@@ -171,10 +142,7 @@ impl<'a> SpanUtils<'a> {
             }
             prev = next;
         }
-        if result.is_none() && prev_span.is_some() {
-            return self.make_sub_span(span, prev_span);
-        }
-        return self.make_sub_span(span, result);
+        result.or(prev_span)
     }
 
     // Return the span for the last ident before a `<` and outside any
@@ -234,9 +202,9 @@ impl<'a> SpanUtils<'a> {
                       loc.line);
         }
         if result.is_none() && prev.tok.is_ident() && angle_count == 0 {
-            return self.make_sub_span(span, Some(prev.sp));
+            return Some(prev.sp);
         }
-        self.make_sub_span(span, result)
+        result
     }
 
     // Reparse span and return an owned vector of sub spans of the first limit
@@ -303,7 +271,7 @@ impl<'a> SpanUtils<'a> {
                 angle_count += 1;
             }
             if ts.tok.is_ident() && angle_count == nesting {
-                result.push(self.make_sub_span(span, Some(ts.sp)).unwrap());
+                result.push(ts.sp);
             }
         }
     }
@@ -317,7 +285,7 @@ impl<'a> SpanUtils<'a> {
             }
             let next = toks.real_token();
             if next.tok == tok {
-                return self.make_sub_span(span, Some(prev.sp));
+                return Some(prev.sp);
             }
             prev = next;
         }
@@ -331,7 +299,7 @@ impl<'a> SpanUtils<'a> {
                 return None;
             }
             if next.tok == tok {
-                return self.make_sub_span(span, Some(next.sp));
+                return Some(next.sp);
             }
         }
     }
@@ -356,7 +324,7 @@ impl<'a> SpanUtils<'a> {
                 if ts.tok == token::Eof {
                     return None
                 } else {
-                    return self.make_sub_span(span, Some(ts.sp));
+                    return Some(ts.sp);
                 }
             }
         }
@@ -377,57 +345,44 @@ impl<'a> SpanUtils<'a> {
         self.spans_with_brackets(span, 1, number)
     }
 
-    pub fn report_span_err(&self, kind: &str, span: Span) {
-        let loc = self.sess.codemap().lookup_char_pos(span.lo);
-        info!("({}) Could not find sub_span in `{}` in {}, line {}",
-              kind,
-              self.snippet(span),
-              loc.file.name,
-              loc.line);
-        self.err_count.set(self.err_count.get() + 1);
-        if self.err_count.get() > 1000 {
-            bug!("span errors reached 1000, giving up");
-        }
-    }
+    // // Return the name for a macro definition (identifier after first `!`)
+    // pub fn span_for_macro_def_name(&self, span: Span) -> Option<Span> {
+    //     let mut toks = self.retokenise_span(span);
+    //     loop {
+    //         let ts = toks.real_token();
+    //         if ts.tok == token::Eof {
+    //             return None;
+    //         }
+    //         if ts.tok == token::Not {
+    //             let ts = toks.real_token();
+    //             if ts.tok.is_ident() {
+    //                 return Some(ts.sp);
+    //             } else {
+    //                 return None;
+    //             }
+    //         }
+    //     }
+    // }
 
-    // Return the name for a macro definition (identifier after first `!`)
-    pub fn span_for_macro_def_name(&self, span: Span) -> Option<Span> {
-        let mut toks = self.retokenise_span(span);
-        loop {
-            let ts = toks.real_token();
-            if ts.tok == token::Eof {
-                return None;
-            }
-            if ts.tok == token::Not {
-                let ts = toks.real_token();
-                if ts.tok.is_ident() {
-                    return self.make_sub_span(span, Some(ts.sp));
-                } else {
-                    return None;
-                }
-            }
-        }
-    }
-
-    // Return the name for a macro use (identifier before first `!`).
-    pub fn span_for_macro_use_name(&self, span:Span) -> Option<Span> {
-        let mut toks = self.retokenise_span(span);
-        let mut prev = toks.real_token();
-        loop {
-            if prev.tok == token::Eof {
-                return None;
-            }
-            let ts = toks.real_token();
-            if ts.tok == token::Not {
-                if prev.tok.is_ident() {
-                    return self.make_sub_span(span, Some(prev.sp));
-                } else {
-                    return None;
-                }
-            }
-            prev = ts;
-        }
-    }
+    // // Return the name for a macro use (identifier before first `!`).
+    // pub fn span_for_macro_use_name(&self, span:Span) -> Option<Span> {
+    //     let mut toks = self.retokenise_span(span);
+    //     let mut prev = toks.real_token();
+    //     loop {
+    //         if prev.tok == token::Eof {
+    //             return None;
+    //         }
+    //         let ts = toks.real_token();
+    //         if ts.tok == token::Not {
+    //             if prev.tok.is_ident() {
+    //                 return Some(prev.sp);
+    //             } else {
+    //                 return None;
+    //             }
+    //         }
+    //         prev = ts;
+    //     }
+    // }
 
     /// Return true if the span is generated code, and
     /// it is not a subspan of the root callsite.
@@ -443,9 +398,10 @@ impl<'a> SpanUtils<'a> {
             return false;
         }
         // If sub_span is none, filter out generated code.
-        if sub_span.is_none() {
-            return true;
-        }
+        let sub_span = match sub_span {
+            Some(ss) => ss,
+            None => return true,
+        };
 
         //If the span comes from a fake filemap, filter it.
         if !self.sess.codemap().lookup_char_pos(parent.lo).file.is_real_file() {
@@ -454,8 +410,7 @@ impl<'a> SpanUtils<'a> {
 
         // Otherwise, a generated span is deemed invalid if it is not a sub-span of the root
         // callsite. This filters out macro internal variables and most malformed spans.
-        let span = self.sess.codemap().source_callsite(parent);
-        !(span.contains(parent))
+        !parent.source_callsite().contains(sub_span)
     }
 }
 

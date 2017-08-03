@@ -11,21 +11,16 @@
 //! Syntax extensions in the Rust compiler.
 
 #![crate_name = "syntax_ext"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
-#![feature(proc_macro_lib)]
 #![feature(proc_macro_internals)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
 
 extern crate fmt_macros;
-#[macro_use]
 extern crate log;
 #[macro_use]
 extern crate syntax;
@@ -35,11 +30,13 @@ extern crate rustc_errors as errors;
 
 mod asm;
 mod cfg;
+mod compile_error;
 mod concat;
 mod concat_idents;
 mod env;
 mod format;
 mod format_foreign;
+mod global_asm;
 mod log_syntax;
 mod trace_macros;
 
@@ -48,20 +45,21 @@ pub mod proc_macro_registrar;
 // for custom_derive
 pub mod deriving;
 
+pub mod proc_macro_impl;
+
 use std::rc::Rc;
 use syntax::ast;
-use syntax::ext::base::{MacroExpanderFn, NormalTT, IdentTT, MultiModifier, NamedSyntaxExtension};
-use syntax::ext::tt::macro_rules::MacroRulesExpander;
+use syntax::ext::base::{MacroExpanderFn, NormalTT, NamedSyntaxExtension};
 use syntax::symbol::Symbol;
 
 pub fn register_builtins(resolver: &mut syntax::ext::base::Resolver,
                          user_exts: Vec<NamedSyntaxExtension>,
                          enable_quotes: bool) {
-    let mut register = |name, ext| {
-        resolver.add_ext(ast::Ident::with_empty_ctxt(name), Rc::new(ext));
-    };
+    deriving::register_builtin_derives(resolver);
 
-    register(Symbol::intern("macro_rules"), IdentTT(Box::new(MacroRulesExpander), None, false));
+    let mut register = |name, ext| {
+        resolver.add_builtin(ast::Ident::with_empty_ctxt(name), Rc::new(ext));
+    };
 
     macro_rules! register {
         ($( $name:ident: $f:expr, )*) => { $(
@@ -80,7 +78,6 @@ pub fn register_builtins(resolver: &mut syntax::ext::base::Resolver,
             quote_pat: expand_quote_pat,
             quote_arm: expand_quote_arm,
             quote_stmt: expand_quote_stmt,
-            quote_matcher: expand_quote_matcher,
             quote_attr: expand_quote_attr,
             quote_arg: expand_quote_arg,
             quote_block: expand_quote_block,
@@ -101,6 +98,7 @@ pub fn register_builtins(resolver: &mut syntax::ext::base::Resolver,
         module_path: expand_mod,
 
         asm: asm::expand_asm,
+        global_asm: global_asm::expand_global_asm,
         cfg: cfg::expand_cfg,
         concat: concat::expand_syntax_ext,
         concat_idents: concat_idents::expand_syntax_ext,
@@ -108,13 +106,12 @@ pub fn register_builtins(resolver: &mut syntax::ext::base::Resolver,
         option_env: env::expand_option_env,
         log_syntax: log_syntax::expand_syntax_ext,
         trace_macros: trace_macros::expand_trace_macros,
+        compile_error: compile_error::expand_compile_error,
     }
 
     // format_args uses `unstable` things internally.
     register(Symbol::intern("format_args"),
              NormalTT(Box::new(format::expand_format_args), None, true));
-
-    register(Symbol::intern("derive"), MultiModifier(Box::new(deriving::expand_derive)));
 
     for (name, ext) in user_exts {
         register(name, ext);

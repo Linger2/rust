@@ -8,12 +8,14 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use LinkerFlavor;
 use target::{Target, TargetResult};
 
 pub fn target() -> TargetResult {
     let mut base = super::windows_msvc_base::opts();
     base.cpu = "x86-64".to_string();
     base.max_atomic_width = Some(64);
+    base.has_elf_tls = true;
 
     Ok(Target {
         llvm_target: "x86_64-pc-windows-msvc".to_string(),
@@ -24,6 +26,7 @@ pub fn target() -> TargetResult {
         target_os: "windows".to_string(),
         target_env: "msvc".to_string(),
         target_vendor: "pc".to_string(),
+        linker_flavor: LinkerFlavor::Msvc,
         options: base,
     })
 }

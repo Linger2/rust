@@ -8,22 +8,171 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE};
+//! For each definition, we track the following data.  A definition
+//! here is defined somewhat circularly as "something with a def-id",
+//! but it generally corresponds to things like structs, enums, etc.
+//! There are also some rather random cases (like const initializer
+//! expressions) that are mostly just leftovers.
+
+use hir;
+use hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE, DefIndexAddressSpace,
+                  CRATE_DEF_INDEX};
+use ich::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::indexed_vec::IndexVec;
+use rustc_data_structures::stable_hasher::StableHasher;
+use serialize::{Encodable, Decodable, Encoder, Decoder};
 use std::fmt::Write;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
 use syntax::ast;
+use syntax::ext::hygiene::Mark;
 use syntax::symbol::{Symbol, InternedString};
 use ty::TyCtxt;
 use util::nodemap::NodeMap;
 
-/// The definition table containing node definitions
-#[derive(Clone)]
+/// The DefPathTable maps DefIndexes to DefKeys and vice versa.
+/// Internally the DefPathTable holds a tree of DefKeys, where each DefKey
+/// stores the DefIndex of its parent.
+/// There is one DefPathTable for each crate.
+pub struct DefPathTable {
+    index_to_key: [Vec<DefKey>; 2],
+    def_path_hashes: [Vec<DefPathHash>; 2],
+}
+
+// Unfortunately we have to provide a manual impl of Clone because of the
+// fixed-sized array field.
+impl Clone for DefPathTable {
+    fn clone(&self) -> Self {
+        DefPathTable {
+            index_to_key: [self.index_to_key[0].clone(),
+                           self.index_to_key[1].clone()],
+            def_path_hashes: [self.def_path_hashes[0].clone(),
+                              self.def_path_hashes[1].clone()],
+        }
+    }
+}
+
+impl DefPathTable {
+
+    fn allocate(&mut self,
+                key: DefKey,
+                def_path_hash: DefPathHash,
+                address_space: DefIndexAddressSpace)
+                -> DefIndex {
+        let index = {
+            let index_to_key = &mut self.index_to_key[address_space.index()];
+            let index = DefIndex::new(index_to_key.len() + address_space.start());
+            debug!("DefPathTable::insert() - {:?} <-> {:?}", key, index);
+            index_to_key.push(key);
+            index
+        };
+        self.def_path_hashes[address_space.index()].push(def_path_hash);
+        debug_assert!(self.def_path_hashes[address_space.index()].len() ==
+                      self.index_to_key[address_space.index()].len());
+        index
+    }
+
+    #[inline(always)]
+    pub fn def_key(&self, index: DefIndex) -> DefKey {
+        self.index_to_key[index.address_space().index()]
+                         [index.as_array_index()].clone()
+    }
+
+    #[inline(always)]
+    pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
+        self.def_path_hashes[index.address_space().index()]
+                            [index.as_array_index()]
+    }
+
+    pub fn add_def_path_hashes_to(&self,
+                                  cnum: CrateNum,
+                                  out: &mut FxHashMap<DefPathHash, DefId>) {
+        for address_space in &[DefIndexAddressSpace::Low, DefIndexAddressSpace::High] {
+            let start_index = address_space.start();
+            out.extend(
+                (&self.def_path_hashes[address_space.index()])
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &hash)| {
+                        let def_id = DefId {
+                            krate: cnum,
+                            index: DefIndex::new(index + start_index),
+                        };
+                        (hash, def_id)
+                    })
+            );
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.index_to_key.iter().map(|v| v.len()).sum()
+    }
+}
+
+
+impl Encodable for DefPathTable {
+    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+        // Index to key
+        self.index_to_key[DefIndexAddressSpace::Low.index()].encode(s)?;
+        self.index_to_key[DefIndexAddressSpace::High.index()].encode(s)?;
+
+        // DefPath hashes
+        self.def_path_hashes[DefIndexAddressSpace::Low.index()].encode(s)?;
+        self.def_path_hashes[DefIndexAddressSpace::High.index()].encode(s)?;
+
+        Ok(())
+    }
+}
+
+impl Decodable for DefPathTable {
+    fn decode<D: Decoder>(d: &mut D) -> Result<DefPathTable, D::Error> {
+        let index_to_key_lo: Vec<DefKey> = Decodable::decode(d)?;
+        let index_to_key_hi: Vec<DefKey> = Decodable::decode(d)?;
+
+        let def_path_hashes_lo: Vec<DefPathHash> = Decodable::decode(d)?;
+        let def_path_hashes_hi: Vec<DefPathHash> = Decodable::decode(d)?;
+
+        let index_to_key = [index_to_key_lo, index_to_key_hi];
+        let def_path_hashes = [def_path_hashes_lo, def_path_hashes_hi];
+
+        Ok(DefPathTable {
+            index_to_key,
+            def_path_hashes,
+        })
+    }
+}
+
+
+/// The definition table containing node definitions.
+/// It holds the DefPathTable for local DefIds/DefPaths and it also stores a
+/// mapping from NodeIds to local DefIds.
 pub struct Definitions {
-    data: Vec<DefData>,
-    key_map: FxHashMap<DefKey, DefIndex>,
-    node_map: NodeMap<DefIndex>,
+    table: DefPathTable,
+    node_to_def_index: NodeMap<DefIndex>,
+    def_index_to_node: [Vec<ast::NodeId>; 2],
+    pub(super) node_to_hir_id: IndexVec<ast::NodeId, hir::HirId>,
+    macro_def_scopes: FxHashMap<Mark, DefId>,
+    expansions: FxHashMap<DefIndex, Mark>,
+    next_disambiguator: FxHashMap<(DefIndex, DefPathData), u32>,
+}
+
+// Unfortunately we have to provide a manual impl of Clone because of the
+// fixed-sized array field.
+impl Clone for Definitions {
+    fn clone(&self) -> Self {
+        Definitions {
+            table: self.table.clone(),
+            node_to_def_index: self.node_to_def_index.clone(),
+            def_index_to_node: [
+                self.def_index_to_node[0].clone(),
+                self.def_index_to_node[1].clone(),
+            ],
+            node_to_hir_id: self.node_to_hir_id.clone(),
+            macro_def_scopes: self.macro_def_scopes.clone(),
+            expansions: self.expansions.clone(),
+            next_disambiguator: self.next_disambiguator.clone(),
+        }
+    }
 }
 
 /// A unique identifier that we can use to lookup a definition
@@ -38,6 +187,61 @@ pub struct DefKey {
     pub disambiguated_data: DisambiguatedDefPathData,
 }
 
+impl DefKey {
+    fn compute_stable_hash(&self, parent_hash: DefPathHash) -> DefPathHash {
+        let mut hasher = StableHasher::new();
+
+        // We hash a 0u8 here to disambiguate between regular DefPath hashes,
+        // and the special "root_parent" below.
+        0u8.hash(&mut hasher);
+        parent_hash.hash(&mut hasher);
+
+        let DisambiguatedDefPathData {
+            ref data,
+            disambiguator,
+        } = self.disambiguated_data;
+
+        ::std::mem::discriminant(data).hash(&mut hasher);
+        match *data {
+            DefPathData::TypeNs(name) |
+            DefPathData::ValueNs(name) |
+            DefPathData::Module(name) |
+            DefPathData::MacroDef(name) |
+            DefPathData::TypeParam(name) |
+            DefPathData::LifetimeDef(name) |
+            DefPathData::EnumVariant(name) |
+            DefPathData::Binding(name) |
+            DefPathData::Field(name) |
+            DefPathData::GlobalMetaData(name) => {
+                (*name.as_str()).hash(&mut hasher);
+            }
+
+            DefPathData::Impl |
+            DefPathData::CrateRoot |
+            DefPathData::Misc |
+            DefPathData::ClosureExpr |
+            DefPathData::StructCtor |
+            DefPathData::Initializer |
+            DefPathData::ImplTrait |
+            DefPathData::Typeof => {}
+        };
+
+        disambiguator.hash(&mut hasher);
+
+        DefPathHash(hasher.finish())
+    }
+
+    fn root_parent_stable_hash(crate_name: &str, crate_disambiguator: &str) -> DefPathHash {
+        let mut hasher = StableHasher::new();
+        // Disambiguate this from a regular DefPath hash,
+        // see compute_stable_hash() above.
+        1u8.hash(&mut hasher);
+        crate_name.hash(&mut hasher);
+        crate_disambiguator.hash(&mut hasher);
+        DefPathHash(hasher.finish())
+    }
+}
+
 /// Pair of `DefPathData` and an integer disambiguator. The integer is
 /// normally 0, but in the event that there are multiple defs with the
 /// same `parent` and `data`, we use this field to disambiguate
@@ -48,19 +252,6 @@ pub struct DefKey {
 pub struct DisambiguatedDefPathData {
     pub data: DefPathData,
     pub disambiguator: u32
-}
-
-/// For each definition, we track the following data.  A definition
-/// here is defined somewhat circularly as "something with a def-id",
-/// but it generally corresponds to things like structs, enums, etc.
-/// There are also some rather random cases (like const initializer
-/// expressions) that are mostly just leftovers.
-#[derive(Clone, Debug)]
-pub struct DefData {
-    pub key: DefKey,
-
-    /// Local ID within the HIR.
-    pub node_id: ast::NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
@@ -77,12 +268,11 @@ impl DefPath {
         self.krate == LOCAL_CRATE
     }
 
-    pub fn make<FN>(start_krate: CrateNum,
+    pub fn make<FN>(krate: CrateNum,
                     start_index: DefIndex,
                     mut get_key: FN) -> DefPath
         where FN: FnMut(DefIndex) -> DefKey
     {
-        let mut krate = start_krate;
         let mut data = vec![];
         let mut index = Some(start_index);
         loop {
@@ -93,13 +283,6 @@ impl DefPath {
             match key.disambiguated_data.data {
                 DefPathData::CrateRoot => {
                     assert!(key.parent.is_none());
-                    break;
-                }
-                DefPathData::InlinedRoot(ref p) => {
-                    assert!(key.parent.is_none());
-                    assert!(!p.def_id.is_local());
-                    data.extend(p.data.iter().cloned().rev());
-                    krate = p.def_id.krate;
                     break;
                 }
                 _ => {
@@ -117,7 +300,9 @@ impl DefPath {
 
         s.push_str(&tcx.original_crate_name(self.krate).as_str());
         s.push_str("/");
-        s.push_str(&tcx.crate_disambiguator(self.krate).as_str());
+        // Don't print the whole crate disambiguator. That's just annoying in
+        // debug output.
+        s.push_str(&tcx.crate_disambiguator(self.krate).as_str()[..7]);
 
         for component in &self.data {
             write!(s,
@@ -130,53 +315,30 @@ impl DefPath {
         s
     }
 
-    pub fn deterministic_hash(&self, tcx: TyCtxt) -> u64 {
-        let mut state = DefaultHasher::new();
-        self.deterministic_hash_to(tcx, &mut state);
-        state.finish()
-    }
+    /// Returns a string representation of the DefPath without
+    /// the crate-prefix. This method is useful if you don't have
+    /// a TyCtxt available.
+    pub fn to_string_no_crate(&self) -> String {
+        let mut s = String::with_capacity(self.data.len() * 16);
 
-    pub fn deterministic_hash_to<H: Hasher>(&self, tcx: TyCtxt, state: &mut H) {
-        tcx.original_crate_name(self.krate).as_str().hash(state);
-        tcx.crate_disambiguator(self.krate).as_str().hash(state);
-        self.data.hash(state);
+        for component in &self.data {
+            write!(s,
+                   "::{}[{}]",
+                   component.data.as_interned_str(),
+                   component.disambiguator)
+                .unwrap();
+        }
+
+        s
     }
 }
 
-/// Root of an inlined item. We track the `DefPath` of the item within
-/// the original crate but also its def-id. This is kind of an
-/// augmented version of a `DefPath` that includes a `DefId`. This is
-/// all sort of ugly but the hope is that inlined items will be going
-/// away soon anyway.
-///
-/// Some of the constraints that led to the current approach:
-///
-/// - I don't want to have a `DefId` in the main `DefPath` because
-///   that gets serialized for incr. comp., and when reloaded the
-///   `DefId` is no longer valid. I'd rather maintain the invariant
-///   that every `DefId` is valid, and a potentially outdated `DefId` is
-///   represented as a `DefPath`.
-///   - (We don't serialize def-paths from inlined items, so it's ok to have one here.)
-/// - We need to be able to extract the def-id from inline items to
-///   make the symbol name. In theory we could retrace it from the
-///   data, but the metadata doesn't have the required indices, and I
-///   don't want to write the code to create one just for this.
-/// - It may be that we don't actually need `data` at all. We'll have
-///   to see about that.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
-pub struct InlinedRootPath {
-    pub data: Vec<DisambiguatedDefPathData>,
-    pub def_id: DefId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, RustcEncodable, RustcDecodable)]
 pub enum DefPathData {
     // Root: these should only be used for the root nodes, because
     // they are treated specially by the `def_path` function.
     /// The crate root (marker)
     CrateRoot,
-    /// An inlined root
-    InlinedRoot(Box<InlinedRootPath>),
 
     // Catch-all for random DefId things like DUMMY_NODE_ID
     Misc,
@@ -185,56 +347,82 @@ pub enum DefPathData {
     /// An impl
     Impl,
     /// Something in the type NS
-    TypeNs(InternedString),
+    TypeNs(Symbol),
     /// Something in the value NS
-    ValueNs(InternedString),
+    ValueNs(Symbol),
     /// A module declaration
-    Module(InternedString),
+    Module(Symbol),
     /// A macro rule
-    MacroDef(InternedString),
+    MacroDef(Symbol),
     /// A closure expression
     ClosureExpr,
 
     // Subportions of items
     /// A type parameter (generic parameter)
-    TypeParam(InternedString),
+    TypeParam(Symbol),
     /// A lifetime definition
-    LifetimeDef(InternedString),
+    LifetimeDef(Symbol),
     /// A variant of a enum
-    EnumVariant(InternedString),
+    EnumVariant(Symbol),
     /// A struct field
-    Field(InternedString),
+    Field(Symbol),
     /// Implicit ctor for a tuple-like struct
     StructCtor,
     /// Initializer for a const
     Initializer,
     /// Pattern binding
-    Binding(InternedString),
+    Binding(Symbol),
     /// An `impl Trait` type node.
-    ImplTrait
+    ImplTrait,
+    /// A `typeof` type node.
+    Typeof,
+
+    /// GlobalMetaData identifies a piece of crate metadata that is global to
+    /// a whole crate (as opposed to just one item). GlobalMetaData components
+    /// are only supposed to show up right below the crate root.
+    GlobalMetaData(Symbol)
 }
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug,
+         RustcEncodable, RustcDecodable)]
+pub struct DefPathHash(pub Fingerprint);
+
+impl_stable_hash_for!(tuple_struct DefPathHash { fingerprint });
 
 impl Definitions {
     /// Create new empty definition map.
     pub fn new() -> Definitions {
         Definitions {
-            data: vec![],
-            key_map: FxHashMap(),
-            node_map: NodeMap(),
+            table: DefPathTable {
+                index_to_key: [vec![], vec![]],
+                def_path_hashes: [vec![], vec![]],
+            },
+            node_to_def_index: NodeMap(),
+            def_index_to_node: [vec![], vec![]],
+            node_to_hir_id: IndexVec::new(),
+            macro_def_scopes: FxHashMap(),
+            expansions: FxHashMap(),
+            next_disambiguator: FxHashMap(),
         }
     }
 
+    pub fn def_path_table(&self) -> &DefPathTable {
+        &self.table
+    }
+
     /// Get the number of definitions.
-    pub fn len(&self) -> usize {
-        self.data.len()
+    pub fn def_index_counts_lo_hi(&self) -> (usize, usize) {
+        (self.table.index_to_key[DefIndexAddressSpace::Low.index()].len(),
+         self.table.index_to_key[DefIndexAddressSpace::High.index()].len())
     }
 
     pub fn def_key(&self, index: DefIndex) -> DefKey {
-        self.data[index.as_usize()].key.clone()
+        self.table.def_key(index)
     }
 
-    pub fn def_index_for_def_key(&self, key: DefKey) -> Option<DefIndex> {
-        self.key_map.get(&key).cloned()
+    #[inline(always)]
+    pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
+        self.table.def_path_hash(index)
     }
 
     /// Returns the path from the crate root to `index`. The root
@@ -247,7 +435,7 @@ impl Definitions {
     }
 
     pub fn opt_def_index(&self, node: ast::NodeId) -> Option<DefIndex> {
-        self.node_map.get(&node).cloned()
+        self.node_to_def_index.get(&node).cloned()
     }
 
     pub fn opt_local_def_id(&self, node: ast::NodeId) -> Option<DefId> {
@@ -260,107 +448,181 @@ impl Definitions {
 
     pub fn as_local_node_id(&self, def_id: DefId) -> Option<ast::NodeId> {
         if def_id.krate == LOCAL_CRATE {
-            assert!(def_id.index.as_usize() < self.data.len());
-            Some(self.data[def_id.index.as_usize()].node_id)
+            let space_index = def_id.index.address_space().index();
+            let array_index = def_id.index.as_array_index();
+            let node_id = self.def_index_to_node[space_index][array_index];
+            if node_id != ast::DUMMY_NODE_ID {
+                Some(node_id)
+            } else {
+                None
+            }
         } else {
             None
         }
     }
 
+    pub fn node_to_hir_id(&self, node_id: ast::NodeId) -> hir::HirId {
+        self.node_to_hir_id[node_id]
+    }
+
     /// Add a definition with a parent definition.
-    pub fn create_def_with_parent(&mut self,
-                                  parent: Option<DefIndex>,
-                                  node_id: ast::NodeId,
-                                  data: DefPathData)
-                                  -> DefIndex {
-        debug!("create_def_with_parent(parent={:?}, node_id={:?}, data={:?})",
-               parent, node_id, data);
-
-        assert!(!self.node_map.contains_key(&node_id),
-                "adding a def'n for node-id {:?} and data {:?} but a previous def'n exists: {:?}",
-                node_id,
-                data,
-                self.data[self.node_map[&node_id].as_usize()]);
-
-        assert!(parent.is_some() ^ match data {
-            DefPathData::CrateRoot | DefPathData::InlinedRoot(_) => true,
-            _ => false,
-        });
-
-        // Find a unique DefKey. This basically means incrementing the disambiguator
-        // until we get no match.
-        let mut key = DefKey {
-            parent: parent,
+    pub fn create_root_def(&mut self,
+                           crate_name: &str,
+                           crate_disambiguator: &str)
+                           -> DefIndex {
+        let key = DefKey {
+            parent: None,
             disambiguated_data: DisambiguatedDefPathData {
-                data: data,
+                data: DefPathData::CrateRoot,
                 disambiguator: 0
             }
         };
 
-        while self.key_map.contains_key(&key) {
-            key.disambiguated_data.disambiguator += 1;
-        }
+        let parent_hash = DefKey::root_parent_stable_hash(crate_name,
+                                                          crate_disambiguator);
+        let def_path_hash = key.compute_stable_hash(parent_hash);
+
+        // Create the definition.
+        let address_space = super::ITEM_LIKE_SPACE;
+        let root_index = self.table.allocate(key, def_path_hash, address_space);
+        assert_eq!(root_index, CRATE_DEF_INDEX);
+        assert!(self.def_index_to_node[address_space.index()].is_empty());
+        self.def_index_to_node[address_space.index()].push(ast::CRATE_NODE_ID);
+        self.node_to_def_index.insert(ast::CRATE_NODE_ID, root_index);
+
+        // Allocate some other DefIndices that always must exist.
+        GlobalMetaDataKind::allocate_def_indices(self);
+
+        root_index
+    }
+
+    /// Add a definition with a parent definition.
+    pub fn create_def_with_parent(&mut self,
+                                  parent: DefIndex,
+                                  node_id: ast::NodeId,
+                                  data: DefPathData,
+                                  address_space: DefIndexAddressSpace,
+                                  expansion: Mark)
+                                  -> DefIndex {
+        debug!("create_def_with_parent(parent={:?}, node_id={:?}, data={:?})",
+               parent, node_id, data);
+
+        assert!(!self.node_to_def_index.contains_key(&node_id),
+                "adding a def'n for node-id {:?} and data {:?} but a previous def'n exists: {:?}",
+                node_id,
+                data,
+                self.table.def_key(self.node_to_def_index[&node_id]));
+
+        // The root node must be created with create_root_def()
+        assert!(data != DefPathData::CrateRoot);
+
+        // Find the next free disambiguator for this key.
+        let disambiguator = {
+            let next_disamb = self.next_disambiguator.entry((parent, data.clone())).or_insert(0);
+            let disambiguator = *next_disamb;
+            *next_disamb = next_disamb.checked_add(1).expect("disambiguator overflow");
+            disambiguator
+        };
+
+        let key = DefKey {
+            parent: Some(parent),
+            disambiguated_data: DisambiguatedDefPathData {
+                data, disambiguator
+            }
+        };
+
+        let parent_hash = self.table.def_path_hash(parent);
+        let def_path_hash = key.compute_stable_hash(parent_hash);
 
         debug!("create_def_with_parent: after disambiguation, key = {:?}", key);
 
         // Create the definition.
-        let index = DefIndex::new(self.data.len());
-        self.data.push(DefData { key: key.clone(), node_id: node_id });
-        debug!("create_def_with_parent: node_map[{:?}] = {:?}", node_id, index);
-        self.node_map.insert(node_id, index);
-        debug!("create_def_with_parent: key_map[{:?}] = {:?}", key, index);
-        self.key_map.insert(key, index);
+        let index = self.table.allocate(key, def_path_hash, address_space);
+        assert_eq!(index.as_array_index(),
+                   self.def_index_to_node[address_space.index()].len());
+        self.def_index_to_node[address_space.index()].push(node_id);
 
+        // Some things for which we allocate DefIndices don't correspond to
+        // anything in the AST, so they don't have a NodeId. For these cases
+        // we don't need a mapping from NodeId to DefIndex.
+        if node_id != ast::DUMMY_NODE_ID {
+            debug!("create_def_with_parent: def_index_to_node[{:?} <-> {:?}", index, node_id);
+            self.node_to_def_index.insert(node_id, index);
+        }
+
+        if expansion.is_modern() {
+            self.expansions.insert(index, expansion);
+        }
 
         index
+    }
+
+    /// Initialize the ast::NodeId to HirId mapping once it has been generated during
+    /// AST to HIR lowering.
+    pub fn init_node_id_to_hir_id_mapping(&mut self,
+                                          mapping: IndexVec<ast::NodeId, hir::HirId>) {
+        assert!(self.node_to_hir_id.is_empty(),
+                "Trying initialize NodeId -> HirId mapping twice");
+        self.node_to_hir_id = mapping;
+    }
+
+    pub fn expansion(&self, index: DefIndex) -> Mark {
+        self.expansions.get(&index).cloned().unwrap_or(Mark::root())
+    }
+
+    pub fn macro_def_scope(&self, mark: Mark) -> DefId {
+        self.macro_def_scopes[&mark]
+    }
+
+    pub fn add_macro_def_scope(&mut self, mark: Mark, scope: DefId) {
+        self.macro_def_scopes.insert(mark, scope);
     }
 }
 
 impl DefPathData {
-    pub fn get_opt_name(&self) -> Option<ast::Name> {
+    pub fn get_opt_name(&self) -> Option<Symbol> {
         use self::DefPathData::*;
         match *self {
-            TypeNs(ref name) |
-            ValueNs(ref name) |
-            Module(ref name) |
-            MacroDef(ref name) |
-            TypeParam(ref name) |
-            LifetimeDef(ref name) |
-            EnumVariant(ref name) |
-            Binding(ref name) |
-            Field(ref name) => Some(Symbol::intern(name)),
+            TypeNs(name) |
+            ValueNs(name) |
+            Module(name) |
+            MacroDef(name) |
+            TypeParam(name) |
+            LifetimeDef(name) |
+            EnumVariant(name) |
+            Binding(name) |
+            Field(name) |
+            GlobalMetaData(name) => Some(name),
 
             Impl |
             CrateRoot |
-            InlinedRoot(_) |
             Misc |
             ClosureExpr |
             StructCtor |
             Initializer |
-            ImplTrait => None
+            ImplTrait |
+            Typeof => None
         }
     }
 
     pub fn as_interned_str(&self) -> InternedString {
         use self::DefPathData::*;
         let s = match *self {
-            TypeNs(ref name) |
-            ValueNs(ref name) |
-            Module(ref name) |
-            MacroDef(ref name) |
-            TypeParam(ref name) |
-            LifetimeDef(ref name) |
-            EnumVariant(ref name) |
-            Binding(ref name) |
-            Field(ref name) => {
-                return name.clone();
+            TypeNs(name) |
+            ValueNs(name) |
+            Module(name) |
+            MacroDef(name) |
+            TypeParam(name) |
+            LifetimeDef(name) |
+            EnumVariant(name) |
+            Binding(name) |
+            Field(name) |
+            GlobalMetaData(name) => {
+                return name.as_str();
             }
 
             // note that this does not show up in user printouts
             CrateRoot => "{{root}}",
-
-            // note that this does not show up in user printouts
-            InlinedRoot(_) => "{{inlined-root}}",
 
             Impl => "{{impl}}",
             Misc => "{{?}}",
@@ -368,6 +630,7 @@ impl DefPathData {
             StructCtor => "{{constructor}}",
             Initializer => "{{initializer}}",
             ImplTrait => "{{impl-Trait}}",
+            Typeof => "{{typeof}}",
         };
 
         Symbol::intern(s).as_str()
@@ -378,3 +641,81 @@ impl DefPathData {
     }
 }
 
+// We define the GlobalMetaDataKind enum with this macro because we want to
+// make sure that we exhaustively iterate over all variants when registering
+// the corresponding DefIndices in the DefTable.
+macro_rules! define_global_metadata_kind {
+    (pub enum GlobalMetaDataKind {
+        $($variant:ident),*
+    }) => (
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+                 RustcEncodable, RustcDecodable)]
+        pub enum GlobalMetaDataKind {
+            $($variant),*
+        }
+
+        const GLOBAL_MD_ADDRESS_SPACE: DefIndexAddressSpace = DefIndexAddressSpace::High;
+
+        impl GlobalMetaDataKind {
+            fn allocate_def_indices(definitions: &mut Definitions) {
+                $({
+                    let instance = GlobalMetaDataKind::$variant;
+                    definitions.create_def_with_parent(
+                        CRATE_DEF_INDEX,
+                        ast::DUMMY_NODE_ID,
+                        DefPathData::GlobalMetaData(instance.name()),
+                        GLOBAL_MD_ADDRESS_SPACE,
+                        Mark::root()
+                    );
+
+                    // Make sure calling def_index does not crash.
+                    instance.def_index(&definitions.table);
+                })*
+            }
+
+            pub fn def_index(&self, def_path_table: &DefPathTable) -> DefIndex {
+                let def_key = DefKey {
+                    parent: Some(CRATE_DEF_INDEX),
+                    disambiguated_data: DisambiguatedDefPathData {
+                        data: DefPathData::GlobalMetaData(self.name()),
+                        disambiguator: 0,
+                    }
+                };
+
+                // These DefKeys are all right after the root,
+                // so a linear search is fine.
+                let index = def_path_table.index_to_key[GLOBAL_MD_ADDRESS_SPACE.index()]
+                                          .iter()
+                                          .position(|k| *k == def_key)
+                                          .unwrap();
+
+                DefIndex::from_array_index(index, GLOBAL_MD_ADDRESS_SPACE)
+            }
+
+            fn name(&self) -> Symbol {
+
+                let string = match *self {
+                    $(
+                        GlobalMetaDataKind::$variant => {
+                            concat!("{{GlobalMetaData::", stringify!($variant), "}}")
+                        }
+                    )*
+                };
+
+                Symbol::intern(string)
+            }
+        }
+    )
+}
+
+define_global_metadata_kind!(pub enum GlobalMetaDataKind {
+    Krate,
+    CrateDeps,
+    DylibDependencyFormats,
+    LangItems,
+    LangItemsMissing,
+    NativeLibraries,
+    CodeMap,
+    Impls,
+    ExportedSymbols
+});

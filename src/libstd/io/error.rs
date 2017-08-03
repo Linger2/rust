@@ -39,7 +39,7 @@ use convert::From;
 /// fn get_string() -> io::Result<String> {
 ///     let mut buffer = String::new();
 ///
-///     try!(io::stdin().read_line(&mut buffer));
+///     io::stdin().read_line(&mut buffer)?;
 ///
 ///     Ok(buffer)
 /// }
@@ -140,13 +140,13 @@ pub enum ErrorKind {
     #[stable(feature = "rust1", since = "1.0.0")]
     TimedOut,
     /// An error returned when an operation could not be completed because a
-    /// call to [`write()`] returned [`Ok(0)`].
+    /// call to [`write`] returned [`Ok(0)`].
     ///
     /// This typically means that an operation could only succeed if it wrote a
     /// particular number of bytes but only a smaller number of bytes could be
     /// written.
     ///
-    /// [`write()`]: ../../std/io/trait.Write.html#tymethod.write
+    /// [`write`]: ../../std/io/trait.Write.html#tymethod.write
     /// [`Ok(0)`]: ../../std/io/type.Result.html
     #[stable(feature = "rust1", since = "1.0.0")]
     WriteZero,
@@ -208,6 +208,7 @@ impl ErrorKind {
 /// the heap (for normal construction via Error::new) is too costly.
 #[stable(feature = "io_error_from_errorkind", since = "1.14.0")]
 impl From<ErrorKind> for Error {
+    #[inline]
     fn from(kind: ErrorKind) -> Error {
         Error {
             repr: Repr::Simple(kind)
@@ -388,12 +389,12 @@ impl Error {
     /// impl MyError {
     ///     fn new() -> MyError {
     ///         MyError {
-    ///             v: "oh no!".to_owned()
+    ///             v: "oh no!".to_string()
     ///         }
     ///     }
     ///
     ///     fn change_message(&mut self, new_message: &str) {
-    ///         self.v = new_message.to_owned();
+    ///         self.v = new_message.to_string();
     ///     }
     /// }
     ///

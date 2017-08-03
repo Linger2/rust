@@ -8,7 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use LinkerFlavor;
 use target::{Target, TargetOptions, TargetResult};
+
+// See https://developer.android.com/ndk/guides/abis.html#arm64-v8a
+// for target ABI requirements.
 
 pub fn target() -> TargetResult {
     let mut base = super::android_base::opts();
@@ -25,6 +29,7 @@ pub fn target() -> TargetResult {
         target_os: "android".to_string(),
         target_env: "".to_string(),
         target_vendor: "unknown".to_string(),
+        linker_flavor: LinkerFlavor::Gcc,
         options: TargetOptions {
             abi_blacklist: super::arm_base::abi_blacklist(),
             .. base

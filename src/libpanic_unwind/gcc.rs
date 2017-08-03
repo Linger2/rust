@@ -133,6 +133,9 @@ const UNWIND_DATA_REG: (i32, i32) = (3, 4); // R3, R4 / X3, X4
 #[cfg(target_arch = "s390x")]
 const UNWIND_DATA_REG: (i32, i32) = (6, 7); // R6, R7
 
+#[cfg(target_arch = "sparc64")]
+const UNWIND_DATA_REG: (i32, i32) = (24, 25); // I0, I1
+
 // The following code is based on GCC's C and C++ personality routines.  For reference, see:
 // https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/libsupc++/eh_personality.cc
 // https://github.com/gcc-mirror/gcc/blob/trunk/libgcc/unwind-c.c
@@ -153,7 +156,10 @@ unsafe extern "C" fn rust_eh_personality(version: c_int,
     if version != 1 {
         return uw::_URC_FATAL_PHASE1_ERROR;
     }
-    let eh_action = find_eh_action(context);
+    let eh_action = match find_eh_action(context) {
+        Ok(action) => action,
+        Err(_) => return uw::_URC_FATAL_PHASE1_ERROR,
+    };
     if actions as i32 & uw::_UA_SEARCH_PHASE as i32 != 0 {
         match eh_action {
             EHAction::None |
@@ -216,7 +222,10 @@ unsafe extern "C" fn rust_eh_personality(state: uw::_Unwind_State,
     // _Unwind_Context in our libunwind bindings and fetch the required data from there directly,
     // bypassing DWARF compatibility functions.
 
-    let eh_action = find_eh_action(context);
+    let eh_action = match find_eh_action(context) {
+        Ok(action) => action,
+        Err(_) => return uw::_URC_FAILURE,
+    };
     if search_phase {
         match eh_action {
             EHAction::None |
@@ -257,7 +266,9 @@ unsafe extern "C" fn rust_eh_personality(state: uw::_Unwind_State,
     }
 }
 
-unsafe fn find_eh_action(context: *mut uw::_Unwind_Context) -> EHAction {
+unsafe fn find_eh_action(context: *mut uw::_Unwind_Context)
+    -> Result<EHAction, ()>
+{
     let lsda = uw::_Unwind_GetLanguageSpecificData(context) as *const u8;
     let mut ip_before_instr: c_int = 0;
     let ip = uw::_Unwind_GetIPInfo(context, &mut ip_before_instr);
@@ -298,10 +309,6 @@ unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: *mut u8) -> ! {
 // with any GCC runtime.
 #[cfg(all(target_os="windows", target_arch = "x86", target_env="gnu"))]
 pub mod eh_frame_registry {
-    #[link(name = "gcc_eh")]
-    #[cfg(not(cargobuild))]
-    extern "C" {}
-
     extern "C" {
         fn __register_frame_info(eh_frame_begin: *const u8, object: *mut u8);
         fn __deregister_frame_info(eh_frame_begin: *const u8, object: *mut u8);

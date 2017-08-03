@@ -9,22 +9,18 @@
 // except according to those terms.
 
 #![crate_name = "rustc_borrowck"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![allow(non_camel_case_types)]
 
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
-#![feature(associated_consts)]
-#![feature(nonzero)]
+
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
 extern crate syntax_pos;
@@ -41,7 +37,7 @@ extern crate core; // for NonZero
 
 pub use borrowck::check_crate;
 pub use borrowck::build_borrowck_dataflow_data_for_fn;
-pub use borrowck::{AnalysisData, BorrowckCtxt, ElaborateDrops};
+pub use borrowck::{AnalysisData, BorrowckCtxt};
 
 // NB: This module needs to be declared first so diagnostics are
 // registered before they are used.
@@ -50,5 +46,7 @@ pub mod diagnostics;
 mod borrowck;
 
 pub mod graphviz;
+
+pub use borrowck::provide;
 
 __build_diagnostic_array! { librustc_borrowck, DIAGNOSTICS }

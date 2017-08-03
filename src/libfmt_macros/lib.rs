@@ -15,7 +15,6 @@
 //! generated instead.
 
 #![crate_name = "fmt_macros"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -23,10 +22,7 @@
        html_root_url = "https://doc.rust-lang.org/nightly/",
        html_playground_url = "https://play.rust-lang.org/",
        test(attr(deny(warnings))))]
-#![cfg_attr(not(stage0), deny(warnings))]
-
-#![feature(staged_api)]
-#![feature(unicode)]
+#![deny(warnings)]
 
 pub use self::Piece::*;
 pub use self::Position::*;

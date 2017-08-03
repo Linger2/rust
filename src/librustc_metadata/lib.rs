@@ -9,32 +9,32 @@
 // except according to those terms.
 
 #![crate_name = "rustc_metadata"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(box_patterns)]
 #![feature(conservative_impl_trait)]
 #![feature(core_intrinsics)]
+#![feature(i128_type)]
 #![feature(proc_macro_internals)]
-#![feature(proc_macro_lib)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(rustc_private)]
 #![feature(specialization)]
-#![feature(staged_api)]
+#![feature(discriminant_value)]
+#![feature(rustc_private)]
 
 #[macro_use]
 extern crate log;
 #[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
-extern crate flate;
+extern crate flate2;
 extern crate serialize as rustc_serialize; // used by deriving
+extern crate owning_ref;
 extern crate rustc_errors as errors;
 extern crate syntax_ext;
 extern crate proc_macro;
@@ -44,9 +44,10 @@ extern crate rustc;
 extern crate rustc_back;
 extern crate rustc_const_math;
 extern crate rustc_data_structures;
-extern crate rustc_llvm;
 
 mod diagnostics;
+
+pub use rustc::middle;
 
 mod astencode;
 mod index_builder;
@@ -54,6 +55,7 @@ mod index;
 mod encoder;
 mod decoder;
 mod cstore_impl;
+mod isolated_encoder;
 mod schema;
 
 pub mod creader;

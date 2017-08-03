@@ -12,16 +12,19 @@
 
 use std::marker::Unsize;
 use std::iter::Extend;
-use std::ptr::{self, drop_in_place};
+use std::ptr::{self, drop_in_place, Shared};
 use std::ops::{Deref, DerefMut, Range};
 use std::hash::{Hash, Hasher};
 use std::slice;
 use std::fmt;
 use std::mem;
+use std::collections::range::RangeArgument;
+use std::collections::Bound::{Excluded, Included, Unbounded};
+use std::mem::ManuallyDrop;
 
 pub unsafe trait Array {
     type Element;
-    type PartialStorage: Default + Unsize<[ManuallyDrop<Self::Element>]>;
+    type PartialStorage: Unsize<[ManuallyDrop<Self::Element>]>;
     const LEN: usize;
 }
 
@@ -37,6 +40,12 @@ unsafe impl<T> Array for [T; 8] {
     const LEN: usize = 8;
 }
 
+unsafe impl<T> Array for [T; 32] {
+    type Element = T;
+    type PartialStorage = [ManuallyDrop<T>; 32];
+    const LEN: usize = 32;
+}
+
 pub struct ArrayVec<A: Array> {
     count: usize,
     values: A::PartialStorage
@@ -49,14 +58,6 @@ impl<A> Hash for ArrayVec<A>
         (&self[..]).hash(state);
     }
 }
-
-impl<A: Array> PartialEq for ArrayVec<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self == other
-    }
-}
-
-impl<A: Array> Eq for ArrayVec<A> {}
 
 impl<A> Clone for ArrayVec<A>
     where A: Array,
@@ -72,7 +73,7 @@ impl<A: Array> ArrayVec<A> {
     pub fn new() -> Self {
         ArrayVec {
             count: 0,
-            values: Default::default(),
+            values: unsafe { ::std::mem::uninitialized() },
         }
     }
 
@@ -87,7 +88,7 @@ impl<A: Array> ArrayVec<A> {
     /// Panics when the stack vector is full.
     pub fn push(&mut self, el: A::Element) {
         let arr = &mut self.values as &mut [ManuallyDrop<_>];
-        arr[self.count] = ManuallyDrop { value: el };
+        arr[self.count] = ManuallyDrop::new(el);
         self.count += 1;
     }
 
@@ -96,11 +97,57 @@ impl<A: Array> ArrayVec<A> {
             let arr = &mut self.values as &mut [ManuallyDrop<_>];
             self.count -= 1;
             unsafe {
-                let value = ptr::read(&arr[self.count]);
-                Some(value.value)
+                let value = ptr::read(&*arr[self.count]);
+                Some(value)
             }
         } else {
             None
+        }
+    }
+
+    pub fn drain<R>(&mut self, range: R) -> Drain<A>
+        where R: RangeArgument<usize>
+    {
+        // Memory safety
+        //
+        // When the Drain is first created, it shortens the length of
+        // the source vector to make sure no uninitalized or moved-from elements
+        // are accessible at all if the Drain's destructor never gets to run.
+        //
+        // Drain will ptr::read out the values to remove.
+        // When finished, remaining tail of the vec is copied back to cover
+        // the hole, and the vector length is restored to the new length.
+        //
+        let len = self.len();
+        let start = match range.start() {
+            Included(&n) => n,
+            Excluded(&n) => n + 1,
+            Unbounded    => 0,
+        };
+        let end = match range.end() {
+            Included(&n) => n + 1,
+            Excluded(&n) => n,
+            Unbounded    => len,
+        };
+        assert!(start <= end);
+        assert!(end <= len);
+
+        unsafe {
+            // set self.vec length's to start, to be safe in case Drain is leaked
+            self.set_len(start);
+            // Use the borrow in the IterMut to indicate borrowing behavior of the
+            // whole Drain iterator (like &mut T).
+            let range_slice = {
+                let arr = &mut self.values as &mut [ManuallyDrop<_>];
+                slice::from_raw_parts_mut(arr.as_mut_ptr().offset(start as isize),
+                                          end - start)
+            };
+            Drain {
+                tail_start: end,
+                tail_len: len - end,
+                iter: range_slice.iter(),
+                array_vec: Shared::from(self),
+            }
         }
     }
 }
@@ -170,12 +217,57 @@ impl<A: Array> Iterator for Iter<A> {
     fn next(&mut self) -> Option<A::Element> {
         let arr = &self.store as &[ManuallyDrop<_>];
         unsafe {
-            self.indices.next().map(|i| ptr::read(&arr[i]).value)
+            self.indices.next().map(|i| ptr::read(&*arr[i]))
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.indices.size_hint()
+    }
+}
+
+pub struct Drain<'a, A: Array>
+        where A::Element: 'a
+{
+    tail_start: usize,
+    tail_len: usize,
+    iter: slice::Iter<'a, ManuallyDrop<A::Element>>,
+    array_vec: Shared<ArrayVec<A>>,
+}
+
+impl<'a, A: Array> Iterator for Drain<'a, A> {
+    type Item = A::Element;
+
+    #[inline]
+    fn next(&mut self) -> Option<A::Element> {
+        self.iter.next().map(|elt| unsafe { ptr::read(&**elt) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<'a, A: Array> Drop for Drain<'a, A> {
+    fn drop(&mut self) {
+        // exhaust self first
+        while let Some(_) = self.next() {}
+
+        if self.tail_len > 0 {
+            unsafe {
+                let source_array_vec = self.array_vec.as_mut();
+                // memmove back untouched tail, update to new length
+                let start = source_array_vec.len();
+                let tail = self.tail_start;
+                {
+                    let mut arr = &mut source_array_vec.values as &mut [ManuallyDrop<_>];
+                    let src = arr.as_ptr().offset(tail as isize);
+                    let dst = arr.as_mut_ptr().offset(start as isize);
+                    ptr::copy(src, dst, self.tail_len);
+                };
+                source_array_vec.set_len(start + self.tail_len);
+            }
+        }
     }
 }
 
@@ -210,26 +302,3 @@ impl<'a, A: Array> IntoIterator for &'a mut ArrayVec<A> {
         self.iter_mut()
     }
 }
-
-// FIXME: This should use repr(transparent) from rust-lang/rfcs#1758.
-#[allow(unions_with_drop_fields)]
-pub union ManuallyDrop<T> {
-    value: T,
-    #[allow(dead_code)]
-    empty: (),
-}
-
-impl<T> ManuallyDrop<T> {
-    fn new() -> ManuallyDrop<T> {
-        ManuallyDrop {
-            empty: ()
-        }
-    }
-}
-
-impl<T> Default for ManuallyDrop<T> {
-    fn default() -> Self {
-        ManuallyDrop::new()
-    }
-}
-

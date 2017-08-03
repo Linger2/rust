@@ -46,6 +46,7 @@ r##"<!DOCTYPE html>
 
     <title>{title}</title>
 
+    <link rel="stylesheet" type="text/css" href="{root_path}normalize.css">
     <link rel="stylesheet" type="text/css" href="{root_path}rustdoc.css">
     <link rel="stylesheet" type="text/css" href="{root_path}main.css">
     {css_extension}
@@ -53,7 +54,7 @@ r##"<!DOCTYPE html>
     {favicon}
     {in_header}
 </head>
-<body class="rustdoc">
+<body class="rustdoc {css_class}">
     <!--[if lte IE 8]>
     <div class="warning">
         This old browser is unsupported and will most likely display funky
@@ -79,7 +80,7 @@ r##"<!DOCTYPE html>
         </form>
     </nav>
 
-    <section id='main' class="content {css_class}">{content}</section>
+    <section id='main' class="content">{content}</section>
     <section id='search' class="content hidden"></section>
 
     <section class="footer"></section>
@@ -136,7 +137,6 @@ r##"<!DOCTYPE html>
         window.rootPath = "{root_path}";
         window.currentCrate = "{krate}";
     </script>
-    <script src="{root_path}jquery.js"></script>
     <script src="{root_path}main.js"></script>
     <script defer src="{root_path}search-index.js"></script>
 </body>

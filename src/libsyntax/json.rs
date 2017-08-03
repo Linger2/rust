@@ -19,7 +19,7 @@
 
 // FIXME spec the JSON output properly.
 
-use codemap::CodeMap;
+use codemap::{CodeMap, FilePathMapping};
 use syntax_pos::{self, MacroBacktrace, Span, SpanLabel, MultiSpan};
 use errors::registry::Registry;
 use errors::{DiagnosticBuilder, SubDiagnostic, RenderSpan, CodeSuggestion, CodeMapper};
@@ -48,7 +48,8 @@ impl JsonEmitter {
     }
 
     pub fn basic() -> JsonEmitter {
-        JsonEmitter::stderr(None, Rc::new(CodeMap::new()))
+        let file_path_mapping = FilePathMapping::empty();
+        JsonEmitter::stderr(None, Rc::new(CodeMap::new(file_path_mapping)))
     }
 
     pub fn new(dst: Box<Write + Send>,
@@ -74,15 +75,15 @@ impl Emitter for JsonEmitter {
 // The following data types are provided just for serialisation.
 
 #[derive(RustcEncodable)]
-struct Diagnostic<'a> {
+struct Diagnostic {
     /// The primary error message.
-    message: &'a str,
+    message: String,
     code: Option<DiagnosticCode>,
     /// "error: internal compiler error", "error", "warning", "note", "help".
     level: &'static str,
     spans: Vec<DiagnosticSpan>,
     /// Associated diagnostic messages.
-    children: Vec<Diagnostic<'a>>,
+    children: Vec<Diagnostic>,
     /// The message as rustc would render it. Currently this is only
     /// `Some` for "suggestions", but eventually it will include all
     /// snippets.
@@ -148,33 +149,44 @@ struct DiagnosticCode {
     explanation: Option<&'static str>,
 }
 
-impl<'a> Diagnostic<'a> {
-    fn from_diagnostic_builder<'c>(db: &'c DiagnosticBuilder,
-                                   je: &JsonEmitter)
-                                   -> Diagnostic<'c> {
+impl Diagnostic {
+    fn from_diagnostic_builder(db: &DiagnosticBuilder,
+                               je: &JsonEmitter)
+                               -> Diagnostic {
+        let sugg = db.suggestions.iter().flat_map(|sugg| {
+            je.render(sugg).into_iter().map(move |rendered| {
+                Diagnostic {
+                    message: sugg.msg.clone(),
+                    code: None,
+                    level: "help",
+                    spans: DiagnosticSpan::from_suggestion(sugg, je),
+                    children: vec![],
+                    rendered: Some(rendered),
+                }
+            })
+        });
         Diagnostic {
-            message: &db.message,
+            message: db.message(),
             code: DiagnosticCode::map_opt_string(db.code.clone(), je),
             level: db.level.to_str(),
             spans: DiagnosticSpan::from_multispan(&db.span, je),
             children: db.children.iter().map(|c| {
                 Diagnostic::from_sub_diagnostic(c, je)
-            }).collect(),
+            }).chain(sugg).collect(),
             rendered: None,
         }
     }
 
-    fn from_sub_diagnostic<'c>(db: &'c SubDiagnostic, je: &JsonEmitter) -> Diagnostic<'c> {
+    fn from_sub_diagnostic(db: &SubDiagnostic, je: &JsonEmitter) -> Diagnostic {
         Diagnostic {
-            message: &db.message,
+            message: db.message(),
             code: None,
             level: db.level.to_str(),
             spans: db.render_span.as_ref()
                      .map(|sp| DiagnosticSpan::from_render_span(sp, je))
                      .unwrap_or_else(|| DiagnosticSpan::from_multispan(&db.span, je)),
             children: vec![],
-            rendered: db.render_span.as_ref()
-                                    .and_then(|rsp| je.render(rsp)),
+            rendered: None,
         }
     }
 }
@@ -202,7 +214,7 @@ impl DiagnosticSpan {
         // backtrace ourselves, but the `macro_backtrace` helper makes
         // some decision, such as dropping some frames, and I don't
         // want to duplicate that logic here.
-        let backtrace = je.cm.macro_backtrace(span).into_iter();
+        let backtrace = span.macro_backtrace().into_iter();
         DiagnosticSpan::from_span_full(span,
                                        is_primary,
                                        label,
@@ -244,8 +256,8 @@ impl DiagnosticSpan {
         });
         DiagnosticSpan {
             file_name: start.file.name.clone(),
-            byte_start: span.lo.0,
-            byte_end: span.hi.0,
+            byte_start: span.lo.0 - start.file.start_pos.0,
+            byte_end: span.hi.0 - start.file.start_pos.0,
             line_start: start.line,
             line_end: end.line,
             column_start: start.col.0 + 1,
@@ -267,14 +279,19 @@ impl DiagnosticSpan {
 
     fn from_suggestion(suggestion: &CodeSuggestion, je: &JsonEmitter)
                        -> Vec<DiagnosticSpan> {
-        assert_eq!(suggestion.msp.span_labels().len(), suggestion.substitutes.len());
-        suggestion.msp.span_labels()
-                      .into_iter()
-                      .zip(&suggestion.substitutes)
-                      .map(|(span_label, suggestion)| {
-                          DiagnosticSpan::from_span_label(span_label,
-                                                          Some(suggestion),
-                                                          je)
+        suggestion.substitution_parts
+                      .iter()
+                      .flat_map(|substitution| {
+                          substitution.substitutions.iter().map(move |suggestion| {
+                              let span_label = SpanLabel {
+                                  span: substitution.span,
+                                  is_primary: true,
+                                  label: None,
+                              };
+                              DiagnosticSpan::from_span_label(span_label,
+                                                              Some(suggestion),
+                                                              je)
+                          })
                       })
                       .collect()
     }
@@ -283,8 +300,9 @@ impl DiagnosticSpan {
         match *rsp {
             RenderSpan::FullSpan(ref msp) =>
                 DiagnosticSpan::from_multispan(msp, je),
-            RenderSpan::Suggestion(ref suggestion) =>
-                DiagnosticSpan::from_suggestion(suggestion, je),
+            // regular diagnostics don't produce this anymore
+            // FIXME(oli_obk): remove it entirely
+            RenderSpan::Suggestion(_) => unreachable!(),
         }
     }
 }
@@ -296,7 +314,7 @@ impl DiagnosticSpanLine {
                          h_end: usize)
                          -> DiagnosticSpanLine {
         DiagnosticSpanLine {
-            text: fm.get_line(index).unwrap().to_owned(),
+            text: fm.get_line(index).map_or(String::new(), |l| l.into_owned()),
             highlight_start: h_start,
             highlight_end: h_end,
         }
@@ -319,7 +337,7 @@ impl DiagnosticSpanLine {
                       })
                      .collect()
              })
-            .unwrap_or(vec![])
+            .unwrap_or_else(|_| vec![])
     }
 }
 
@@ -340,17 +358,7 @@ impl DiagnosticCode {
 }
 
 impl JsonEmitter {
-    fn render(&self, render_span: &RenderSpan) -> Option<String> {
-        use std::borrow::Borrow;
-
-        match *render_span {
-            RenderSpan::FullSpan(_) => {
-                None
-            }
-            RenderSpan::Suggestion(ref suggestion) => {
-                Some(suggestion.splice_lines(self.cm.borrow()))
-            }
-        }
+    fn render(&self, suggestion: &CodeSuggestion) -> Vec<String> {
+        suggestion.splice_lines(&*self.cm).iter().map(|line| line.0.to_owned()).collect()
     }
 }
-

@@ -11,29 +11,31 @@
 use rustc::dep_graph::DepNode;
 use rustc::hir::def_id::DefId;
 use rustc::hir::svh::Svh;
+use rustc::ich::Fingerprint;
+use rustc::middle::cstore::EncodedMetadataHashes;
 use rustc::session::Session;
 use rustc::ty::TyCtxt;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::graph;
+use rustc_data_structures::indexed_vec::IndexVec;
 use rustc_serialize::Encodable as RustcEncodable;
 use rustc_serialize::opaque::Encoder;
-use std::hash::Hash;
 use std::io::{self, Cursor, Write};
 use std::fs::{self, File};
 use std::path::PathBuf;
 
 use IncrementalHashesMap;
-use ich::Fingerprint;
 use super::data::*;
-use super::directory::*;
 use super::hash::*;
 use super::preds::*;
 use super::fs::*;
 use super::dirty_clean;
 use super::file_format;
-use calculate_svh::hasher::IchHasher;
+use super::work_product;
 
 pub fn save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                incremental_hashes_map: &IncrementalHashesMap,
+                                incremental_hashes_map: IncrementalHashesMap,
+                                metadata_hashes: &EncodedMetadataHashes,
                                 svh: Svh) {
     debug!("save_dep_graph()");
     let _ignore = tcx.dep_graph.in_ignore();
@@ -42,26 +44,34 @@ pub fn save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         return;
     }
 
-    let mut builder = DefIdDirectoryBuilder::new(tcx);
     let query = tcx.dep_graph.query();
-    let mut hcx = HashContext::new(tcx, incremental_hashes_map);
+
+    if tcx.sess.opts.debugging_opts.incremental_info {
+        eprintln!("incremental: {} nodes in dep-graph", query.graph.len_nodes());
+        eprintln!("incremental: {} edges in dep-graph", query.graph.len_edges());
+    }
+
+    let mut hcx = HashContext::new(tcx, &incremental_hashes_map);
     let preds = Predecessors::new(&query, &mut hcx);
     let mut current_metadata_hashes = FxHashMap();
 
     // IMPORTANT: We are saving the metadata hashes *before* the dep-graph,
     //            since metadata-encoding might add new entries to the
     //            DefIdDirectory (which is saved in the dep-graph file).
-    save_in(sess,
-            metadata_hash_export_path(sess),
-            |e| encode_metadata_hashes(tcx,
-                                       svh,
-                                       &preds,
-                                       &mut builder,
-                                       &mut current_metadata_hashes,
-                                       e));
+    if sess.opts.debugging_opts.incremental_cc ||
+       sess.opts.debugging_opts.query_dep_graph {
+        save_in(sess,
+                metadata_hash_export_path(sess),
+                |e| encode_metadata_hashes(tcx,
+                                           svh,
+                                           metadata_hashes,
+                                           &mut current_metadata_hashes,
+                                           e));
+    }
+
     save_in(sess,
             dep_graph_path(sess),
-            |e| encode_dep_graph(&preds, &mut builder, e));
+            |e| encode_dep_graph(tcx, &preds, e));
 
     let prev_metadata_hashes = incremental_hashes_map.prev_metadata_hashes.borrow();
     dirty_clean::check_dirty_clean_metadata(tcx,
@@ -78,6 +88,31 @@ pub fn save_work_products(sess: &Session) {
     let _ignore = sess.dep_graph.in_ignore();
     let path = work_products_path(sess);
     save_in(sess, path, |e| encode_work_products(sess, e));
+
+    // We also need to clean out old work-products, as not all of them are
+    // deleted during invalidation. Some object files don't change their
+    // content, they are just not needed anymore.
+    let new_work_products = sess.dep_graph.work_products();
+    let previous_work_products = sess.dep_graph.previous_work_products();
+
+    for (id, wp) in previous_work_products.iter() {
+        if !new_work_products.contains_key(id) {
+            work_product::delete_workproduct_files(sess, wp);
+            debug_assert!(wp.saved_files.iter().all(|&(_, ref file_name)| {
+                !in_incr_comp_dir_sess(sess, file_name).exists()
+            }));
+        }
+    }
+
+    // Check that we did not delete one of the current work-products:
+    debug_assert!({
+        new_work_products.iter()
+                         .flat_map(|(_, wp)| wp.saved_files
+                                               .iter()
+                                               .map(|&(_, ref name)| name))
+                         .map(|name| in_incr_comp_dir_sess(sess, name))
+                         .all(|path| path.exists())
+    });
 }
 
 fn save_in<F>(sess: &Session, path_buf: PathBuf, encode: F)
@@ -131,151 +166,133 @@ fn save_in<F>(sess: &Session, path_buf: PathBuf, encode: F)
     }
 }
 
-pub fn encode_dep_graph(preds: &Predecessors,
-                        builder: &mut DefIdDirectoryBuilder,
+pub fn encode_dep_graph(tcx: TyCtxt,
+                        preds: &Predecessors,
                         encoder: &mut Encoder)
                         -> io::Result<()> {
     // First encode the commandline arguments hash
-    let tcx = builder.tcx();
     tcx.sess.opts.dep_tracking_hash().encode(encoder)?;
 
-    // Create a flat list of (Input, WorkProduct) edges for
-    // serialization.
-    let mut edges = vec![];
-    for (&target, sources) in &preds.inputs {
-        match *target {
-            DepNode::MetaData(ref def_id) => {
-                // Metadata *targets* are always local metadata nodes. We have
-                // already handled those in `encode_metadata_hashes`.
-                assert!(def_id.is_local());
-                continue;
-            }
-            _ => (),
+    // NB: We rely on this Vec being indexable by reduced_graph's NodeIndex.
+    let mut nodes: IndexVec<DepNodeIndex, DepNode> = preds
+        .reduced_graph
+        .all_nodes()
+        .iter()
+        .map(|node| node.data.clone())
+        .collect();
+
+    let mut edge_list_indices = IndexVec::with_capacity(nodes.len());
+    let mut edge_list_data = Vec::with_capacity(preds.reduced_graph.len_edges());
+
+    for node_index in 0 .. nodes.len() {
+        let start = edge_list_data.len() as u32;
+
+        for target in preds.reduced_graph.successor_nodes(graph::NodeIndex(node_index)) {
+            edge_list_data.push(DepNodeIndex::new(target.node_id()));
         }
-        let target = builder.map(target);
-        for &source in sources {
-            let source = builder.map(source);
-            edges.push((source, target.clone()));
+
+        let end = edge_list_data.len() as u32;
+        debug_assert_eq!(node_index, edge_list_indices.len());
+        edge_list_indices.push((start, end));
+    }
+
+    // Let's make sure we had no overflow there.
+    assert!(edge_list_data.len() <= ::std::u32::MAX as usize);
+    // Check that we have a consistent number of edges.
+    assert_eq!(edge_list_data.len(), preds.reduced_graph.len_edges());
+
+    let bootstrap_outputs = preds.bootstrap_outputs
+                                 .iter()
+                                 .map(|dep_node| (**dep_node).clone())
+                                 .collect();
+
+    // Next, build the map of content hashes. To this end, we need to transform
+    // the (DepNode -> Fingerprint) map that we have into a
+    // (DepNodeIndex -> Fingerprint) map. This may necessitate adding nodes back
+    // to the dep-graph that have been filtered out during reduction.
+    let content_hashes = {
+        // We have to build a (DepNode -> DepNodeIndex) map. We over-allocate a
+        // little because we expect some more nodes to be added.
+        let capacity = (nodes.len() * 120) / 100;
+        let mut node_to_index = FxHashMap::with_capacity_and_hasher(capacity,
+                                                                    Default::default());
+        // Add the nodes we already have in the graph.
+        node_to_index.extend(nodes.iter_enumerated()
+                                  .map(|(index, &node)| (node, index)));
+
+        let mut content_hashes = Vec::with_capacity(preds.hashes.len());
+
+        for (&&dep_node, &hash) in preds.hashes.iter() {
+            let dep_node_index = *node_to_index
+                .entry(dep_node)
+                .or_insert_with(|| {
+                    // There is no DepNodeIndex for this DepNode yet. This
+                    // happens when the DepNode got filtered out during graph
+                    // reduction. Since we have a content hash for the DepNode,
+                    // we add it back to the graph.
+                    let next_index = nodes.len();
+                    nodes.push(dep_node);
+
+                    debug_assert_eq!(next_index, edge_list_indices.len());
+                    // Push an empty list of edges
+                    edge_list_indices.push((0,0));
+
+                    DepNodeIndex::new(next_index)
+                });
+
+            content_hashes.push((dep_node_index, hash));
         }
+
+        content_hashes
+    };
+
+    let graph = SerializedDepGraph {
+        nodes,
+        edge_list_indices,
+        edge_list_data,
+        bootstrap_outputs,
+        hashes: content_hashes,
+    };
+
+    // Encode the graph data.
+    graph.encode(encoder)?;
+
+    if tcx.sess.opts.debugging_opts.incremental_info {
+        eprintln!("incremental: {} nodes in reduced dep-graph", graph.nodes.len());
+        eprintln!("incremental: {} edges in serialized dep-graph", graph.edge_list_data.len());
+        eprintln!("incremental: {} hashes in serialized dep-graph", graph.hashes.len());
     }
 
     if tcx.sess.opts.debugging_opts.incremental_dump_hash {
         for (dep_node, hash) in &preds.hashes {
-            println!("HIR hash for {:?} is {}", dep_node, hash);
+            println!("ICH for {:?} is {}", dep_node, hash);
         }
     }
-
-    // Create the serialized dep-graph.
-    let graph = SerializedDepGraph {
-        edges: edges,
-        hashes: preds.hashes
-            .iter()
-            .map(|(&dep_node, &hash)| {
-                SerializedHash {
-                    dep_node: builder.map(dep_node),
-                    hash: hash,
-                }
-            })
-            .collect(),
-    };
-
-    debug!("graph = {:#?}", graph);
-
-    // Encode the directory and then the graph data.
-    builder.directory().encode(encoder)?;
-    graph.encode(encoder)?;
 
     Ok(())
 }
 
 pub fn encode_metadata_hashes(tcx: TyCtxt,
                               svh: Svh,
-                              preds: &Predecessors,
-                              builder: &mut DefIdDirectoryBuilder,
+                              metadata_hashes: &EncodedMetadataHashes,
                               current_metadata_hashes: &mut FxHashMap<DefId, Fingerprint>,
                               encoder: &mut Encoder)
                               -> io::Result<()> {
-    // For each `MetaData(X)` node where `X` is local, accumulate a
-    // hash.  These are the metadata items we export. Downstream
-    // crates will want to see a hash that tells them whether we might
-    // have changed the metadata for a given item since they last
-    // compiled.
-    //
-    // (I initially wrote this with an iterator, but it seemed harder to read.)
+    assert_eq!(metadata_hashes.hashes.len(),
+        metadata_hashes.hashes.iter().map(|x| (x.def_index, ())).collect::<FxHashMap<_,_>>().len());
+
     let mut serialized_hashes = SerializedMetadataHashes {
-        hashes: vec![],
+        entry_hashes: metadata_hashes.hashes.to_vec(),
         index_map: FxHashMap()
     };
 
-    let mut def_id_hashes = FxHashMap();
-
-    for (&target, sources) in &preds.inputs {
-        let def_id = match *target {
-            DepNode::MetaData(def_id) => {
-                assert!(def_id.is_local());
-                def_id
-            }
-            _ => continue,
-        };
-
-        let mut def_id_hash = |def_id: DefId| -> u64 {
-            *def_id_hashes.entry(def_id)
-                .or_insert_with(|| {
-                    let index = builder.add(def_id);
-                    let path = builder.lookup_def_path(index);
-                    path.deterministic_hash(tcx)
-                })
-        };
-
-        // To create the hash for each item `X`, we don't hash the raw
-        // bytes of the metadata (though in principle we
-        // could). Instead, we walk the predecessors of `MetaData(X)`
-        // from the dep-graph. This corresponds to all the inputs that
-        // were read to construct the metadata. To create the hash for
-        // the metadata, we hash (the hash of) all of those inputs.
-        debug!("save: computing metadata hash for {:?}", def_id);
-
-        // Create a vector containing a pair of (source-id, hash).
-        // The source-id is stored as a `DepNode<u64>`, where the u64
-        // is the det. hash of the def-path. This is convenient
-        // because we can sort this to get a stable ordering across
-        // compilations, even if the def-ids themselves have changed.
-        let mut hashes: Vec<(DepNode<u64>, Fingerprint)> = sources.iter()
-            .map(|dep_node| {
-                let hash_dep_node = dep_node.map_def(|&def_id| Some(def_id_hash(def_id))).unwrap();
-                let hash = preds.hashes[dep_node];
-                (hash_dep_node, hash)
-            })
-            .collect();
-
-        hashes.sort();
-        let mut state = IchHasher::new();
-        hashes.hash(&mut state);
-        let hash = state.finish();
-
-        debug!("save: metadata hash for {:?} is {}", def_id, hash);
-
-        if tcx.sess.opts.debugging_opts.incremental_dump_hash {
-            println!("metadata hash for {:?} is {}", def_id, hash);
-            for dep_node in sources {
-                println!("metadata hash for {:?} depends on {:?} with hash {}",
-                         def_id, dep_node, preds.hashes[dep_node]);
-            }
-        }
-
-        serialized_hashes.hashes.push(SerializedMetadataHash {
-            def_index: def_id.index,
-            hash: hash,
-        });
-    }
-
     if tcx.sess.opts.debugging_opts.query_dep_graph {
-        for serialized_hash in &serialized_hashes.hashes {
+        for serialized_hash in &serialized_hashes.entry_hashes {
             let def_id = DefId::local(serialized_hash.def_index);
 
             // Store entry in the index_map
-            let def_path_index = builder.add(def_id);
-            serialized_hashes.index_map.insert(def_id.index, def_path_index);
+            let def_path_hash = tcx.def_path_hash(def_id);
+            serialized_hashes.index_map.insert(def_id.index, def_path_hash);
 
             // Record hash in current_metadata_hashes
             current_metadata_hashes.insert(def_id, serialized_hash.hash);

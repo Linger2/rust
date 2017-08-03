@@ -10,31 +10,31 @@
 
 use eval;
 
-use rustc::middle::const_val::ConstVal;
+use rustc::middle::const_val::{ConstEvalErr, ConstVal};
 use rustc::mir::{Field, BorrowKind, Mutability};
 use rustc::ty::{self, TyCtxt, AdtDef, Ty, Region};
-use rustc::hir::{self, PatKind};
-use rustc::hir::def::Def;
-use rustc::hir::def_id::DefId;
+use rustc::ty::subst::{Substs, Kind};
+use rustc::hir::{self, PatKind, RangeEnd};
+use rustc::hir::def::{Def, CtorKind};
 use rustc::hir::pat_util::EnumerateAndAdjustIterator;
 
 use rustc_data_structures::indexed_vec::Idx;
 
+use std::fmt;
 use syntax::ast;
 use syntax::ptr::P;
 use syntax_pos::Span;
 
 #[derive(Clone, Debug)]
-pub enum PatternError {
+pub enum PatternError<'tcx> {
     StaticInPattern(Span),
-    BadConstInPattern(Span, DefId),
-    ConstEval(eval::ConstEvalErr),
+    ConstEval(ConstEvalErr<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug)]
 pub enum BindingMode<'tcx> {
     ByValue,
-    ByRef(&'tcx Region, BorrowKind),
+    ByRef(Region<'tcx>, BorrowKind),
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +67,7 @@ pub enum PatternKind<'tcx> {
     /// Foo(...) or Foo{...} or Foo, where `Foo` is a variant name from an adt with >1 variants
     Variant {
         adt_def: &'tcx AdtDef,
+        substs: &'tcx Substs<'tcx>,
         variant_index: usize,
         subpatterns: Vec<FieldPattern<'tcx>>,
     },
@@ -82,12 +83,13 @@ pub enum PatternKind<'tcx> {
     },
 
     Constant {
-        value: ConstVal,
+        value: ConstVal<'tcx>,
     },
 
     Range {
-        lo: ConstVal,
-        hi: ConstVal,
+        lo: ConstVal<'tcx>,
+        hi: ConstVal<'tcx>,
+        end: RangeEnd,
     },
 
     /// matches against a slice, checking the length and extracting elements
@@ -105,14 +107,179 @@ pub enum PatternKind<'tcx> {
     },
 }
 
-pub struct PatternContext<'a, 'gcx: 'tcx, 'tcx: 'a> {
-    pub tcx: TyCtxt<'a, 'gcx, 'tcx>,
-    pub errors: Vec<PatternError>,
+fn print_const_val(value: &ConstVal, f: &mut fmt::Formatter) -> fmt::Result {
+    match *value {
+        ConstVal::Float(ref x) => write!(f, "{}", x),
+        ConstVal::Integral(ref i) => write!(f, "{}", i),
+        ConstVal::Str(ref s) => write!(f, "{:?}", &s[..]),
+        ConstVal::ByteStr(ref b) => write!(f, "{:?}", &b[..]),
+        ConstVal::Bool(b) => write!(f, "{:?}", b),
+        ConstVal::Char(c) => write!(f, "{:?}", c),
+        ConstVal::Variant(_) |
+        ConstVal::Struct(_) |
+        ConstVal::Tuple(_) |
+        ConstVal::Function(..) |
+        ConstVal::Array(..) |
+        ConstVal::Repeat(..) => bug!("{:?} not printable in a pattern", value)
+    }
 }
 
-impl<'a, 'gcx, 'tcx> Pattern<'tcx> {
-    pub fn from_hir(tcx: TyCtxt<'a, 'gcx, 'tcx>, pat: &hir::Pat) -> Self {
-        let mut pcx = PatternContext::new(tcx);
+impl<'tcx> fmt::Display for Pattern<'tcx> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self.kind {
+            PatternKind::Wild => write!(f, "_"),
+            PatternKind::Binding { mutability, name, mode, ref subpattern, .. } => {
+                let is_mut = match mode {
+                    BindingMode::ByValue => mutability == Mutability::Mut,
+                    BindingMode::ByRef(_, bk) => {
+                        write!(f, "ref ")?;
+                        bk == BorrowKind::Mut
+                    }
+                };
+                if is_mut {
+                    write!(f, "mut ")?;
+                }
+                write!(f, "{}", name)?;
+                if let Some(ref subpattern) = *subpattern {
+                    write!(f, " @ {}", subpattern)?;
+                }
+                Ok(())
+            }
+            PatternKind::Variant { ref subpatterns, .. } |
+            PatternKind::Leaf { ref subpatterns } => {
+                let variant = match *self.kind {
+                    PatternKind::Variant { adt_def, variant_index, .. } => {
+                        Some(&adt_def.variants[variant_index])
+                    }
+                    _ => if let ty::TyAdt(adt, _) = self.ty.sty {
+                        if adt.is_univariant() {
+                            Some(&adt.variants[0])
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let mut first = true;
+                let mut start_or_continue = || if first { first = false; "" } else { ", " };
+
+                if let Some(variant) = variant {
+                    write!(f, "{}", variant.name)?;
+
+                    // Only for TyAdt we can have `S {...}`,
+                    // which we handle separately here.
+                    if variant.ctor_kind == CtorKind::Fictive {
+                        write!(f, " {{ ")?;
+
+                        let mut printed = 0;
+                        for p in subpatterns {
+                            if let PatternKind::Wild = *p.pattern.kind {
+                                continue;
+                            }
+                            let name = variant.fields[p.field.index()].name;
+                            write!(f, "{}{}: {}", start_or_continue(), name, p.pattern)?;
+                            printed += 1;
+                        }
+
+                        if printed < variant.fields.len() {
+                            write!(f, "{}..", start_or_continue())?;
+                        }
+
+                        return write!(f, " }}");
+                    }
+                }
+
+                let num_fields = variant.map_or(subpatterns.len(), |v| v.fields.len());
+                if num_fields != 0 || variant.is_none() {
+                    write!(f, "(")?;
+                    for i in 0..num_fields {
+                        write!(f, "{}", start_or_continue())?;
+
+                        // Common case: the field is where we expect it.
+                        if let Some(p) = subpatterns.get(i) {
+                            if p.field.index() == i {
+                                write!(f, "{}", p.pattern)?;
+                                continue;
+                            }
+                        }
+
+                        // Otherwise, we have to go looking for it.
+                        if let Some(p) = subpatterns.iter().find(|p| p.field.index() == i) {
+                            write!(f, "{}", p.pattern)?;
+                        } else {
+                            write!(f, "_")?;
+                        }
+                    }
+                    write!(f, ")")?;
+                }
+
+                Ok(())
+            }
+            PatternKind::Deref { ref subpattern } => {
+                match self.ty.sty {
+                    ty::TyAdt(def, _) if def.is_box() => write!(f, "box ")?,
+                    ty::TyRef(_, mt) => {
+                        write!(f, "&")?;
+                        if mt.mutbl == hir::MutMutable {
+                            write!(f, "mut ")?;
+                        }
+                    }
+                    _ => bug!("{} is a bad Deref pattern type", self.ty)
+                }
+                write!(f, "{}", subpattern)
+            }
+            PatternKind::Constant { ref value } => {
+                print_const_val(value, f)
+            }
+            PatternKind::Range { ref lo, ref hi, ref end } => {
+                print_const_val(lo, f)?;
+                match *end {
+                    RangeEnd::Included => write!(f, "...")?,
+                    RangeEnd::Excluded => write!(f, "..")?,
+                }
+                print_const_val(hi, f)
+            }
+            PatternKind::Slice { ref prefix, ref slice, ref suffix } |
+            PatternKind::Array { ref prefix, ref slice, ref suffix } => {
+                let mut first = true;
+                let mut start_or_continue = || if first { first = false; "" } else { ", " };
+                write!(f, "[")?;
+                for p in prefix {
+                    write!(f, "{}{}", start_or_continue(), p)?;
+                }
+                if let Some(ref slice) = *slice {
+                    write!(f, "{}", start_or_continue())?;
+                    match *slice.kind {
+                        PatternKind::Wild => {}
+                        _ => write!(f, "{}", slice)?
+                    }
+                    write!(f, "..")?;
+                }
+                for p in suffix {
+                    write!(f, "{}{}", start_or_continue(), p)?;
+                }
+                write!(f, "]")
+            }
+        }
+    }
+}
+
+pub struct PatternContext<'a, 'tcx: 'a> {
+    pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    pub param_env: ty::ParamEnv<'tcx>,
+    pub tables: &'a ty::TypeckTables<'tcx>,
+    pub substs: &'tcx Substs<'tcx>,
+    pub errors: Vec<PatternError<'tcx>>,
+}
+
+impl<'a, 'tcx> Pattern<'tcx> {
+    pub fn from_hir(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                    param_env_and_substs: ty::ParamEnvAnd<'tcx, &'tcx Substs<'tcx>>,
+                    tables: &'a ty::TypeckTables<'tcx>,
+                    pat: &hir::Pat) -> Self {
+        let mut pcx = PatternContext::new(tcx, param_env_and_substs, tables);
         let result = pcx.lower_pattern(pat);
         if !pcx.errors.is_empty() {
             span_bug!(pat.span, "encountered errors lowering pattern: {:?}", pcx.errors)
@@ -122,75 +289,39 @@ impl<'a, 'gcx, 'tcx> Pattern<'tcx> {
     }
 }
 
-impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
-    pub fn new(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Self {
-        PatternContext { tcx: tcx, errors: vec![] }
+impl<'a, 'tcx> PatternContext<'a, 'tcx> {
+    pub fn new(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+               param_env_and_substs: ty::ParamEnvAnd<'tcx, &'tcx Substs<'tcx>>,
+               tables: &'a ty::TypeckTables<'tcx>) -> Self {
+        PatternContext {
+            tcx,
+            param_env: param_env_and_substs.param_env,
+            tables,
+            substs: param_env_and_substs.value,
+            errors: vec![]
+        }
     }
 
     pub fn lower_pattern(&mut self, pat: &hir::Pat) -> Pattern<'tcx> {
-        let mut ty = self.tcx.tables().node_id_to_type(pat.id);
+        let mut ty = self.tables.node_id_to_type(pat.id);
 
         let kind = match pat.node {
             PatKind::Wild => PatternKind::Wild,
 
-            PatKind::Lit(ref value) => {
-                match eval::eval_const_expr_checked(self.tcx.global_tcx(), value) {
-                    Ok(value) => {
-                        PatternKind::Constant { value: value }
+            PatKind::Lit(ref value) => self.lower_lit(value),
+
+            PatKind::Range(ref lo, ref hi, ref end) => {
+                match (self.lower_lit(lo), self.lower_lit(hi)) {
+                    (PatternKind::Constant { value: lo },
+                     PatternKind::Constant { value: hi }) => {
+                        PatternKind::Range { lo: lo, hi: hi, end: end.clone() }
                     }
-                    Err(e) => {
-                        self.errors.push(PatternError::ConstEval(e));
-                        PatternKind::Wild
-                    }
-                }
-            }
-
-            PatKind::Range(ref lo, ref hi) => {
-                let r_lo = eval::eval_const_expr_checked(self.tcx.global_tcx(), lo);
-                if let Err(ref e_lo) = r_lo {
-                    self.errors.push(PatternError::ConstEval(e_lo.clone()));
-                }
-
-                let r_hi = eval::eval_const_expr_checked(self.tcx.global_tcx(), hi);
-                if let Err(ref e_hi) = r_hi {
-                    self.errors.push(PatternError::ConstEval(e_hi.clone()));
-                }
-
-                if let (Ok(lo), Ok(hi)) = (r_lo, r_hi) {
-                    PatternKind::Range { lo: lo, hi: hi }
-                } else {
-                    PatternKind::Wild
+                    _ => PatternKind::Wild
                 }
             }
 
             PatKind::Path(ref qpath) => {
-                let def = self.tcx.tables().qpath_def(qpath, pat.id);
-                match def {
-                    Def::Const(def_id) | Def::AssociatedConst(def_id) => {
-                        let tcx = self.tcx.global_tcx();
-                        let substs = tcx.tables().node_id_item_substs(pat.id)
-                            .unwrap_or_else(|| tcx.intern_substs(&[]));
-                        match eval::lookup_const_by_id(tcx, def_id, Some(substs)) {
-                            Some((const_expr, _const_ty)) => {
-                                match eval::const_expr_to_pat(
-                                    tcx, const_expr, pat.id, pat.span)
-                                {
-                                    Ok(pat) => return self.lower_pattern(&pat),
-                                    Err(_) => {
-                                        self.errors.push(PatternError::BadConstInPattern(
-                                            pat.span, def_id));
-                                        PatternKind::Wild
-                                    }
-                                }
-                            }
-                            None => {
-                                self.errors.push(PatternError::StaticInPattern(pat.span));
-                                PatternKind::Wild
-                            }
-                        }
-                    }
-                    _ => self.lower_variant_or_leaf(def, vec![])
-                }
+                return self.lower_path(qpath, pat.id, pat.id, pat.span);
             }
 
             PatKind::Ref(ref subpattern, _) |
@@ -199,7 +330,7 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
             }
 
             PatKind::Slice(ref prefix, ref slice, ref suffix) => {
-                let ty = self.tcx.tables().node_id_to_type(pat.id);
+                let ty = self.tables.node_id_to_type(pat.id);
                 match ty.sty {
                     ty::TyRef(_, mt) =>
                         PatternKind::Deref {
@@ -224,9 +355,9 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
             }
 
             PatKind::Tuple(ref subpatterns, ddpos) => {
-                let ty = self.tcx.tables().node_id_to_type(pat.id);
+                let ty = self.tables.node_id_to_type(pat.id);
                 match ty.sty {
-                    ty::TyTuple(ref tys) => {
+                    ty::TyTuple(ref tys, _) => {
                         let subpatterns =
                             subpatterns.iter()
                                        .enumerate_and_adjust(tys.len(), ddpos)
@@ -243,27 +374,31 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
                 }
             }
 
-            PatKind::Binding(bm, def_id, ref ident, ref sub) => {
-                let id = self.tcx.map.as_local_node_id(def_id).unwrap();
-                let var_ty = self.tcx.tables().node_id_to_type(pat.id);
+            PatKind::Binding(_, def_id, ref ident, ref sub) => {
+                let id = self.tcx.hir.as_local_node_id(def_id).unwrap();
+                let var_ty = self.tables.node_id_to_type(pat.id);
                 let region = match var_ty.sty {
                     ty::TyRef(r, _) => Some(r),
                     _ => None,
                 };
+                let bm = *self.tables.pat_binding_modes.get(&pat.id)
+                                                       .expect("missing binding mode");
                 let (mutability, mode) = match bm {
-                    hir::BindByValue(hir::MutMutable) =>
+                    ty::BindByValue(hir::MutMutable) =>
                         (Mutability::Mut, BindingMode::ByValue),
-                    hir::BindByValue(hir::MutImmutable) =>
+                    ty::BindByValue(hir::MutImmutable) =>
                         (Mutability::Not, BindingMode::ByValue),
-                    hir::BindByRef(hir::MutMutable) =>
-                        (Mutability::Not, BindingMode::ByRef(region.unwrap(), BorrowKind::Mut)),
-                    hir::BindByRef(hir::MutImmutable) =>
-                        (Mutability::Not, BindingMode::ByRef(region.unwrap(), BorrowKind::Shared)),
+                    ty::BindByReference(hir::MutMutable) =>
+                        (Mutability::Not, BindingMode::ByRef(
+                            region.unwrap(), BorrowKind::Mut)),
+                    ty::BindByReference(hir::MutImmutable) =>
+                        (Mutability::Not, BindingMode::ByRef(
+                            region.unwrap(), BorrowKind::Shared)),
                 };
 
                 // A ref x pattern is the same node used for x, and as such it has
                 // x's type, which is &T, where we want T (the type being matched).
-                if let hir::BindByRef(_) = bm {
+                if let ty::BindByReference(_) = bm {
                     if let ty::TyRef(_, mt) = ty.sty {
                         ty = mt.ty;
                     } else {
@@ -282,9 +417,8 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
             }
 
             PatKind::TupleStruct(ref qpath, ref subpatterns, ddpos) => {
-                let def = self.tcx.tables().qpath_def(qpath, pat.id);
-                let pat_ty = self.tcx.tables().node_id_to_type(pat.id);
-                let adt_def = match pat_ty.sty {
+                let def = self.tables.qpath_def(qpath, pat.id);
+                let adt_def = match ty.sty {
                     ty::TyAdt(adt_def, _) => adt_def,
                     _ => span_bug!(pat.span, "tuple struct pattern not applied to an ADT"),
                 };
@@ -298,13 +432,12 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
                                        pattern: self.lower_pattern(field),
                                    })
                                    .collect();
-                self.lower_variant_or_leaf(def, subpatterns)
+                self.lower_variant_or_leaf(def, ty, subpatterns)
             }
 
             PatKind::Struct(ref qpath, ref fields, _) => {
-                let def = self.tcx.tables().qpath_def(qpath, pat.id);
-                let pat_ty = self.tcx.tables().node_id_to_type(pat.id);
-                let adt_def = match pat_ty.sty {
+                let def = self.tables.qpath_def(qpath, pat.id);
+                let adt_def = match ty.sty {
                     ty::TyAdt(adt_def, _) => adt_def,
                     _ => {
                         span_bug!(
@@ -331,7 +464,7 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
                           })
                           .collect();
 
-                self.lower_variant_or_leaf(def, subpatterns)
+                self.lower_variant_or_leaf(def, ty, subpatterns)
             }
         };
 
@@ -421,16 +554,23 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
     fn lower_variant_or_leaf(
         &mut self,
         def: Def,
+        ty: Ty<'tcx>,
         subpatterns: Vec<FieldPattern<'tcx>>)
         -> PatternKind<'tcx>
     {
         match def {
             Def::Variant(variant_id) | Def::VariantCtor(variant_id, ..) => {
                 let enum_id = self.tcx.parent_def_id(variant_id).unwrap();
-                let adt_def = self.tcx.lookup_adt_def(enum_id);
+                let adt_def = self.tcx.adt_def(enum_id);
                 if adt_def.variants.len() > 1 {
+                    let substs = match ty.sty {
+                        ty::TyAdt(_, substs) |
+                        ty::TyFnDef(_, substs) => substs,
+                        _ => bug!("inappropriate type for def: {:?}", ty.sty),
+                    };
                     PatternKind::Variant {
                         adt_def: adt_def,
+                        substs: substs,
                         variant_index: adt_def.variant_index_with_id(variant_id),
                         subpatterns: subpatterns,
                     }
@@ -445,6 +585,186 @@ impl<'a, 'gcx, 'tcx> PatternContext<'a, 'gcx, 'tcx> {
             }
 
             _ => bug!()
+        }
+    }
+
+    fn lower_path(&mut self,
+                  qpath: &hir::QPath,
+                  id: ast::NodeId,
+                  pat_id: ast::NodeId,
+                  span: Span)
+                  -> Pattern<'tcx> {
+        let ty = self.tables.node_id_to_type(id);
+        let def = self.tables.qpath_def(qpath, id);
+        let kind = match def {
+            Def::Const(def_id) | Def::AssociatedConst(def_id) => {
+                let substs = self.tables.node_substs(id);
+                match eval::lookup_const_by_id(self.tcx, self.param_env.and((def_id, substs))) {
+                    Some((def_id, substs)) => {
+                        // Enter the inlined constant's tables&substs temporarily.
+                        let old_tables = self.tables;
+                        let old_substs = self.substs;
+                        self.tables = self.tcx.typeck_tables_of(def_id);
+                        self.substs = substs;
+                        let body = if let Some(id) = self.tcx.hir.as_local_node_id(def_id) {
+                            self.tcx.hir.body(self.tcx.hir.body_owned_by(id))
+                        } else {
+                            self.tcx.sess.cstore.item_body(self.tcx, def_id)
+                        };
+                        let pat = self.lower_const_expr(&body.value, pat_id, span);
+                        self.tables = old_tables;
+                        self.substs = old_substs;
+                        return pat;
+                    }
+                    None => {
+                        self.errors.push(PatternError::StaticInPattern(span));
+                        PatternKind::Wild
+                    }
+                }
+            }
+            _ => self.lower_variant_or_leaf(def, ty, vec![]),
+        };
+
+        Pattern {
+            span: span,
+            ty: ty,
+            kind: Box::new(kind),
+        }
+    }
+
+    fn lower_lit(&mut self, expr: &hir::Expr) -> PatternKind<'tcx> {
+        let const_cx = eval::ConstContext::new(self.tcx,
+                                               self.param_env.and(self.substs),
+                                               self.tables);
+        match const_cx.eval(expr) {
+            Ok(value) => {
+                if let ConstVal::Variant(def_id) = value {
+                    let ty = self.tables.expr_ty(expr);
+                    self.lower_variant_or_leaf(Def::Variant(def_id), ty, vec![])
+                } else {
+                    PatternKind::Constant { value: value }
+                }
+            }
+            Err(e) => {
+                self.errors.push(PatternError::ConstEval(e));
+                PatternKind::Wild
+            }
+        }
+    }
+
+    fn lower_const_expr(&mut self,
+                        expr: &hir::Expr,
+                        pat_id: ast::NodeId,
+                        span: Span)
+                        -> Pattern<'tcx> {
+        let pat_ty = self.tables.expr_ty(expr);
+        debug!("expr={:?} pat_ty={:?} pat_id={}", expr, pat_ty, pat_id);
+        match pat_ty.sty {
+            ty::TyFloat(_) => {
+                self.tcx.sess.span_err(span, "floating point constants cannot be used in patterns");
+            }
+            ty::TyAdt(adt_def, _) if adt_def.is_union() => {
+                // Matching on union fields is unsafe, we can't hide it in constants
+                self.tcx.sess.span_err(span, "cannot use unions in constant patterns");
+            }
+            ty::TyAdt(adt_def, _) => {
+                if !self.tcx.has_attr(adt_def.did, "structural_match") {
+                    let msg = format!("to use a constant of type `{}` in a pattern, \
+                                       `{}` must be annotated with `#[derive(PartialEq, Eq)]`",
+                                      self.tcx.item_path_str(adt_def.did),
+                                      self.tcx.item_path_str(adt_def.did));
+                    self.tcx.sess.span_err(span, &msg);
+                }
+            }
+            _ => { }
+        }
+        let kind = match expr.node {
+            hir::ExprTup(ref exprs) => {
+                PatternKind::Leaf {
+                    subpatterns: exprs.iter().enumerate().map(|(i, expr)| {
+                        FieldPattern {
+                            field: Field::new(i),
+                            pattern: self.lower_const_expr(expr, pat_id, span)
+                        }
+                    }).collect()
+                }
+            }
+
+            hir::ExprCall(ref callee, ref args) => {
+                let qpath = match callee.node {
+                    hir::ExprPath(ref qpath) => qpath,
+                    _ => bug!()
+                };
+                let ty = self.tables.node_id_to_type(callee.id);
+                let def = self.tables.qpath_def(qpath, callee.id);
+                match def {
+                    Def::Fn(..) | Def::Method(..) => self.lower_lit(expr),
+                    _ => {
+                        let subpatterns = args.iter().enumerate().map(|(i, expr)| {
+                            FieldPattern {
+                                field: Field::new(i),
+                                pattern: self.lower_const_expr(expr, pat_id, span)
+                            }
+                        }).collect();
+                        self.lower_variant_or_leaf(def, ty, subpatterns)
+                    }
+                }
+            }
+
+            hir::ExprStruct(ref qpath, ref fields, None) => {
+                let def = self.tables.qpath_def(qpath, expr.id);
+                let adt_def = match pat_ty.sty {
+                    ty::TyAdt(adt_def, _) => adt_def,
+                    _ => {
+                        span_bug!(
+                            expr.span,
+                            "struct expr without ADT type");
+                    }
+                };
+                let variant_def = adt_def.variant_of_def(def);
+
+                let subpatterns =
+                    fields.iter()
+                          .map(|field| {
+                              let index = variant_def.index_of_field_named(field.name.node);
+                              let index = index.unwrap_or_else(|| {
+                                  span_bug!(
+                                      expr.span,
+                                      "no field with name {:?}",
+                                      field.name);
+                              });
+                              FieldPattern {
+                                  field: Field::new(index),
+                                  pattern: self.lower_const_expr(&field.expr, pat_id, span),
+                              }
+                          })
+                          .collect();
+
+                self.lower_variant_or_leaf(def, pat_ty, subpatterns)
+            }
+
+            hir::ExprArray(ref exprs) => {
+                let pats = exprs.iter()
+                                .map(|expr| self.lower_const_expr(expr, pat_id, span))
+                                .collect();
+                PatternKind::Array {
+                    prefix: pats,
+                    slice: None,
+                    suffix: vec![]
+                }
+            }
+
+            hir::ExprPath(ref qpath) => {
+                return self.lower_path(qpath, expr.id, pat_id, span);
+            }
+
+            _ => self.lower_lit(expr)
+        };
+
+        Pattern {
+            span: span,
+            ty: pat_ty,
+            kind: Box::new(kind),
         }
     }
 }
@@ -500,8 +820,9 @@ macro_rules! CloneImpls {
 }
 
 CloneImpls!{ <'tcx>
-    Span, Field, Mutability, ast::Name, ast::NodeId, usize, ConstVal,
-    Ty<'tcx>, BindingMode<'tcx>, &'tcx AdtDef
+    Span, Field, Mutability, ast::Name, ast::NodeId, usize, ConstVal<'tcx>, Region<'tcx>,
+    Ty<'tcx>, BindingMode<'tcx>, &'tcx AdtDef,
+    &'tcx Substs<'tcx>, &'tcx Kind<'tcx>
 }
 
 impl<'tcx> PatternFoldable<'tcx> for FieldPattern<'tcx> {
@@ -552,10 +873,12 @@ impl<'tcx> PatternFoldable<'tcx> for PatternKind<'tcx> {
             },
             PatternKind::Variant {
                 adt_def,
+                substs,
                 variant_index,
                 ref subpatterns,
             } => PatternKind::Variant {
                 adt_def: adt_def.fold_with(folder),
+                substs: substs.fold_with(folder),
                 variant_index: variant_index.fold_with(folder),
                 subpatterns: subpatterns.fold_with(folder)
             },
@@ -576,10 +899,12 @@ impl<'tcx> PatternFoldable<'tcx> for PatternKind<'tcx> {
             },
             PatternKind::Range {
                 ref lo,
-                ref hi
+                ref hi,
+                ref end,
             } => PatternKind::Range {
                 lo: lo.fold_with(folder),
-                hi: hi.fold_with(folder)
+                hi: hi.fold_with(folder),
+                end: end.clone(),
             },
             PatternKind::Slice {
                 ref prefix,

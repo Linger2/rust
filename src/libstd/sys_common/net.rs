@@ -91,7 +91,7 @@ fn sockname<F>(f: F) -> io::Result<SocketAddr>
     }
 }
 
-fn sockaddr_to_addr(storage: &c::sockaddr_storage,
+pub fn sockaddr_to_addr(storage: &c::sockaddr_storage,
                     len: usize) -> io::Result<SocketAddr> {
     match storage.ss_family as c_int {
         c::AF_INET => {
@@ -177,9 +177,22 @@ pub fn lookup_host(host: &str) -> io::Result<LookupHost> {
     };
     let mut res = ptr::null_mut();
     unsafe {
-        cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints,
-                               &mut res))?;
-        Ok(LookupHost { original: res, cur: res })
+        match cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints, &mut res)) {
+            Ok(_) => {
+                Ok(LookupHost { original: res, cur: res })
+            },
+            #[cfg(unix)]
+            Err(e) => {
+                // The lookup failure could be caused by using a stale /etc/resolv.conf.
+                // See https://github.com/rust-lang/rust/issues/41570.
+                // We therefore force a reload of the nameserver information.
+                c::res_init();
+                Err(e)
+            },
+            // the cfg is needed here to avoid an "unreachable pattern" warning
+            #[cfg(not(unix))]
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -199,6 +212,14 @@ impl TcpStream {
 
         let (addrp, len) = addr.into_inner();
         cvt_r(|| unsafe { c::connect(*sock.as_inner(), addrp, len) })?;
+        Ok(TcpStream { inner: sock })
+    }
+
+    pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+        init();
+
+        let sock = Socket::new(addr, c::SOCK_STREAM)?;
+        sock.connect_timeout(addr, timeout)?;
         Ok(TcpStream { inner: sock })
     }
 
@@ -222,12 +243,12 @@ impl TcpStream {
         self.inner.timeout(c::SO_SNDTIMEO)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.peek(buf)
     }
 
-    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.inner.read_to_end(buf)
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -335,7 +356,7 @@ impl TcpListener {
 
         // Bind our new socket
         let (addrp, len) = addr.into_inner();
-        cvt(unsafe { c::bind(*sock.as_inner(), addrp, len) })?;
+        cvt(unsafe { c::bind(*sock.as_inner(), addrp, len as _) })?;
 
         // Start listening
         cvt(unsafe { c::listen(*sock.as_inner(), 128) })?;
@@ -426,7 +447,7 @@ impl UdpSocket {
 
         let sock = Socket::new(addr, c::SOCK_DGRAM)?;
         let (addrp, len) = addr.into_inner();
-        cvt(unsafe { c::bind(*sock.as_inner(), addrp, len) })?;
+        cvt(unsafe { c::bind(*sock.as_inner(), addrp, len as _) })?;
         Ok(UdpSocket { inner: sock })
     }
 
@@ -441,17 +462,11 @@ impl UdpSocket {
     }
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut storage: c::sockaddr_storage = unsafe { mem::zeroed() };
-        let mut addrlen = mem::size_of_val(&storage) as c::socklen_t;
-        let len = cmp::min(buf.len(), <wrlen_t>::max_value() as usize) as wrlen_t;
+        self.inner.recv_from(buf)
+    }
 
-        let n = cvt(unsafe {
-            c::recvfrom(*self.inner.as_inner(),
-                        buf.as_mut_ptr() as *mut c_void,
-                        len, 0,
-                        &mut storage as *mut _ as *mut _, &mut addrlen)
-        })?;
-        Ok((n as usize, sockaddr_to_addr(&storage, addrlen as usize)?))
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.peek_from(buf)
     }
 
     pub fn send_to(&self, buf: &[u8], dst: &SocketAddr) -> io::Result<usize> {
@@ -576,6 +591,10 @@ impl UdpSocket {
 
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
+    }
+
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.peek(buf)
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {

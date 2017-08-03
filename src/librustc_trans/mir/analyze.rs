@@ -13,34 +13,33 @@
 
 use rustc_data_structures::bitvec::BitVector;
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
-use rustc::mir::{self, Location, TerminatorKind};
+use rustc::middle::const_val::ConstVal;
+use rustc::mir::{self, Location, TerminatorKind, Literal};
 use rustc::mir::visit::{Visitor, LvalueContext};
 use rustc::mir::traversal;
-use common::{self, Block, BlockAndBuilder};
-use glue;
-use super::rvalue;
+use common;
+use super::MirContext;
 
-pub fn lvalue_locals<'bcx, 'tcx>(bcx: Block<'bcx,'tcx>,
-                                 mir: &mir::Mir<'tcx>) -> BitVector {
-    let bcx = bcx.build();
-    let mut analyzer = LocalAnalyzer::new(mir, &bcx);
+pub fn lvalue_locals<'a, 'tcx>(mircx: &MirContext<'a, 'tcx>) -> BitVector {
+    let mir = mircx.mir;
+    let mut analyzer = LocalAnalyzer::new(mircx);
 
     analyzer.visit_mir(mir);
 
     for (index, ty) in mir.local_decls.iter().map(|l| l.ty).enumerate() {
-        let ty = bcx.monomorphize(&ty);
+        let ty = mircx.monomorphize(&ty);
         debug!("local {} has type {:?}", index, ty);
         if ty.is_scalar() ||
-            ty.is_unique() ||
+            ty.is_box() ||
             ty.is_region_ptr() ||
             ty.is_simd() ||
-            common::type_is_zero_size(bcx.ccx(), ty)
+            common::type_is_zero_size(mircx.ccx, ty)
         {
             // These sorts of types are immediates that we can store
             // in an ValueRef without an alloca.
-            assert!(common::type_is_immediate(bcx.ccx(), ty) ||
-                    common::type_is_fat_ptr(bcx.tcx(), ty));
-        } else if common::type_is_imm_pair(bcx.ccx(), ty) {
+            assert!(common::type_is_immediate(mircx.ccx, ty) ||
+                    common::type_is_fat_ptr(mircx.ccx, ty));
+        } else if common::type_is_imm_pair(mircx.ccx, ty) {
             // We allow pairs and uses of any of their 2 fields.
         } else {
             // These sorts of types require an alloca. Note that
@@ -56,22 +55,18 @@ pub fn lvalue_locals<'bcx, 'tcx>(bcx: Block<'bcx,'tcx>,
     analyzer.lvalue_locals
 }
 
-struct LocalAnalyzer<'mir, 'bcx: 'mir, 'tcx: 'bcx> {
-    mir: &'mir mir::Mir<'tcx>,
-    bcx: &'mir BlockAndBuilder<'bcx, 'tcx>,
+struct LocalAnalyzer<'mir, 'a: 'mir, 'tcx: 'a> {
+    cx: &'mir MirContext<'a, 'tcx>,
     lvalue_locals: BitVector,
     seen_assigned: BitVector
 }
 
-impl<'mir, 'bcx, 'tcx> LocalAnalyzer<'mir, 'bcx, 'tcx> {
-    fn new(mir: &'mir mir::Mir<'tcx>,
-           bcx: &'mir BlockAndBuilder<'bcx, 'tcx>)
-           -> LocalAnalyzer<'mir, 'bcx, 'tcx> {
+impl<'mir, 'a, 'tcx> LocalAnalyzer<'mir, 'a, 'tcx> {
+    fn new(mircx: &'mir MirContext<'a, 'tcx>) -> LocalAnalyzer<'mir, 'a, 'tcx> {
         LocalAnalyzer {
-            mir: mir,
-            bcx: bcx,
-            lvalue_locals: BitVector::new(mir.local_decls.len()),
-            seen_assigned: BitVector::new(mir.local_decls.len())
+            cx: mircx,
+            lvalue_locals: BitVector::new(mircx.mir.local_decls.len()),
+            seen_assigned: BitVector::new(mircx.mir.local_decls.len())
         }
     }
 
@@ -87,7 +82,7 @@ impl<'mir, 'bcx, 'tcx> LocalAnalyzer<'mir, 'bcx, 'tcx> {
     }
 }
 
-impl<'mir, 'bcx, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'bcx, 'tcx> {
+impl<'mir, 'a, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'a, 'tcx> {
     fn visit_assign(&mut self,
                     block: mir::BasicBlock,
                     lvalue: &mir::Lvalue<'tcx>,
@@ -97,7 +92,7 @@ impl<'mir, 'bcx, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'bcx, 'tcx> {
 
         if let mir::Lvalue::Local(index) = *lvalue {
             self.mark_assigned(index);
-            if !rvalue::rvalue_creates_operand(self.mir, self.bcx, rvalue) {
+            if !self.cx.rvalue_creates_operand(rvalue) {
                 self.mark_as_lvalue(index);
             }
         } else {
@@ -113,11 +108,13 @@ impl<'mir, 'bcx, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'bcx, 'tcx> {
                              location: Location) {
         match *kind {
             mir::TerminatorKind::Call {
-                func: mir::Operand::Constant(mir::Constant {
-                    literal: mir::Literal::Item { def_id, .. }, ..
+                func: mir::Operand::Constant(box mir::Constant {
+                    literal: Literal::Value {
+                        value: ConstVal::Function(def_id, _), ..
+                    }, ..
                 }),
                 ref args, ..
-            } if Some(def_id) == self.bcx.tcx().lang_items.box_free_fn() => {
+            } if Some(def_id) == self.cx.ccx.tcx().lang_items.box_free_fn() => {
                 // box_free(x) shares with `drop x` the property that it
                 // is not guaranteed to be statically dominated by the
                 // definition of x, so x must always be in an alloca.
@@ -140,10 +137,10 @@ impl<'mir, 'bcx, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'bcx, 'tcx> {
         // Allow uses of projections of immediate pair fields.
         if let mir::Lvalue::Projection(ref proj) = *lvalue {
             if let mir::Lvalue::Local(_) = proj.base {
-                let ty = proj.base.ty(self.mir, self.bcx.tcx());
+                let ty = proj.base.ty(self.cx.mir, self.cx.ccx.tcx());
 
-                let ty = self.bcx.monomorphize(&ty.to_ty(self.bcx.tcx()));
-                if common::type_is_imm_pair(self.bcx.ccx(), ty) {
+                let ty = self.cx.monomorphize(&ty.to_ty(self.cx.ccx.tcx()));
+                if common::type_is_imm_pair(self.cx.ccx, ty) {
                     if let mir::ProjectionElem::Field(..) = proj.elem {
                         if let LvalueContext::Consume = context {
                             return;
@@ -161,21 +158,21 @@ impl<'mir, 'bcx, 'tcx> Visitor<'tcx> for LocalAnalyzer<'mir, 'bcx, 'tcx> {
 
                 LvalueContext::StorageLive |
                 LvalueContext::StorageDead |
+                LvalueContext::Inspect |
                 LvalueContext::Consume => {}
 
                 LvalueContext::Store |
-                LvalueContext::Inspect |
                 LvalueContext::Borrow { .. } |
                 LvalueContext::Projection(..) => {
                     self.mark_as_lvalue(index);
                 }
 
                 LvalueContext::Drop => {
-                    let ty = lvalue.ty(self.mir, self.bcx.tcx());
-                    let ty = self.bcx.monomorphize(&ty.to_ty(self.bcx.tcx()));
+                    let ty = lvalue.ty(self.cx.mir, self.cx.ccx.tcx());
+                    let ty = self.cx.monomorphize(&ty.to_ty(self.cx.ccx.tcx()));
 
                     // Only need the lvalue if we're actually dropping it.
-                    if glue::type_needs_drop(self.bcx.tcx(), ty) {
+                    if self.cx.ccx.shared().type_needs_drop(ty) {
                         self.mark_as_lvalue(index);
                     }
                 }
@@ -200,10 +197,17 @@ pub enum CleanupKind {
     Internal { funclet: mir::BasicBlock }
 }
 
-pub fn cleanup_kinds<'bcx,'tcx>(_bcx: Block<'bcx,'tcx>,
-                                mir: &mir::Mir<'tcx>)
-                                -> IndexVec<mir::BasicBlock, CleanupKind>
-{
+impl CleanupKind {
+    pub fn funclet_bb(self, for_bb: mir::BasicBlock) -> Option<mir::BasicBlock> {
+        match self {
+            CleanupKind::NotCleanup => None,
+            CleanupKind::Funclet => Some(for_bb),
+            CleanupKind::Internal { funclet } => Some(funclet),
+        }
+    }
+}
+
+pub fn cleanup_kinds<'a, 'tcx>(mir: &mir::Mir<'tcx>) -> IndexVec<mir::BasicBlock, CleanupKind> {
     fn discover_masters<'tcx>(result: &mut IndexVec<mir::BasicBlock, CleanupKind>,
                               mir: &mir::Mir<'tcx>) {
         for (bb, data) in mir.basic_blocks().iter_enumerated() {
@@ -212,8 +216,6 @@ pub fn cleanup_kinds<'bcx,'tcx>(_bcx: Block<'bcx,'tcx>,
                 TerminatorKind::Resume |
                 TerminatorKind::Return |
                 TerminatorKind::Unreachable |
-                TerminatorKind::If { .. } |
-                TerminatorKind::Switch { .. } |
                 TerminatorKind::SwitchInt { .. } => {
                     /* nothing to do */
                 }
@@ -268,7 +270,9 @@ pub fn cleanup_kinds<'bcx,'tcx>(_bcx: Block<'bcx,'tcx>,
                         result[succ] = CleanupKind::Internal { funclet: funclet };
                     }
                     CleanupKind::Funclet => {
-                        set_successor(funclet, succ);
+                        if funclet != succ {
+                            set_successor(funclet, succ);
+                        }
                     }
                     CleanupKind::Internal { funclet: succ_funclet } => {
                         if funclet != succ_funclet {

@@ -50,7 +50,7 @@ use std::default::Default;
 use std::io::prelude::*;
 use syntax::abi::{Abi, lookup as lookup_abi};
 
-use PanicStrategy;
+use {LinkerFlavor, PanicStrategy, RelroLevel};
 
 mod android_base;
 mod apple_base;
@@ -58,6 +58,7 @@ mod apple_ios_base;
 mod arm_base;
 mod bitrig_base;
 mod dragonfly_base;
+mod emscripten_base;
 mod freebsd_base;
 mod haiku_base;
 mod linux_base;
@@ -69,7 +70,9 @@ mod windows_base;
 mod windows_msvc_base;
 mod thumb_base;
 mod fuchsia_base;
+mod redox_base;
 
+pub type LinkArgs = BTreeMap<LinkerFlavor, Vec<String>>;
 pub type TargetResult = Result<Target, String>;
 
 macro_rules! supported_targets {
@@ -156,11 +159,15 @@ supported_targets! {
     ("mips-unknown-linux-uclibc", mips_unknown_linux_uclibc),
     ("mipsel-unknown-linux-uclibc", mipsel_unknown_linux_uclibc),
 
+    ("sparc64-unknown-linux-gnu", sparc64_unknown_linux_gnu),
+
     ("i686-linux-android", i686_linux_android),
+    ("x86_64-linux-android", x86_64_linux_android),
     ("arm-linux-androideabi", arm_linux_androideabi),
     ("armv7-linux-androideabi", armv7_linux_androideabi),
     ("aarch64-linux-android", aarch64_linux_android),
 
+    ("aarch64-unknown-freebsd", aarch64_unknown_freebsd),
     ("i686-unknown-freebsd", i686_unknown_freebsd),
     ("x86_64-unknown-freebsd", x86_64_unknown_freebsd),
 
@@ -172,6 +179,8 @@ supported_targets! {
     ("i686-unknown-openbsd", i686_unknown_openbsd),
     ("x86_64-unknown-openbsd", x86_64_unknown_openbsd),
 
+    ("i686-unknown-netbsd", i686_unknown_netbsd),
+    ("sparc64-unknown-netbsd", sparc64_unknown_netbsd),
     ("x86_64-unknown-netbsd", x86_64_unknown_netbsd),
     ("x86_64-rumprun-netbsd", x86_64_rumprun_netbsd),
 
@@ -184,6 +193,8 @@ supported_targets! {
     ("aarch64-unknown-fuchsia", aarch64_unknown_fuchsia),
     ("x86_64-unknown-fuchsia", x86_64_unknown_fuchsia),
 
+    ("x86_64-unknown-redox", x86_64_unknown_redox),
+
     ("i386-apple-ios", i386_apple_ios),
     ("x86_64-apple-ios", x86_64_apple_ios),
     ("aarch64-apple-ios", aarch64_apple_ios),
@@ -191,6 +202,7 @@ supported_targets! {
     ("armv7s-apple-ios", armv7s_apple_ios),
 
     ("x86_64-sun-solaris", x86_64_sun_solaris),
+    ("sparcv9-sun-solaris", sparcv9_sun_solaris),
 
     ("x86_64-pc-windows-gnu", x86_64_pc_windows_gnu),
     ("i686-pc-windows-gnu", i686_pc_windows_gnu),
@@ -202,11 +214,14 @@ supported_targets! {
     ("le32-unknown-nacl", le32_unknown_nacl),
     ("asmjs-unknown-emscripten", asmjs_unknown_emscripten),
     ("wasm32-unknown-emscripten", wasm32_unknown_emscripten),
+    ("wasm32-experimental-emscripten", wasm32_experimental_emscripten),
 
     ("thumbv6m-none-eabi", thumbv6m_none_eabi),
     ("thumbv7m-none-eabi", thumbv7m_none_eabi),
     ("thumbv7em-none-eabi", thumbv7em_none_eabi),
     ("thumbv7em-none-eabihf", thumbv7em_none_eabihf),
+
+    ("msp430-none-elf", msp430_none_elf),
 }
 
 /// Everything `rustc` knows about how to compile for a specific target.
@@ -231,6 +246,8 @@ pub struct Target {
     pub arch: String,
     /// [Data layout](http://llvm.org/docs/LangRef.html#data-layout) to pass to LLVM.
     pub data_layout: String,
+    /// Linker flavor
+    pub linker_flavor: LinkerFlavor,
     /// Optional settings with defaults.
     pub options: TargetOptions,
 }
@@ -251,7 +268,7 @@ pub struct TargetOptions {
 
     /// Linker arguments that are unconditionally passed *before* any
     /// user-defined libraries.
-    pub pre_link_args: Vec<String>,
+    pub pre_link_args: LinkArgs,
     /// Objects to link before all others, always found within the
     /// sysroot folder.
     pub pre_link_objects_exe: Vec<String>, // ... when linking an executable
@@ -259,13 +276,19 @@ pub struct TargetOptions {
     /// Linker arguments that are unconditionally passed after any
     /// user-defined but before post_link_objects.  Standard platform
     /// libraries that should be always be linked to, usually go here.
-    pub late_link_args: Vec<String>,
+    pub late_link_args: LinkArgs,
     /// Objects to link after all others, always found within the
     /// sysroot folder.
     pub post_link_objects: Vec<String>,
     /// Linker arguments that are unconditionally passed *after* any
     /// user-defined libraries.
-    pub post_link_args: Vec<String>,
+    pub post_link_args: LinkArgs,
+
+    /// Environment variables to be set before invoking the linker.
+    pub link_env: Vec<(String, String)>,
+
+    /// Extra arguments to pass to the external assembler (when used)
+    pub asm_args: Vec<String>,
 
     /// Default CPU to pass to LLVM. Corresponds to `llc -mcpu=$cpu`. Defaults
     /// to "generic".
@@ -305,8 +328,8 @@ pub struct TargetOptions {
     /// Whether the target toolchain is like OpenBSD's.
     /// Only useful for compiling against OpenBSD, for configuring abi when returning a struct.
     pub is_like_openbsd: bool,
-    /// Whether the target toolchain is like OSX's. Only useful for compiling against iOS/OS X, in
-    /// particular running dsymutil and some other stuff like `-dead_strip`. Defaults to false.
+    /// Whether the target toolchain is like macOS's. Only useful for compiling against iOS/macOS,
+    /// in particular running dsymutil and some other stuff like `-dead_strip`. Defaults to false.
     pub is_like_osx: bool,
     /// Whether the target toolchain is like Solaris's.
     /// Only useful for compiling against Illumos/Solaris,
@@ -320,6 +343,10 @@ pub struct TargetOptions {
     /// Whether the target toolchain is like Android's. Only useful for compiling against Android.
     /// Defaults to false.
     pub is_like_android: bool,
+    /// Whether the target toolchain is like Emscripten's. Only useful for compiling with
+    /// Emscripten toolchain.
+    /// Defaults to false.
+    pub is_like_emscripten: bool,
     /// Whether the linker support GNU-like arguments such as -O. Defaults to false.
     pub linker_is_gnu: bool,
     /// The MinGW toolchain has a known issue that prevents it from correctly
@@ -340,6 +367,10 @@ pub struct TargetOptions {
     /// the functions in the executable are not randomized and can be used
     /// during an exploit of a vulnerability in any code.
     pub position_independent_executables: bool,
+    /// Either partial, full, or off. Full RELRO makes the dynamic linker
+    /// resolve all symbols at startup and marks the GOT read-only before
+    /// starting the program, preventing overwriting the GOT.
+    pub relro_level: RelroLevel,
     /// Format that archives should be emitted in. This affects whether we use
     /// LLVM to assemble an archive or fall back to the system linker, and
     /// currently only "gnu" is used to fall into LLVM. Unknown strings cause
@@ -353,9 +384,8 @@ pub struct TargetOptions {
     /// `eh_unwind_resume` lang item.
     pub custom_unwind_resume: bool,
 
-    /// Default crate for allocation symbols to link against
-    pub lib_allocation_crate: String,
-    pub exe_allocation_crate: String,
+    /// If necessary, a different crate to link exe allocators by default
+    pub exe_allocation_crate: Option<String>,
 
     /// Flag indicating whether ELF TLS (e.g. #[thread_local]) is available for
     /// this target.
@@ -370,6 +400,9 @@ pub struct TargetOptions {
     // file
     pub no_integrated_as: bool,
 
+    /// Don't use this field; instead use the `.min_atomic_width()` method.
+    pub min_atomic_width: Option<u64>,
+
     /// Don't use this field; instead use the `.max_atomic_width()` method.
     pub max_atomic_width: Option<u64>,
 
@@ -382,6 +415,9 @@ pub struct TargetOptions {
 
     /// Whether or not the CRT is statically linked by default.
     pub crt_static_default: bool,
+
+    /// Whether or not stack probes (__rust_probestack) are enabled
+    pub stack_probes: bool,
 }
 
 impl Default for TargetOptions {
@@ -392,8 +428,9 @@ impl Default for TargetOptions {
             is_builtin: false,
             linker: option_env!("CFG_DEFAULT_LINKER").unwrap_or("cc").to_string(),
             ar: option_env!("CFG_DEFAULT_AR").unwrap_or("ar").to_string(),
-            pre_link_args: Vec::new(),
-            post_link_args: Vec::new(),
+            pre_link_args: LinkArgs::new(),
+            post_link_args: LinkArgs::new(),
+            asm_args: Vec::new(),
             cpu: "generic".to_string(),
             features: "".to_string(),
             dynamic_linking: false,
@@ -414,28 +451,32 @@ impl Default for TargetOptions {
             is_like_solaris: false,
             is_like_windows: false,
             is_like_android: false,
+            is_like_emscripten: false,
             is_like_msvc: false,
             linker_is_gnu: false,
             allows_weak_linkage: true,
             has_rpath: false,
             no_default_libraries: true,
             position_independent_executables: false,
+            relro_level: RelroLevel::Off,
             pre_link_objects_exe: Vec::new(),
             pre_link_objects_dll: Vec::new(),
             post_link_objects: Vec::new(),
-            late_link_args: Vec::new(),
+            late_link_args: LinkArgs::new(),
+            link_env: Vec::new(),
             archive_format: "gnu".to_string(),
             custom_unwind_resume: false,
-            lib_allocation_crate: "alloc_system".to_string(),
-            exe_allocation_crate: "alloc_system".to_string(),
+            exe_allocation_crate: None,
             allow_asm: true,
             has_elf_tls: false,
             obj_is_bitcode: false,
             no_integrated_as: false,
+            min_atomic_width: None,
             max_atomic_width: None,
             panic_strategy: PanicStrategy::Unwind,
             abi_blacklist: vec![],
             crt_static_default: false,
+            stack_probes: false,
         }
     }
 }
@@ -453,6 +494,12 @@ impl Target {
             },
             abi => abi
         }
+    }
+
+    /// Minimum integer size in bits that this target can perform atomic
+    /// operations on.
+    pub fn min_atomic_width(&self) -> u64 {
+        self.options.min_atomic_width.unwrap_or(8)
     }
 
     /// Maximum integer size in bits that this target can perform atomic
@@ -500,6 +547,10 @@ impl Target {
             target_os: get_req_field("os")?,
             target_env: get_opt_field("env", ""),
             target_vendor: get_opt_field("vendor", "unknown"),
+            linker_flavor: LinkerFlavor::from_str(&*get_req_field("linker-flavor")?)
+                .ok_or_else(|| {
+                    format!("linker flavor must be {}", LinkerFlavor::one_of())
+                })?,
             options: Default::default(),
         };
 
@@ -534,6 +585,18 @@ impl Target {
                 Some(Ok(()))
             })).unwrap_or(Ok(()))
             } );
+            ($key_name:ident, RelroLevel) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                obj.find(&name[..]).and_then(|o| o.as_string().and_then(|s| {
+                    match s.parse::<RelroLevel>() {
+                        Ok(level) => base.options.$key_name = level,
+                        _ => return Some(Err(format!("'{}' is not a valid value for \
+                                                      relro-level. Use 'full', 'partial, or 'off'.",
+                                                      s))),
+                    }
+                    Some(Ok(()))
+                })).unwrap_or(Ok(()))
+            } );
             ($key_name:ident, list) => ( {
                 let name = (stringify!($key_name)).replace("_", "-");
                 obj.find(&name[..]).map(|o| o.as_array()
@@ -550,17 +613,66 @@ impl Target {
                         .map(|s| s.to_string() );
                 }
             } );
+            ($key_name:ident, LinkerFlavor) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                obj.find(&name[..]).and_then(|o| o.as_string().map(|s| {
+                    LinkerFlavor::from_str(&s).ok_or_else(|| {
+                        Err(format!("'{}' is not a valid value for linker-flavor. \
+                                     Use 'em', 'gcc', 'ld' or 'msvc.", s))
+                    })
+                })).unwrap_or(Ok(()))
+            } );
+            ($key_name:ident, link_args) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                if let Some(obj) = obj.find(&name[..]).and_then(|o| o.as_object()) {
+                    let mut args = LinkArgs::new();
+                    for (k, v) in obj {
+                        let k = LinkerFlavor::from_str(&k).ok_or_else(|| {
+                            format!("{}: '{}' is not a valid value for linker-flavor. \
+                                     Use 'em', 'gcc', 'ld' or 'msvc'", name, k)
+                        })?;
+
+                        let v = v.as_array().map(|a| {
+                            a
+                                .iter()
+                                .filter_map(|o| o.as_string())
+                                .map(|s| s.to_owned())
+                                .collect::<Vec<_>>()
+                        }).unwrap_or(vec![]);
+
+                        args.insert(k, v);
+                    }
+                    base.options.$key_name = args;
+                }
+            } );
+            ($key_name:ident, env) => ( {
+                let name = (stringify!($key_name)).replace("_", "-");
+                if let Some(a) = obj.find(&name[..]).and_then(|o| o.as_array()) {
+                    for o in a {
+                        if let Some(s) = o.as_string() {
+                            let p = s.split('=').collect::<Vec<_>>();
+                            if p.len() == 2 {
+                                let k = p[0].to_string();
+                                let v = p[1].to_string();
+                                base.options.$key_name.push((k, v));
+                            }
+                        }
+                    }
+                }
+            } );
         }
 
         key!(is_builtin, bool);
         key!(linker);
         key!(ar);
-        key!(pre_link_args, list);
+        key!(pre_link_args, link_args);
         key!(pre_link_objects_exe, list);
         key!(pre_link_objects_dll, list);
-        key!(late_link_args, list);
+        key!(late_link_args, link_args);
         key!(post_link_objects, list);
-        key!(post_link_args, list);
+        key!(post_link_args, link_args);
+        key!(link_env, env);
+        key!(asm_args, list);
         key!(cpu);
         key!(features);
         key!(dynamic_linking, bool);
@@ -581,23 +693,26 @@ impl Target {
         key!(is_like_solaris, bool);
         key!(is_like_windows, bool);
         key!(is_like_msvc, bool);
+        key!(is_like_emscripten, bool);
         key!(is_like_android, bool);
         key!(linker_is_gnu, bool);
         key!(allows_weak_linkage, bool);
         key!(has_rpath, bool);
         key!(no_default_libraries, bool);
         key!(position_independent_executables, bool);
+        try!(key!(relro_level, RelroLevel));
         key!(archive_format);
         key!(allow_asm, bool);
         key!(custom_unwind_resume, bool);
-        key!(lib_allocation_crate);
-        key!(exe_allocation_crate);
+        key!(exe_allocation_crate, optional);
         key!(has_elf_tls, bool);
         key!(obj_is_bitcode, bool);
         key!(no_integrated_as, bool);
         key!(max_atomic_width, Option<u64>);
+        key!(min_atomic_width, Option<u64>);
         try!(key!(panic_strategy, PanicStrategy));
         key!(crt_static_default, bool);
+        key!(stack_probes, bool);
 
         if let Some(array) = obj.find("abi-blacklist").and_then(Json::as_array) {
             for name in array.iter().filter_map(|abi| abi.as_string()) {
@@ -702,6 +817,27 @@ impl ToJson for Target {
                     d.insert(name.to_string(), self.options.$attr.to_json());
                 }
             } );
+            (link_args - $attr:ident) => ( {
+                let name = (stringify!($attr)).replace("_", "-");
+                if default.$attr != self.options.$attr {
+                    let obj = self.options.$attr
+                        .iter()
+                        .map(|(k, v)| (k.desc().to_owned(), v.clone()))
+                        .collect::<BTreeMap<_, _>>();
+                    d.insert(name.to_string(), obj.to_json());
+                }
+            } );
+            (env - $attr:ident) => ( {
+                let name = (stringify!($attr)).replace("_", "-");
+                if default.$attr != self.options.$attr {
+                    let obj = self.options.$attr
+                        .iter()
+                        .map(|&(ref k, ref v)| k.clone() + "=" + &v)
+                        .collect::<Vec<_>>();
+                    d.insert(name.to_string(), obj.to_json());
+                }
+            } );
+
         }
 
         target_val!(llvm_target);
@@ -711,18 +847,20 @@ impl ToJson for Target {
         target_val!(target_os, "os");
         target_val!(target_env, "env");
         target_val!(target_vendor, "vendor");
-        target_val!(arch);
         target_val!(data_layout);
+        target_val!(linker_flavor);
 
         target_option_val!(is_builtin);
         target_option_val!(linker);
         target_option_val!(ar);
-        target_option_val!(pre_link_args);
+        target_option_val!(link_args - pre_link_args);
         target_option_val!(pre_link_objects_exe);
         target_option_val!(pre_link_objects_dll);
-        target_option_val!(late_link_args);
+        target_option_val!(link_args - late_link_args);
         target_option_val!(post_link_objects);
-        target_option_val!(post_link_args);
+        target_option_val!(link_args - post_link_args);
+        target_option_val!(env - link_env);
+        target_option_val!(asm_args);
         target_option_val!(cpu);
         target_option_val!(features);
         target_option_val!(dynamic_linking);
@@ -743,23 +881,26 @@ impl ToJson for Target {
         target_option_val!(is_like_solaris);
         target_option_val!(is_like_windows);
         target_option_val!(is_like_msvc);
+        target_option_val!(is_like_emscripten);
         target_option_val!(is_like_android);
         target_option_val!(linker_is_gnu);
         target_option_val!(allows_weak_linkage);
         target_option_val!(has_rpath);
         target_option_val!(no_default_libraries);
         target_option_val!(position_independent_executables);
+        target_option_val!(relro_level);
         target_option_val!(archive_format);
         target_option_val!(allow_asm);
         target_option_val!(custom_unwind_resume);
-        target_option_val!(lib_allocation_crate);
         target_option_val!(exe_allocation_crate);
         target_option_val!(has_elf_tls);
         target_option_val!(obj_is_bitcode);
         target_option_val!(no_integrated_as);
+        target_option_val!(min_atomic_width);
         target_option_val!(max_atomic_width);
         target_option_val!(panic_strategy);
         target_option_val!(crt_static_default);
+        target_option_val!(stack_probes);
 
         if default.abi_blacklist != self.options.abi_blacklist {
             d.insert("abi-blacklist".to_string(), self.options.abi_blacklist.iter()
@@ -771,10 +912,10 @@ impl ToJson for Target {
     }
 }
 
-fn maybe_jemalloc() -> String {
+fn maybe_jemalloc() -> Option<String> {
     if cfg!(feature = "jemalloc") {
-        "alloc_jemalloc".to_string()
+        Some("alloc_jemalloc".to_string())
     } else {
-        "alloc_system".to_string()
+        None
     }
 }

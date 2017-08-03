@@ -144,7 +144,7 @@ that at most one writer or multiple readers can access the data at any one time.
 If you wish to learn more about ownership in Rust, start with the chapter in the
 Book:
 
-https://doc.rust-lang.org/book/ownership.html
+https://doc.rust-lang.org/book/first-edition/ownership.html
 "##,
 
 E0383: r##"
@@ -153,9 +153,12 @@ structure that is currently uninitialized.
 
 For example, this can happen when a drop has taken place:
 
-```ignore
+```compile_fail,E0383
 struct Foo {
     a: u32,
+}
+impl Drop for Foo {
+    fn drop(&mut self) { /* ... */ }
 }
 
 let mut x = Foo { a: 1 };
@@ -168,6 +171,9 @@ This error can be fixed by fully reinitializing the structure in question:
 ```
 struct Foo {
     a: u32,
+}
+impl Drop for Foo {
+    fn drop(&mut self) { /* ... */ }
 }
 
 let mut x = Foo { a: 1 };
@@ -198,7 +204,7 @@ fn main() {
 ```
 "##,
 
-E0386: r##"
+/*E0386: r##"
 This error occurs when an attempt is made to mutate the target of a mutable
 reference stored inside an immutable container.
 
@@ -228,7 +234,7 @@ let x: i64 = 1;
 let y: Box<Cell<_>> = Box::new(Cell::new(x));
 y.set(2);
 ```
-"##,
+"##,*/
 
 E0387: r##"
 This error occurs when an attempt is made to mutate or mutably reference data
@@ -287,27 +293,7 @@ https://doc.rust-lang.org/std/cell/
 "##,
 
 E0388: r##"
-A mutable borrow was attempted in a static location.
-
-Erroneous code example:
-
-```compile_fail,E0388
-static X: i32 = 1;
-
-static STATIC_REF: &'static mut i32 = &mut X;
-// error: cannot borrow data mutably in a static location
-
-const CONST_REF: &'static mut i32 = &mut X;
-// error: cannot borrow data mutably in a static location
-```
-
-To fix this error, you have to use constant borrow:
-
-```
-static X: i32 = 1;
-
-static STATIC_REF: &'static i32 = &X;
-```
+E0388 was removed and is no longer issued.
 "##,
 
 E0389: r##"
@@ -386,8 +372,8 @@ let mut a = &mut i;
 
 Please note that in rust, you can either have many immutable references, or one
 mutable reference. Take a look at
-https://doc.rust-lang.org/stable/book/references-and-borrowing.html for more
-information. Example:
+https://doc.rust-lang.org/book/first-edition/references-and-borrowing.html
+for more information. Example:
 
 
 ```
@@ -553,7 +539,7 @@ fn foo(a: &mut i32) {
 ```
 
 For more information on the rust ownership system, take a look at
-https://doc.rust-lang.org/stable/book/references-and-borrowing.html.
+https://doc.rust-lang.org/book/first-edition/references-and-borrowing.html.
 "##,
 
 E0503: r##"
@@ -609,7 +595,7 @@ fn main() {
 ```
 
 You can find more information about borrowing in the rust-book:
-http://doc.rust-lang.org/stable/book/references-and-borrowing.html
+http://doc.rust-lang.org/book/first-edition/references-and-borrowing.html
 "##,
 
 E0504: r##"
@@ -793,7 +779,7 @@ fn main() {
 ```
 
 You can find more information about borrowing in the rust-book:
-http://doc.rust-lang.org/stable/book/references-and-borrowing.html
+http://doc.rust-lang.org/book/first-edition/references-and-borrowing.html
 "##,
 
 E0506: r##"
@@ -964,10 +950,9 @@ fn main() {
 }
 ```
 
-Moving out of a member of a mutably borrowed struct is fine if you put something
-back. `mem::replace` can be used for that:
+Moving a member out of a mutably borrowed struct will also cause E0507 error:
 
-```ignore
+```compile_fail,E0507
 struct TheDarkKnight;
 
 impl TheDarkKnight {
@@ -979,20 +964,33 @@ struct Batcave {
 }
 
 fn main() {
-    use std::mem;
-
     let mut cave = Batcave {
         knight: TheDarkKnight
     };
     let borrowed = &mut cave;
 
     borrowed.knight.nothing_is_true(); // E0507
-    mem::replace(&mut borrowed.knight, TheDarkKnight).nothing_is_true(); // ok!
 }
 ```
 
+It is fine only if you put something back. `mem::replace` can be used for that:
+
+```
+# struct TheDarkKnight;
+# impl TheDarkKnight { fn nothing_is_true(self) {} }
+# struct Batcave { knight: TheDarkKnight }
+use std::mem;
+
+let mut cave = Batcave {
+    knight: TheDarkKnight
+};
+let borrowed = &mut cave;
+
+mem::replace(&mut borrowed.knight, TheDarkKnight).nothing_is_true(); // ok!
+```
+
 You can find more information about borrowing in the rust-book:
-http://doc.rust-lang.org/stable/book/references-and-borrowing.html
+http://doc.rust-lang.org/book/first-edition/references-and-borrowing.html
 "##,
 
 E0508: r##"
@@ -1134,9 +1132,80 @@ fn main() {
 ```
 "##,
 
+E0595: r##"
+Closures cannot mutate immutable captured variables.
+
+Erroneous code example:
+
+```compile_fail,E0595
+let x = 3; // error: closure cannot assign to immutable local variable `x`
+let mut c = || { x += 1 };
+```
+
+Make the variable binding mutable:
+
+```
+let mut x = 3; // ok!
+let mut c = || { x += 1 };
+```
+"##,
+
+E0596: r##"
+This error occurs because you tried to mutably borrow a non-mutable variable.
+
+Example of erroneous code:
+
+```compile_fail,E0596
+let x = 1;
+let y = &mut x; // error: cannot borrow mutably
+```
+
+In here, `x` isn't mutable, so when we try to mutably borrow it in `y`, it
+fails. To fix this error, you need to make `x` mutable:
+
+```
+let mut x = 1;
+let y = &mut x; // ok!
+```
+"##,
+
+E0597: r##"
+This error occurs because a borrow was made inside a variable which has a
+greater lifetime than the borrowed one.
+
+Example of erroneous code:
+
+```compile_fail,E0597
+struct Foo<'a> {
+    x: Option<&'a u32>,
+}
+
+let mut x = Foo { x: None };
+let y = 0;
+x.x = Some(&y); // error: `y` does not live long enough
+```
+
+In here, `x` is created before `y` and therefore has a greater lifetime. Always
+keep in mind that values in a scope are dropped in the opposite order they are
+created. So to fix the previous example, just make the `y` lifetime greater than
+the `x`'s one:
+
+```
+struct Foo<'a> {
+    x: Option<&'a u32>,
+}
+
+let y = 0;
+let mut x = Foo { x: None };
+x.x = Some(&y);
+```
+"##,
+
 }
 
 register_diagnostics! {
-    E0385, // {} in an aliasable location
+//    E0385, // {} in an aliasable location
     E0524, // two closures require unique access to `..` at the same time
+    E0594, // cannot assign to {}
+    E0598, // lifetime of {} is too short to guarantee its contents can be...
 }

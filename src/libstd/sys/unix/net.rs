@@ -10,13 +10,15 @@
 
 use ffi::CStr;
 use io;
-use libc::{self, c_int, size_t, sockaddr, socklen_t, EAI_SYSTEM};
+use libc::{self, c_int, c_void, size_t, sockaddr, socklen_t, EAI_SYSTEM, MSG_PEEK};
+use mem;
 use net::{SocketAddr, Shutdown};
 use str;
 use sys::fd::FileDesc;
 use sys_common::{AsInner, FromInner, IntoInner};
-use sys_common::net::{getsockopt, setsockopt};
-use time::Duration;
+use sys_common::net::{getsockopt, setsockopt, sockaddr_to_addr};
+use time::{Duration, Instant};
+use cmp;
 
 pub use sys::{cvt, cvt_r};
 pub extern crate libc as netc;
@@ -121,6 +123,70 @@ impl Socket {
         }
     }
 
+    pub fn connect_timeout(&self, addr: &SocketAddr, timeout: Duration) -> io::Result<()> {
+        self.set_nonblocking(true)?;
+        let r = unsafe {
+            let (addrp, len) = addr.into_inner();
+            cvt(libc::connect(self.0.raw(), addrp, len))
+        };
+        self.set_nonblocking(false)?;
+
+        match r {
+            Ok(_) => return Ok(()),
+            // there's no ErrorKind for EINPROGRESS :(
+            Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => return Err(e),
+        }
+
+        let mut pollfd = libc::pollfd {
+            fd: self.0.raw(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+
+        if timeout.as_secs() == 0 && timeout.subsec_nanos() == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                      "cannot set a 0 duration timeout"));
+        }
+
+        let start = Instant::now();
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "connection timed out"));
+            }
+
+            let timeout = timeout - elapsed;
+            let mut timeout = timeout.as_secs()
+                .saturating_mul(1_000)
+                .saturating_add(timeout.subsec_nanos() as u64 / 1_000_000);
+            if timeout == 0 {
+                timeout = 1;
+            }
+
+            let timeout = cmp::min(timeout, c_int::max_value() as u64) as c_int;
+
+            match unsafe { libc::poll(&mut pollfd, 1, timeout) } {
+                -1 => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+                0 => {}
+                _ => {
+                    if pollfd.revents & libc::POLLOUT == 0 {
+                        if let Some(e) = self.take_error()? {
+                            return Err(e);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub fn accept(&self, storage: *mut sockaddr, len: *mut socklen_t)
                   -> io::Result<Socket> {
         // Unfortunately the only known way right now to accept a socket and
@@ -155,12 +221,46 @@ impl Socket {
         self.0.duplicate().map(Socket)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+    fn recv_with_flags(&self, buf: &mut [u8], flags: c_int) -> io::Result<usize> {
+        let ret = cvt(unsafe {
+            libc::recv(self.0.raw(),
+                       buf.as_mut_ptr() as *mut c_void,
+                       buf.len(),
+                       flags)
+        })?;
+        Ok(ret as usize)
     }
 
-    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.0.read_to_end(buf)
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, 0)
+    }
+
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, MSG_PEEK)
+    }
+
+    fn recv_from_with_flags(&self, buf: &mut [u8], flags: c_int)
+                            -> io::Result<(usize, SocketAddr)> {
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut addrlen = mem::size_of_val(&storage) as libc::socklen_t;
+
+        let n = cvt(unsafe {
+            libc::recvfrom(self.0.raw(),
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len(),
+                        flags,
+                        &mut storage as *mut _ as *mut _,
+                        &mut addrlen)
+        })?;
+        Ok((n as usize, sockaddr_to_addr(&storage, addrlen as usize)?))
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, 0)
+    }
+
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, MSG_PEEK)
     }
 
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {

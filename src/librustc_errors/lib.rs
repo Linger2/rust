@@ -9,30 +9,22 @@
 // except according to those terms.
 
 #![crate_name = "rustc_errors"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(custom_attribute)]
 #![allow(unused_attributes)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
 #![feature(range_contains)]
 #![feature(libc)]
-#![feature(unicode)]
+#![feature(conservative_impl_trait)]
 
-extern crate serialize;
 extern crate term;
-#[macro_use]
-extern crate log;
-#[macro_use]
 extern crate libc;
-extern crate std_unicode;
-extern crate serialize as rustc_serialize; // used by deriving
+extern crate serialize as rustc_serialize;
 extern crate syntax_pos;
 
 pub use emitter::ColorConfig;
@@ -41,6 +33,7 @@ use self::Level::*;
 
 use emitter::{Emitter, EmitterWriter};
 
+use std::borrow::Cow;
 use std::cell::{RefCell, Cell};
 use std::{error, fmt};
 use std::rc::Rc;
@@ -48,15 +41,14 @@ use std::rc::Rc;
 pub mod diagnostic;
 pub mod diagnostic_builder;
 pub mod emitter;
-pub mod snippet;
+mod snippet;
 pub mod registry;
-pub mod styled_buffer;
+mod styled_buffer;
 mod lock;
 
-use syntax_pos::{BytePos, Loc, FileLinesResult, FileName, MultiSpan, Span, NO_EXPANSION};
-use syntax_pos::MacroBacktrace;
+use syntax_pos::{BytePos, Loc, FileLinesResult, FileMap, FileName, MultiSpan, Span, NO_EXPANSION};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum RenderSpan {
     /// A FullSpan renders with both with an initial line for the
     /// message, prefixed by file:linenum, followed by a summary of
@@ -70,10 +62,36 @@ pub enum RenderSpan {
     Suggestion(CodeSuggestion),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
 pub struct CodeSuggestion {
-    pub msp: MultiSpan,
-    pub substitutes: Vec<String>,
+    /// Each substitute can have multiple variants due to multiple
+    /// applicable suggestions
+    ///
+    /// `foo.bar` might be replaced with `a.b` or `x.y` by replacing
+    /// `foo` and `bar` on their own:
+    ///
+    /// ```
+    /// vec![
+    ///     (0..3, vec!["a", "x"]),
+    ///     (4..7, vec!["b", "y"]),
+    /// ]
+    /// ```
+    ///
+    /// or by replacing the entire span:
+    ///
+    /// ```
+    /// vec![(0..7, vec!["a.b", "x.y"])]
+    /// ```
+    pub substitution_parts: Vec<Substitution>,
+    pub msg: String,
+    pub show_code_when_inline: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
+/// See the docs on `CodeSuggestion::substitutions`
+pub struct Substitution {
+    pub span: Span,
+    pub substitutions: Vec<String>,
 }
 
 pub trait CodeMapper {
@@ -81,22 +99,34 @@ pub trait CodeMapper {
     fn span_to_lines(&self, sp: Span) -> FileLinesResult;
     fn span_to_string(&self, sp: Span) -> String;
     fn span_to_filename(&self, sp: Span) -> FileName;
-    fn macro_backtrace(&self, span: Span) -> Vec<MacroBacktrace>;
     fn merge_spans(&self, sp_lhs: Span, sp_rhs: Span) -> Option<Span>;
+    fn call_span_if_macro(&self, sp: Span) -> Span;
+    fn ensure_filemap_source_present(&self, file_map: Rc<FileMap>) -> bool;
 }
 
 impl CodeSuggestion {
-    /// Returns the assembled code suggestion.
-    pub fn splice_lines(&self, cm: &CodeMapper) -> String {
+    /// Returns the number of substitutions
+    fn substitutions(&self) -> usize {
+        self.substitution_parts[0].substitutions.len()
+    }
+
+    /// Returns the number of substitutions
+    pub fn substitution_spans<'a>(&'a self) -> impl Iterator<Item = Span> + 'a {
+        self.substitution_parts.iter().map(|sub| sub.span)
+    }
+
+    /// Returns the assembled code suggestions and wether they should be shown with an underline.
+    pub fn splice_lines(&self, cm: &CodeMapper) -> Vec<(String, bool)> {
         use syntax_pos::{CharPos, Loc, Pos};
 
         fn push_trailing(buf: &mut String,
-                         line_opt: Option<&str>,
+                         line_opt: Option<&Cow<str>>,
                          lo: &Loc,
                          hi_opt: Option<&Loc>) {
             let (lo, hi_opt) = (lo.col.to_usize(), hi_opt.map(|hi| hi.col.to_usize()));
             if let Some(line) = line_opt {
-                if line.len() > lo {
+                if let Some(lo) = line.char_indices().map(|(i, _)| i).nth(lo) {
+                    let hi_opt = hi_opt.and_then(|hi| line.char_indices().map(|(i, _)| i).nth(hi));
                     buf.push_str(match hi_opt {
                         Some(hi) => &line[lo..hi],
                         None => &line[lo..],
@@ -108,24 +138,26 @@ impl CodeSuggestion {
             }
         }
 
-        let mut primary_spans = self.msp.primary_spans().to_owned();
-
-        assert_eq!(primary_spans.len(), self.substitutes.len());
-        if primary_spans.is_empty() {
-            return format!("");
+        if self.substitution_parts.is_empty() {
+            return vec![(String::new(), false)];
         }
+
+        let mut primary_spans: Vec<_> = self.substitution_parts
+            .iter()
+            .map(|sub| (sub.span, &sub.substitutions))
+            .collect();
 
         // Assumption: all spans are in the same file, and all spans
         // are disjoint. Sort in ascending order.
-        primary_spans.sort_by_key(|sp| sp.lo);
+        primary_spans.sort_by_key(|sp| sp.0.lo);
 
         // Find the bounding span.
-        let lo = primary_spans.iter().map(|sp| sp.lo).min().unwrap();
-        let hi = primary_spans.iter().map(|sp| sp.hi).min().unwrap();
+        let lo = primary_spans.iter().map(|sp| sp.0.lo).min().unwrap();
+        let hi = primary_spans.iter().map(|sp| sp.0.hi).min().unwrap();
         let bounding_span = Span {
             lo: lo,
             hi: hi,
-            expn_id: NO_EXPANSION,
+            ctxt: NO_EXPANSION,
         };
         let lines = cm.span_to_lines(bounding_span).unwrap();
         assert!(!lines.lines.is_empty());
@@ -144,33 +176,51 @@ impl CodeSuggestion {
         prev_hi.col = CharPos::from_usize(0);
 
         let mut prev_line = fm.get_line(lines.lines[0].line_index);
-        let mut buf = String::new();
+        let mut bufs = vec![(String::new(), false); self.substitutions()];
 
-        for (sp, substitute) in primary_spans.iter().zip(self.substitutes.iter()) {
+        for (sp, substitutes) in primary_spans {
             let cur_lo = cm.lookup_char_pos(sp.lo);
-            if prev_hi.line == cur_lo.line {
-                push_trailing(&mut buf, prev_line, &prev_hi, Some(&cur_lo));
-            } else {
-                push_trailing(&mut buf, prev_line, &prev_hi, None);
-                // push lines between the previous and current span (if any)
-                for idx in prev_hi.line..(cur_lo.line - 1) {
-                    if let Some(line) = fm.get_line(idx) {
-                        buf.push_str(line);
-                        buf.push('\n');
+            for (&mut (ref mut buf, ref mut underline), substitute) in bufs.iter_mut()
+                                                                           .zip(substitutes) {
+                if prev_hi.line == cur_lo.line {
+                    push_trailing(buf, prev_line.as_ref(), &prev_hi, Some(&cur_lo));
+
+                    // Only show an underline in the suggestions if the suggestion is not the
+                    // entirety of the code being shown and the displayed code is not multiline.
+                    if prev_line.as_ref().unwrap().trim().len() > 0
+                        && !substitute.ends_with('\n')
+                        && substitute.lines().count() == 1
+                    {
+                        *underline = true;
+                    }
+                } else {
+                    *underline = false;
+                    push_trailing(buf, prev_line.as_ref(), &prev_hi, None);
+                    // push lines between the previous and current span (if any)
+                    for idx in prev_hi.line..(cur_lo.line - 1) {
+                        if let Some(line) = fm.get_line(idx) {
+                            buf.push_str(line.as_ref());
+                            buf.push('\n');
+                        }
+                    }
+                    if let Some(cur_line) = fm.get_line(cur_lo.line - 1) {
+                        buf.push_str(&cur_line[..cur_lo.col.to_usize()]);
                     }
                 }
-                if let Some(cur_line) = fm.get_line(cur_lo.line - 1) {
-                    buf.push_str(&cur_line[..cur_lo.col.to_usize()]);
-                }
+                buf.push_str(substitute);
             }
-            buf.push_str(substitute);
             prev_hi = cm.lookup_char_pos(sp.hi);
             prev_line = fm.get_line(prev_hi.line - 1);
         }
-        push_trailing(&mut buf, prev_line, &prev_hi, None);
-        // remove trailing newline
-        buf.pop();
-        buf
+        for &mut (ref mut buf, _) in &mut bufs {
+            // if the replacement already ends with a newline, don't print the next line
+            if !buf.ends_with('\n') {
+                push_trailing(buf, prev_line.as_ref(), &prev_hi, None);
+            }
+            // remove trailing newline
+            buf.pop();
+        }
+        bufs
     }
 }
 
@@ -210,7 +260,7 @@ impl error::Error for ExplicitBug {
     }
 }
 
-pub use diagnostic::{Diagnostic, SubDiagnostic};
+pub use diagnostic::{Diagnostic, SubDiagnostic, DiagnosticStyledString, StringPart};
 pub use diagnostic_builder::DiagnosticBuilder;
 
 /// A handler deals with errors; certain errors
@@ -306,8 +356,14 @@ impl Handler {
         result.code(code.to_owned());
         result
     }
+    // FIXME: This method should be removed (every error should have an associated error code).
     pub fn struct_err<'a>(&'a self, msg: &str) -> DiagnosticBuilder<'a> {
         DiagnosticBuilder::new(self, Level::Error, msg)
+    }
+    pub fn struct_err_with_code<'a>(&'a self, msg: &str, code: &str) -> DiagnosticBuilder<'a> {
+        let mut result = DiagnosticBuilder::new(self, Level::Error, msg);
+        result.code(code.to_owned());
+        result
     }
     pub fn struct_span_fatal<'a, S: Into<MultiSpan>>(&'a self,
                                                      sp: S,
@@ -343,8 +399,7 @@ impl Handler {
 
     pub fn span_fatal<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> FatalError {
         self.emit(&sp.into(), msg, Fatal);
-        self.panic_if_treat_err_as_bug();
-        return FatalError;
+        FatalError
     }
     pub fn span_fatal_with_code<S: Into<MultiSpan>>(&self,
                                                     sp: S,
@@ -352,12 +407,10 @@ impl Handler {
                                                     code: &str)
                                                     -> FatalError {
         self.emit_with_code(&sp.into(), msg, code, Fatal);
-        self.panic_if_treat_err_as_bug();
-        return FatalError;
+        FatalError
     }
     pub fn span_err<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
         self.emit(&sp.into(), msg, Error);
-        self.panic_if_treat_err_as_bug();
     }
     pub fn mut_span_err<'a, S: Into<MultiSpan>>(&'a self,
                                                 sp: S,
@@ -369,7 +422,6 @@ impl Handler {
     }
     pub fn span_err_with_code<S: Into<MultiSpan>>(&self, sp: S, msg: &str, code: &str) {
         self.emit_with_code(&sp.into(), msg, code, Error);
-        self.panic_if_treat_err_as_bug();
     }
     pub fn span_warn<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
         self.emit(&sp.into(), msg, Warning);
@@ -382,6 +434,9 @@ impl Handler {
         panic!(ExplicitBug);
     }
     pub fn delay_span_bug<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
+        if self.treat_err_as_bug {
+            self.span_bug(sp, msg);
+        }
         let mut delayed = self.delayed_span_bug.borrow_mut();
         *delayed = Some((sp.into(), msg.to_string()));
     }
@@ -390,6 +445,14 @@ impl Handler {
     }
     pub fn span_note_without_error<S: Into<MultiSpan>>(&self, sp: S, msg: &str) {
         self.emit(&sp.into(), msg, Note);
+    }
+    pub fn span_note_diag<'a>(&'a self,
+                              sp: Span,
+                              msg: &str)
+                              -> DiagnosticBuilder<'a> {
+        let mut db = DiagnosticBuilder::new(self, Note, msg);
+        db.set_span(sp);
+        db
     }
     pub fn span_unimpl<S: Into<MultiSpan>>(&self, sp: S, msg: &str) -> ! {
         self.span_bug(sp, &format!("unimplemented {}", msg));
@@ -427,6 +490,7 @@ impl Handler {
     }
 
     pub fn bump_err_count(&self) {
+        self.panic_if_treat_err_as_bug();
         self.err_count.set(self.err_count.get() + 1);
     }
 
@@ -484,7 +548,7 @@ impl Handler {
 }
 
 
-#[derive(Copy, PartialEq, Clone, Debug)]
+#[derive(Copy, PartialEq, Clone, Debug, RustcEncodable, RustcDecodable)]
 pub enum Level {
     Bug,
     Fatal,

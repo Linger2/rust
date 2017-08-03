@@ -9,11 +9,10 @@
 // except according to those terms.
 
 // no-prefer-dynamic
+// compile-flags: --emit=metadata
 
 // Check that building a metadata crate finds an error.
 
-#![crate_type="metadata"]
-
 fn main() {
-    let _ = Foo; //~ ERROR unresolved name `Foo`
+    let _ = Foo; //~ ERROR cannot find value `Foo` in this scope
 }

@@ -51,6 +51,7 @@
 // coherence challenge (e.g., specialization, neg impls, etc) we can
 // reconsider what crate these items belong in.
 
+use alloc::allocator;
 use any::TypeId;
 use cell;
 use char;
@@ -193,7 +194,7 @@ impl From<String> for Box<Error + Send + Sync> {
     }
 }
 
-#[stable(feature = "string_box_error", since = "1.7.0")]
+#[stable(feature = "string_box_error", since = "1.6.0")]
 impl From<String> for Box<Error> {
     fn from(str_err: String) -> Box<Error> {
         let err1: Box<Error + Send + Sync> = From::from(str_err);
@@ -209,10 +210,33 @@ impl<'a, 'b> From<&'b str> for Box<Error + Send + Sync + 'a> {
     }
 }
 
-#[stable(feature = "string_box_error", since = "1.7.0")]
+#[stable(feature = "string_box_error", since = "1.6.0")]
 impl<'a> From<&'a str> for Box<Error> {
     fn from(err: &'a str) -> Box<Error> {
         From::from(String::from(err))
+    }
+}
+
+#[unstable(feature = "never_type_impls", issue = "35121")]
+impl Error for ! {
+    fn description(&self) -> &str { *self }
+}
+
+#[unstable(feature = "allocator_api",
+           reason = "the precise API and guarantees it provides may be tweaked.",
+           issue = "32838")]
+impl Error for allocator::AllocErr {
+    fn description(&self) -> &str {
+        allocator::AllocErr::description(self)
+    }
+}
+
+#[unstable(feature = "allocator_api",
+           reason = "the precise API and guarantees it provides may be tweaked.",
+           issue = "32838")]
+impl Error for allocator::CannotReallocInPlace {
+    fn description(&self) -> &str {
+        allocator::CannotReallocInPlace::description(self)
     }
 }
 
@@ -277,7 +301,7 @@ impl Error for char::DecodeUtf16Error {
     }
 }
 
-#[stable(feature = "box_error", since = "1.7.0")]
+#[stable(feature = "box_error", since = "1.8.0")]
 impl<T: Error> Error for Box<T> {
     fn description(&self) -> &str {
         Error::description(&**self)
@@ -315,6 +339,14 @@ impl Error for char::CharTryFromError {
         "converted integer out of range for `char`"
     }
 }
+
+#[stable(feature = "char_from_str", since = "1.20.0")]
+impl Error for char::ParseCharError {
+    fn description(&self) -> &str {
+        self.__description()
+    }
+}
+
 
 // copied from any.rs
 impl Error + 'static {

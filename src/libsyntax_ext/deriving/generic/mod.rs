@@ -305,10 +305,10 @@ pub enum StaticFields {
 /// A summary of the possible sets of fields.
 pub enum SubstructureFields<'a> {
     Struct(&'a ast::VariantData, Vec<FieldInfo<'a>>),
-    /// Matching variants of the enum: variant index, ast::Variant,
+    /// Matching variants of the enum: variant index, variant count, ast::Variant,
     /// fields: the field name is only non-`None` in the case of a struct
     /// variant.
-    EnumMatching(usize, &'a ast::Variant, Vec<FieldInfo<'a>>),
+    EnumMatching(usize, usize, &'a ast::Variant, Vec<FieldInfo<'a>>),
 
     /// Non-matching variants of the enum, but with all state hidden from
     /// the consequent code.  The first component holds `Ident`s for all of
@@ -363,22 +363,19 @@ fn find_type_parameters(ty: &ast::Ty,
 
     impl<'a, 'b> visit::Visitor<'a> for Visitor<'a, 'b> {
         fn visit_ty(&mut self, ty: &'a ast::Ty) {
-            match ty.node {
-                ast::TyKind::Path(_, ref path) if !path.global => {
-                    if let Some(segment) = path.segments.first() {
-                        if self.ty_param_names.contains(&segment.identifier.name) {
-                            self.types.push(P(ty.clone()));
-                        }
+            if let ast::TyKind::Path(_, ref path) = ty.node {
+                if let Some(segment) = path.segments.first() {
+                    if self.ty_param_names.contains(&segment.identifier.name) {
+                        self.types.push(P(ty.clone()));
                     }
                 }
-                _ => {}
             }
 
             visit::walk_ty(self, ty)
         }
 
         fn visit_mac(&mut self, mac: &ast::Mac) {
-            let span = Span { expn_id: self.span.expn_id, ..mac.span };
+            let span = Span { ctxt: self.span.ctxt, ..mac.span };
             self.cx.span_err(span, "`derive` cannot be used on items with type macros");
         }
     }
@@ -442,7 +439,7 @@ impl<'a> TraitDef<'a> {
                 attrs.extend(item.attrs
                     .iter()
                     .filter(|a| {
-                        match &*a.name().as_str() {
+                        a.name().is_some() && match &*a.name().unwrap().as_str() {
                             "allow" | "warn" | "deny" | "forbid" | "stable" | "unstable" => true,
                             _ => false,
                         }
@@ -459,7 +456,7 @@ impl<'a> TraitDef<'a> {
 
     /// Given that we are deriving a trait `DerivedTrait` for a type like:
     ///
-    /// ```ignore
+    /// ```ignore (only-for-syntax-highlight)
     /// struct Struct<'a, ..., 'z, A, B: DeclaredTrait, C, ..., Z> where C: WhereTrait {
     ///     a: A,
     ///     b: B::Item,
@@ -472,7 +469,7 @@ impl<'a> TraitDef<'a> {
     ///
     /// create an impl like:
     ///
-    /// ```ignore
+    /// ```ignore (only-for-syntax-highlight)
     /// impl<'a, ..., 'z, A, B: DeclaredTrait, C, ...  Z> where
     ///     C:                       WhereTrait,
     ///     A: DerivedTrait + B1 + ... + BN,
@@ -507,12 +504,12 @@ impl<'a> TraitDef<'a> {
                 defaultness: ast::Defaultness::Final,
                 attrs: Vec::new(),
                 node: ast::ImplItemKind::Type(type_def.to_ty(cx, self.span, type_ident, generics)),
+                tokens: None,
             }
         });
 
-        let Generics { mut lifetimes, ty_params, mut where_clause, span } = self.generics
+        let Generics { mut lifetimes, mut ty_params, mut where_clause, span } = self.generics
             .to_generics(cx, self.span, type_ident, generics);
-        let mut ty_params = ty_params.into_vec();
 
         // Copy the lifetimes
         lifetimes.extend(generics.lifetimes.iter().cloned());
@@ -536,7 +533,7 @@ impl<'a> TraitDef<'a> {
                 bounds.push((*declared_bound).clone());
             }
 
-            cx.typaram(self.span, ty_param.ident, vec![], P::from_vec(bounds), None)
+            cx.typaram(self.span, ty_param.ident, vec![], bounds, None)
         }));
 
         // and similarly for where clauses
@@ -561,8 +558,8 @@ impl<'a> TraitDef<'a> {
                     ast::WherePredicate::EqPredicate(ast::WhereEqPredicate {
                         id: ast::DUMMY_NODE_ID,
                         span: self.span,
-                        path: we.path.clone(),
-                        ty: we.ty.clone(),
+                        lhs_ty: we.lhs_ty.clone(),
+                        rhs_ty: we.rhs_ty.clone(),
                     })
                 }
             }
@@ -599,7 +596,7 @@ impl<'a> TraitDef<'a> {
                         span: self.span,
                         bound_lifetimes: vec![],
                         bounded_ty: ty,
-                        bounds: P::from_vec(bounds),
+                        bounds: bounds,
                     };
 
                     let predicate = ast::WherePredicate::BoundPredicate(predicate);
@@ -610,7 +607,7 @@ impl<'a> TraitDef<'a> {
 
         let trait_generics = Generics {
             lifetimes: lifetimes,
-            ty_params: P::from_vec(ty_params),
+            ty_params: ty_params,
             where_clause: where_clause,
             span: span,
         };
@@ -662,6 +659,7 @@ impl<'a> TraitDef<'a> {
                 a,
                 ast::ItemKind::Impl(unsafety,
                                     ast::ImplPolarity::Positive,
+                                    ast::Defaultness::Final,
                                     trait_generics,
                                     opt_trait_ref,
                                     self_type,
@@ -777,7 +775,7 @@ fn find_repr_type_name(diagnostic: &Handler, type_attrs: &[ast::Attribute]) -> &
     for a in type_attrs {
         for r in &attr::find_repr_attrs(diagnostic, a) {
             repr_type_name = match *r {
-                attr::ReprAny | attr::ReprPacked | attr::ReprSimd => continue,
+                attr::ReprPacked | attr::ReprSimd | attr::ReprAlign(_) => continue,
                 attr::ReprExtern => "i32",
 
                 attr::ReprInt(attr::SignedInt(ast::IntTy::Is)) => "isize",
@@ -785,12 +783,14 @@ fn find_repr_type_name(diagnostic: &Handler, type_attrs: &[ast::Attribute]) -> &
                 attr::ReprInt(attr::SignedInt(ast::IntTy::I16)) => "i16",
                 attr::ReprInt(attr::SignedInt(ast::IntTy::I32)) => "i32",
                 attr::ReprInt(attr::SignedInt(ast::IntTy::I64)) => "i64",
+                attr::ReprInt(attr::SignedInt(ast::IntTy::I128)) => "i128",
 
                 attr::ReprInt(attr::UnsignedInt(ast::UintTy::Us)) => "usize",
                 attr::ReprInt(attr::UnsignedInt(ast::UintTy::U8)) => "u8",
                 attr::ReprInt(attr::UnsignedInt(ast::UintTy::U16)) => "u16",
                 attr::ReprInt(attr::UnsignedInt(ast::UintTy::U32)) => "u32",
                 attr::ReprInt(attr::UnsignedInt(ast::UintTy::U64)) => "u64",
+                attr::ReprInt(attr::UnsignedInt(ast::UintTy::U128)) => "u128",
             }
         }
     }
@@ -931,11 +931,13 @@ impl<'a> MethodDef<'a> {
                                                 decl: fn_decl,
                                             },
                                             body_block),
+            tokens: None,
         }
     }
 
-    /// ```ignore
+    /// ```
     /// #[derive(PartialEq)]
+    /// # struct Dummy;
     /// struct A { x: i32, y: i32 }
     ///
     /// // equivalent to:
@@ -1041,8 +1043,9 @@ impl<'a> MethodDef<'a> {
                                       &StaticStruct(struct_def, summary))
     }
 
-    /// ```ignore
+    /// ```
     /// #[derive(PartialEq)]
+    /// # struct Dummy;
     /// enum A {
     ///     A1,
     ///     A2(i32)
@@ -1251,7 +1254,7 @@ impl<'a> MethodDef<'a> {
                 // expressions for referencing every field of every
                 // Self arg, assuming all are instances of VariantK.
                 // Build up code associated with such a case.
-                let substructure = EnumMatching(index, variant, field_tuples);
+                let substructure = EnumMatching(index, variants.len(), variant, field_tuples);
                 let arm_expr = self.call_substructure_method(cx,
                                                              trait_,
                                                              type_ident,
@@ -1268,12 +1271,13 @@ impl<'a> MethodDef<'a> {
                 // We need a default case that handles the fieldless variants.
                 // The index and actual variant aren't meaningful in this case,
                 // so just use whatever
+                let substructure = EnumMatching(0, variants.len(), v, Vec::new());
                 Some(self.call_substructure_method(cx,
                                                    trait_,
                                                    type_ident,
                                                    &self_args[..],
                                                    nonself_args,
-                                                   &EnumMatching(0, v, Vec::new())))
+                                                   &substructure))
             }
             _ if variants.len() > 1 && self_args.len() > 1 => {
                 // Since we know that all the arguments will match if we reach
@@ -1460,7 +1464,7 @@ impl<'a> MethodDef<'a> {
             .iter()
             .map(|v| {
                 let ident = v.node.name;
-                let sp = Span { expn_id: trait_.span.expn_id, ..v.span };
+                let sp = Span { ctxt: trait_.span.ctxt, ..v.span };
                 let summary = trait_.summarise_struct(cx, &v.node.data);
                 (ident, sp, summary)
             })
@@ -1480,7 +1484,7 @@ impl<'a> TraitDef<'a> {
         let mut named_idents = Vec::new();
         let mut just_spans = Vec::new();
         for field in struct_def.fields() {
-            let sp = Span { expn_id: self.span.expn_id, ..field.span };
+            let sp = Span { ctxt: self.span.ctxt, ..field.span };
             match field.ident {
                 Some(ident) => named_idents.push((ident, sp)),
                 _ => just_spans.push(sp),
@@ -1525,7 +1529,7 @@ impl<'a> TraitDef<'a> {
         let mut paths = Vec::new();
         let mut ident_exprs = Vec::new();
         for (i, struct_field) in struct_def.fields().iter().enumerate() {
-            let sp = Span { expn_id: self.span.expn_id, ..struct_field.span };
+            let sp = Span { ctxt: self.span.ctxt, ..struct_field.span };
             let ident = cx.ident_of(&format!("{}_{}", prefix, i));
             paths.push(codemap::Spanned {
                 span: sp,
@@ -1546,11 +1550,12 @@ impl<'a> TraitDef<'a> {
                             cx.span_bug(sp, "a braced struct with unnamed fields in `derive`");
                         }
                         codemap::Spanned {
-                            span: Span { expn_id: self.span.expn_id, ..pat.span },
+                            span: Span { ctxt: self.span.ctxt, ..pat.span },
                             node: ast::FieldPat {
                                 ident: ident.unwrap(),
                                 pat: pat,
                                 is_shorthand: false,
+                                attrs: ast::ThinVec::new(),
                             },
                         }
                     })
@@ -1577,7 +1582,7 @@ impl<'a> TraitDef<'a> {
          mutbl: ast::Mutability)
          -> (P<ast::Pat>, Vec<(Span, Option<Ident>, P<Expr>, &'a [ast::Attribute])>) {
         let variant_ident = variant.node.name;
-        let sp = Span { expn_id: self.span.expn_id, ..variant.span };
+        let sp = Span { ctxt: self.span.ctxt, ..variant.span };
         let variant_path = cx.path(sp, vec![enum_ident, variant_ident]);
         self.create_struct_pattern(cx, variant_path, &variant.node.data, prefix, mutbl)
     }
@@ -1624,7 +1629,7 @@ pub fn cs_fold<F>(use_foldl: bool,
 /// Call the method that is being derived on all the fields, and then
 /// process the collected results. i.e.
 ///
-/// ```ignore
+/// ```ignore (only-for-syntax-highlight)
 /// f(cx, span, vec![self_1.method(__arg_1_1, __arg_2_1),
 ///                  self_2.method(__arg_1_2, __arg_2_2)])
 /// ```

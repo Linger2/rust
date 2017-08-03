@@ -8,9 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// ignore-test
+// ignore-test not a test, auxillary
 
-#![feature(macro_reexport, proc_macro)]
+#![feature(macro_reexport)]
 
 #[macro_reexport(A)]
 extern crate derive_a;

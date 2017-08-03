@@ -42,8 +42,10 @@
 //! Recursive structures must be boxed, because if the definition of `Cons`
 //! looked like this:
 //!
-//! ```rust,ignore
+//! ```compile_fail,E0072
+//! # enum List<T> {
 //! Cons(T, List<T>),
+//! # }
 //! ```
 //!
 //! It wouldn't work. This is because the size of a `List` depends on how many
@@ -53,7 +55,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use heap;
+use heap::{Heap, Layout, Alloc};
 use raw_vec::RawVec;
 
 use core::any::Any;
@@ -68,6 +70,7 @@ use core::ops::{CoerceUnsized, Deref, DerefMut};
 use core::ops::{BoxPlace, Boxed, InPlace, Place, Placer};
 use core::ptr::{self, Unique};
 use core::convert::From;
+use str::from_boxed_utf8_unchecked;
 
 /// A value that represents the heap. This is the default place that the `box`
 /// keyword allocates into when no place is supplied.
@@ -94,6 +97,7 @@ pub const HEAP: ExchangeHeapSingleton = ExchangeHeapSingleton { _force_singleton
 #[unstable(feature = "box_heap",
            reason = "may be renamed; uncertain about custom allocator design",
            issue = "27779")]
+#[allow(missing_debug_implementations)]
 #[derive(Copy, Clone)]
 pub struct ExchangeHeapSingleton {
     _force_singleton: (),
@@ -103,6 +107,7 @@ pub struct ExchangeHeapSingleton {
 ///
 /// See the [module-level documentation](../../std/boxed/index.html) for more.
 #[lang = "owned_box"]
+#[fundamental]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Box<T: ?Sized>(Unique<T>);
 
@@ -127,10 +132,10 @@ pub struct Box<T: ?Sized>(Unique<T>);
 #[unstable(feature = "placement_in",
            reason = "placement box design is still being worked out.",
            issue = "27779")]
+#[allow(missing_debug_implementations)]
 pub struct IntermediateBox<T: ?Sized> {
     ptr: *mut u8,
-    size: usize,
-    align: usize,
+    layout: Layout,
     marker: marker::PhantomData<*mut T>,
 }
 
@@ -150,23 +155,21 @@ unsafe fn finalize<T>(b: IntermediateBox<T>) -> Box<T> {
 }
 
 fn make_place<T>() -> IntermediateBox<T> {
-    let size = mem::size_of::<T>();
-    let align = mem::align_of::<T>();
+    let layout = Layout::new::<T>();
 
-    let p = if size == 0 {
-        heap::EMPTY as *mut u8
+    let p = if layout.size() == 0 {
+        mem::align_of::<T>() as *mut u8
     } else {
-        let p = unsafe { heap::allocate(size, align) };
-        if p.is_null() {
-            panic!("Box make_place allocation failure.");
+        unsafe {
+            Heap.alloc(layout.clone()).unwrap_or_else(|err| {
+                Heap.oom(err)
+            })
         }
-        p
     };
 
     IntermediateBox {
         ptr: p,
-        size: size,
-        align: align,
+        layout: layout,
         marker: marker::PhantomData,
     }
 }
@@ -215,14 +218,18 @@ impl<T> Placer<T> for ExchangeHeapSingleton {
            issue = "27779")]
 impl<T: ?Sized> Drop for IntermediateBox<T> {
     fn drop(&mut self) {
-        if self.size > 0 {
-            unsafe { heap::deallocate(self.ptr, self.size, self.align) }
+        if self.layout.size() > 0 {
+            unsafe {
+                Heap.dealloc(self.ptr, self.layout.clone())
+            }
         }
     }
 }
 
 impl<T> Box<T> {
     /// Allocates memory on the heap and then places `x` into it.
+    ///
+    /// This doesn't actually allocate if `T` is zero-sized.
     ///
     /// # Examples
     ///
@@ -290,6 +297,44 @@ impl<T: ?Sized> Box<T> {
     pub fn into_raw(b: Box<T>) -> *mut T {
         unsafe { mem::transmute(b) }
     }
+
+    /// Consumes the `Box`, returning the wrapped pointer as `Unique<T>`.
+    ///
+    /// After calling this function, the caller is responsible for the
+    /// memory previously managed by the `Box`. In particular, the
+    /// caller should properly destroy `T` and release the memory. The
+    /// proper way to do so is to convert the raw pointer back into a
+    /// `Box` with the [`Box::from_raw`] function.
+    ///
+    /// Note: this is an associated function, which means that you have
+    /// to call it as `Box::into_unique(b)` instead of `b.into_unique()`. This
+    /// is so that there is no conflict with a method on the inner type.
+    ///
+    /// [`Box::from_raw`]: struct.Box.html#method.from_raw
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(unique)]
+    ///
+    /// fn main() {
+    ///     let x = Box::new(5);
+    ///     let ptr = Box::into_unique(x);
+    /// }
+    /// ```
+    #[unstable(feature = "unique", reason = "needs an RFC to flesh out design",
+               issue = "27730")]
+    #[inline]
+    pub fn into_unique(b: Box<T>) -> Unique<T> {
+        unsafe { mem::transmute(b) }
+    }
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Box<T> {
+    fn drop(&mut self) {
+        // FIXME: Do nothing, drop is currently performed by compiler.
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -304,6 +349,13 @@ impl<T: Default> Default for Box<T> {
 impl<T> Default for Box<[T]> {
     fn default() -> Box<[T]> {
         Box::<[T; 0]>::new([])
+    }
+}
+
+#[stable(feature = "default_box_extra", since = "1.17.0")]
+impl Default for Box<str> {
+    fn default() -> Box<str> {
+        unsafe { from_boxed_utf8_unchecked(Default::default()) }
     }
 }
 
@@ -348,7 +400,7 @@ impl Clone for Box<str> {
         let buf = RawVec::with_capacity(len);
         unsafe {
             ptr::copy_nonoverlapping(self.as_ptr(), buf.ptr(), len);
-            mem::transmute(buf.into_box()) // bytes to str ~magic
+            from_boxed_utf8_unchecked(buf.into_box())
         }
     }
 }
@@ -408,6 +460,31 @@ impl<T: ?Sized + Hash> Hash for Box<T> {
 impl<T> From<T> for Box<T> {
     fn from(t: T) -> Self {
         Box::new(t)
+    }
+}
+
+#[stable(feature = "box_from_slice", since = "1.17.0")]
+impl<'a, T: Copy> From<&'a [T]> for Box<[T]> {
+    fn from(slice: &'a [T]) -> Box<[T]> {
+        let mut boxed = unsafe { RawVec::with_capacity(slice.len()).into_box() };
+        boxed.copy_from_slice(slice);
+        boxed
+    }
+}
+
+#[stable(feature = "box_from_slice", since = "1.17.0")]
+impl<'a> From<&'a str> for Box<str> {
+    fn from(s: &'a str) -> Box<str> {
+        unsafe { from_boxed_utf8_unchecked(Box::from(s.as_bytes())) }
+    }
+}
+
+#[stable(feature = "boxed_str_conv", since = "1.19.0")]
+impl From<Box<str>> for Box<[u8]> {
+    fn from(s: Box<str>) -> Self {
+        unsafe {
+            mem::transmute(s)
+        }
     }
 }
 
@@ -587,7 +664,7 @@ impl<I: FusedIterator + ?Sized> FusedIterator for Box<I> {}
 /// ```
 #[rustc_paren_sugar]
 #[unstable(feature = "fnbox",
-           reason = "will be deprecated if and when Box<FnOnce> becomes usable", issue = "28796")]
+           reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
 pub trait FnBox<A> {
     type Output;
 
@@ -595,7 +672,7 @@ pub trait FnBox<A> {
 }
 
 #[unstable(feature = "fnbox",
-           reason = "will be deprecated if and when Box<FnOnce> becomes usable", issue = "28796")]
+           reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
 impl<A, F> FnBox<A> for F
     where F: FnOnce<A>
 {
@@ -607,7 +684,7 @@ impl<A, F> FnBox<A> for F
 }
 
 #[unstable(feature = "fnbox",
-           reason = "will be deprecated if and when Box<FnOnce> becomes usable", issue = "28796")]
+           reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
 impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + 'a> {
     type Output = R;
 
@@ -617,7 +694,7 @@ impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + 'a> {
 }
 
 #[unstable(feature = "fnbox",
-           reason = "will be deprecated if and when Box<FnOnce> becomes usable", issue = "28796")]
+           reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
 impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + Send + 'a> {
     type Output = R;
 
@@ -680,14 +757,14 @@ impl<T: Clone> Clone for Box<[T]> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "box_borrow", since = "1.1.0")]
 impl<T: ?Sized> borrow::Borrow<T> for Box<T> {
     fn borrow(&self) -> &T {
         &**self
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "box_borrow", since = "1.1.0")]
 impl<T: ?Sized> borrow::BorrowMut<T> for Box<T> {
     fn borrow_mut(&mut self) -> &mut T {
         &mut **self

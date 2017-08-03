@@ -14,6 +14,7 @@
 
 use any::Any;
 use cell::UnsafeCell;
+use fmt;
 use ops::{Deref, DerefMut};
 use panicking;
 use ptr::{Unique, Shared};
@@ -111,7 +112,7 @@ pub trait UnwindSafe {}
 /// This is a "helper marker trait" used to provide impl blocks for the
 /// `UnwindSafe` trait, for more information see that documentation.
 #[stable(feature = "catch_unwind", since = "1.9.0")]
-#[rustc_on_unimplemented = "the type {Self} contains interior mutability \
+#[rustc_on_unimplemented = "the type {Self} may contain interior mutability \
                             and a reference may not be safely transferrable \
                             across a catch_unwind boundary"]
 pub trait RefUnwindSafe {}
@@ -197,7 +198,7 @@ impl<T: RefUnwindSafe + ?Sized> UnwindSafe for *const T {}
 #[stable(feature = "catch_unwind", since = "1.9.0")]
 impl<T: RefUnwindSafe + ?Sized> UnwindSafe for *mut T {}
 #[unstable(feature = "unique", issue = "27730")]
-impl<T: UnwindSafe> UnwindSafe for Unique<T> {}
+impl<T: UnwindSafe + ?Sized> UnwindSafe for Unique<T> {}
 #[unstable(feature = "shared", issue = "27730")]
 impl<T: RefUnwindSafe + ?Sized> UnwindSafe for Shared<T> {}
 #[stable(feature = "catch_unwind", since = "1.9.0")]
@@ -293,6 +294,15 @@ impl<R, F: FnOnce() -> R> FnOnce<()> for AssertUnwindSafe<F> {
 
     extern "rust-call" fn call_once(self, _args: ()) -> R {
         (self.0)()
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl<T: fmt::Debug> fmt::Debug for AssertUnwindSafe<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("AssertUnwindSafe")
+            .field(&self.0)
+            .finish()
     }
 }
 

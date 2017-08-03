@@ -11,64 +11,60 @@
 use rustc::mir;
 
 use base;
-use common::{self, BlockAndBuilder};
+use asm;
+use common;
+use builder::Builder;
 
 use super::MirContext;
 use super::LocalRef;
 use super::super::adt;
-use super::super::disr::Disr;
 
-impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
+impl<'a, 'tcx> MirContext<'a, 'tcx> {
     pub fn trans_statement(&mut self,
-                           bcx: BlockAndBuilder<'bcx, 'tcx>,
+                           bcx: Builder<'a, 'tcx>,
                            statement: &mir::Statement<'tcx>)
-                           -> BlockAndBuilder<'bcx, 'tcx> {
+                           -> Builder<'a, 'tcx> {
         debug!("trans_statement(statement={:?})", statement);
 
-        let debug_loc = self.debug_loc(statement.source_info);
-        debug_loc.apply_to_bcx(&bcx);
-        debug_loc.apply(bcx.fcx());
+        self.set_debug_loc(&bcx, statement.source_info);
         match statement.kind {
             mir::StatementKind::Assign(ref lvalue, ref rvalue) => {
                 if let mir::Lvalue::Local(index) = *lvalue {
                     match self.locals[index] {
                         LocalRef::Lvalue(tr_dest) => {
-                            self.trans_rvalue(bcx, tr_dest, rvalue, debug_loc)
+                            self.trans_rvalue(bcx, tr_dest, rvalue)
                         }
                         LocalRef::Operand(None) => {
-                            let (bcx, operand) = self.trans_rvalue_operand(bcx, rvalue,
-                                                                           debug_loc);
+                            let (bcx, operand) = self.trans_rvalue_operand(bcx, rvalue);
                             self.locals[index] = LocalRef::Operand(Some(operand));
                             bcx
                         }
                         LocalRef::Operand(Some(_)) => {
                             let ty = self.monomorphized_lvalue_ty(lvalue);
 
-                            if !common::type_is_zero_size(bcx.ccx(), ty) {
+                            if !common::type_is_zero_size(bcx.ccx, ty) {
                                 span_bug!(statement.source_info.span,
                                           "operand {:?} already assigned",
                                           rvalue);
                             } else {
                                 // If the type is zero-sized, it's already been set here,
                                 // but we still need to make sure we translate the operand
-                                self.trans_rvalue_operand(bcx, rvalue, debug_loc).0
+                                self.trans_rvalue_operand(bcx, rvalue).0
                             }
                         }
                     }
                 } else {
                     let tr_dest = self.trans_lvalue(&bcx, lvalue);
-                    self.trans_rvalue(bcx, tr_dest, rvalue, debug_loc)
+                    self.trans_rvalue(bcx, tr_dest, rvalue)
                 }
             }
             mir::StatementKind::SetDiscriminant{ref lvalue, variant_index} => {
                 let ty = self.monomorphized_lvalue_ty(lvalue);
                 let lvalue_transed = self.trans_lvalue(&bcx, lvalue);
-                bcx.with_block(|bcx|
-                    adt::trans_set_discr(bcx,
-                                         ty,
-                                        lvalue_transed.llval,
-                                        Disr::from(variant_index))
-                );
+                adt::trans_set_discr(&bcx,
+                    ty,
+                    lvalue_transed.llval,
+                    variant_index as u64);
                 bcx
             }
             mir::StatementKind::StorageLive(ref lvalue) => {
@@ -77,15 +73,29 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             mir::StatementKind::StorageDead(ref lvalue) => {
                 self.trans_storage_liveness(bcx, lvalue, base::Lifetime::End)
             }
+            mir::StatementKind::InlineAsm { ref asm, ref outputs, ref inputs } => {
+                let outputs = outputs.iter().map(|output| {
+                    let lvalue = self.trans_lvalue(&bcx, output);
+                    (lvalue.llval, lvalue.ty.to_ty(bcx.tcx()))
+                }).collect();
+
+                let input_vals = inputs.iter().map(|input| {
+                    self.trans_operand(&bcx, input).immediate()
+                }).collect();
+
+                asm::trans_inline_asm(&bcx, asm, outputs, input_vals);
+                bcx
+            }
+            mir::StatementKind::EndRegion(_) |
             mir::StatementKind::Nop => bcx,
         }
     }
 
     fn trans_storage_liveness(&self,
-                              bcx: BlockAndBuilder<'bcx, 'tcx>,
+                              bcx: Builder<'a, 'tcx>,
                               lvalue: &mir::Lvalue<'tcx>,
                               intrinsic: base::Lifetime)
-                              -> BlockAndBuilder<'bcx, 'tcx> {
+                              -> Builder<'a, 'tcx> {
         if let mir::Lvalue::Local(index) = *lvalue {
             if let LocalRef::Lvalue(tr_lval) = self.locals[index] {
                 intrinsic.call(&bcx, tr_lval.llval);

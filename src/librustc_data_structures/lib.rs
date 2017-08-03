@@ -17,22 +17,23 @@
 //! This API is completely unstable and subject to change.
 
 #![crate_name = "rustc_data_structures"]
-#![unstable(feature = "rustc_private", issue = "27812")]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://www.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
+#![feature(shared)]
+#![feature(collections_range)]
 #![feature(nonzero)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
 #![feature(unboxed_closures)]
 #![feature(fn_traits)]
-#![feature(untagged_unions)]
-#![feature(associated_consts)]
 #![feature(unsize)]
+#![feature(i128_type)]
+#![feature(conservative_impl_trait)]
+#![feature(discriminant_value)]
+#![feature(specialization)]
 
 #![cfg_attr(unix, feature(libc))]
 #![cfg_attr(test, feature(test))]
@@ -43,6 +44,8 @@ extern crate log;
 extern crate serialize as rustc_serialize; // used by deriving
 #[cfg(unix)]
 extern crate libc;
+
+pub use rustc_serialize::hex::ToHex;
 
 pub mod array_vec;
 pub mod accumulate_vec;
@@ -59,6 +62,7 @@ pub mod indexed_vec;
 pub mod obligation_forest;
 pub mod snapshot_map;
 pub mod snapshot_vec;
+pub mod stable_hasher;
 pub mod transitive_relation;
 pub mod unify;
 pub mod fnv;

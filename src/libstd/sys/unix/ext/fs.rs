@@ -21,7 +21,7 @@ use sys_common::{FromInner, AsInner, AsInnerMut};
 use sys::platform::fs::MetadataExt as UnixMetadataExt;
 
 /// Unix-specific extensions to `File`
-#[unstable(feature = "file_offset", issue = "35918")]
+#[stable(feature = "file_offset", since = "1.15.0")]
 pub trait FileExt {
     /// Reads a number of bytes starting from a given offset.
     ///
@@ -34,7 +34,7 @@ pub trait FileExt {
     ///
     /// Note that similar to `File::read`, it is not an error to return with a
     /// short read.
-    #[unstable(feature = "file_offset", issue = "35918")]
+    #[stable(feature = "file_offset", since = "1.15.0")]
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
     /// Writes a number of bytes starting from a given offset.
@@ -51,11 +51,11 @@ pub trait FileExt {
     ///
     /// Note that similar to `File::write`, it is not an error to return a
     /// short write.
-    #[unstable(feature = "file_offset", issue = "35918")]
+    #[stable(feature = "file_offset", since = "1.15.0")]
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
 }
 
-#[unstable(feature = "file_offset", issue = "35918")]
+#[stable(feature = "file_offset", since = "1.15.0")]
 impl FileExt for fs::File {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.as_inner().read_at(buf, offset)
@@ -73,15 +73,17 @@ pub trait PermissionsExt {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use std::fs::File;
     /// use std::os::unix::fs::PermissionsExt;
     ///
-    /// let f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
+    /// # fn run() -> std::io::Result<()> {
+    /// let f = File::create("foo.txt")?;
+    /// let metadata = f.metadata()?;
     /// let permissions = metadata.permissions();
     ///
     /// println!("permissions: {}", permissions.mode());
+    /// # Ok(()) }
     /// ```
     #[stable(feature = "fs_ext", since = "1.1.0")]
     fn mode(&self) -> u32;
@@ -90,16 +92,18 @@ pub trait PermissionsExt {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
     /// use std::fs::File;
     /// use std::os::unix::fs::PermissionsExt;
     ///
-    /// let f = try!(File::create("foo.txt"));
-    /// let metadata = try!(f.metadata());
+    /// # fn run() -> std::io::Result<()> {
+    /// let f = File::create("foo.txt")?;
+    /// let metadata = f.metadata()?;
     /// let mut permissions = metadata.permissions();
     ///
     /// permissions.set_mode(0o644); // Read/write for owner and read for others.
     /// assert_eq!(permissions.mode(), 0o644);
+    /// # Ok(()) }
     /// ```
     #[stable(feature = "fs_ext", since = "1.1.0")]
     fn set_mode(&mut self, mode: u32);
@@ -109,7 +113,7 @@ pub trait PermissionsExt {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```
     /// use std::fs::Permissions;
     /// use std::os::unix::fs::PermissionsExt;
     ///
@@ -149,14 +153,17 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # #![feature(libc)]
     /// extern crate libc;
     /// use std::fs::OpenOptions;
     /// use std::os::unix::fs::OpenOptionsExt;
     ///
+    /// # fn main() {
     /// let mut options = OpenOptions::new();
     /// options.mode(0o644); // Give read/write for owner and read for others.
     /// let file = options.open("foo.txt");
+    /// # }
     /// ```
     #[stable(feature = "fs_ext", since = "1.1.0")]
     fn mode(&mut self, mode: u32) -> &mut Self;
@@ -171,17 +178,20 @@ pub trait OpenOptionsExt {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```no_run
+    /// # #![feature(libc)]
     /// extern crate libc;
     /// use std::fs::OpenOptions;
     /// use std::os::unix::fs::OpenOptionsExt;
     ///
+    /// # fn main() {
     /// let mut options = OpenOptions::new();
     /// options.write(true);
     /// if cfg!(unix) {
     ///     options.custom_flags(libc::O_NOFOLLOW);
     /// }
     /// let file = options.open("foo.txt");
+    /// # }
     /// ```
     #[stable(feature = "open_options_ext", since = "1.10.0")]
     fn custom_flags(&mut self, flags: i32) -> &mut Self;
@@ -335,7 +345,7 @@ impl DirEntryExt for fs::DirEntry {
 /// use std::os::unix::fs;
 ///
 /// # fn foo() -> std::io::Result<()> {
-/// try!(fs::symlink("a.txt", "b.txt"));
+/// fs::symlink("a.txt", "b.txt")?;
 /// # Ok(())
 /// # }
 /// ```
@@ -353,7 +363,7 @@ pub trait DirBuilderExt {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```no_run
     /// use std::fs::DirBuilder;
     /// use std::os::unix::fs::DirBuilderExt;
     ///

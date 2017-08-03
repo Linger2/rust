@@ -11,29 +11,30 @@
 // The crate store - a central repo for information collected about external
 // crates and libraries
 
-use locator;
-use schema;
+use schema::{self, Tracked};
 
 use rustc::dep_graph::DepGraph;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE, CrateNum, DefIndex, DefId};
-use rustc::hir::map::DefKey;
+use rustc::hir::map::definitions::{DefPathTable, GlobalMetaDataKind};
 use rustc::hir::svh::Svh;
-use rustc::middle::cstore::{DepKind, ExternCrate};
+use rustc::middle::cstore::{DepKind, ExternCrate, MetadataLoader};
 use rustc_back::PanicStrategy;
 use rustc_data_structures::indexed_vec::IndexVec;
 use rustc::util::nodemap::{FxHashMap, FxHashSet, NodeMap, DefIdMap};
 
 use std::cell::{RefCell, Cell};
 use std::rc::Rc;
-use flate::Bytes;
+use owning_ref::ErasedBoxRef;
 use syntax::{ast, attr};
 use syntax::ext::base::SyntaxExtension;
 use syntax::symbol::Symbol;
 use syntax_pos;
 
 pub use rustc::middle::cstore::{NativeLibrary, NativeLibraryKind, LinkagePreference};
-pub use rustc::middle::cstore::{NativeStatic, NativeFramework, NativeUnknown};
+pub use rustc::middle::cstore::NativeLibraryKind::*;
 pub use rustc::middle::cstore::{CrateSource, LinkMeta, LibSource};
+
+pub use cstore_impl::{provide, provide_local};
 
 // A map from external crate numbers (as decoded from some crate file) to
 // local crate numbers (as generated during this session). Each external
@@ -41,11 +42,7 @@ pub use rustc::middle::cstore::{CrateSource, LinkMeta, LibSource};
 // own crate numbers.
 pub type CrateNumMap = IndexVec<CrateNum, CrateNum>;
 
-pub enum MetadataBlob {
-    Inflated(Bytes),
-    Archive(locator::ArchiveMetadata),
-    Raw(Vec<u8>),
-}
+pub struct MetadataBlob(pub ErasedBoxRef<[u8]>);
 
 /// Holds information about a syntax_pos::FileMap imported from another crate.
 /// See `imported_filemaps()` for more information.
@@ -70,6 +67,7 @@ pub struct CrateMetadata {
     pub cnum_map: RefCell<CrateNumMap>,
     pub cnum: CrateNum,
     pub codemap_import_info: RefCell<Vec<ImportedFileMap>>,
+    pub attribute_cache: RefCell<[Vec<Option<Rc<[ast::Attribute]>>>; 2]>,
 
     pub root: schema::CrateRoot,
 
@@ -78,21 +76,18 @@ pub struct CrateMetadata {
     /// hashmap, which gives the reverse mapping.  This allows us to
     /// quickly retrace a `DefPath`, which is needed for incremental
     /// compilation support.
-    pub key_map: FxHashMap<DefKey, DefIndex>,
+    pub def_path_table: Rc<DefPathTable>,
+
+    pub exported_symbols: Tracked<FxHashSet<DefIndex>>,
+
+    pub trait_impls: Tracked<FxHashMap<(u32, DefIndex), schema::LazySeq<DefIndex>>>,
 
     pub dep_kind: Cell<DepKind>,
     pub source: CrateSource,
 
     pub proc_macros: Option<Vec<(ast::Name, Rc<SyntaxExtension>)>>,
     // Foreign items imported from a dylib (Windows only)
-    pub dllimport_foreign_items: FxHashSet<DefIndex>,
-}
-
-pub struct CachedInlinedItem {
-    /// The NodeId of the RootInlinedParent HIR map entry
-    pub inlined_root: ast::NodeId,
-    /// The local NodeId of the inlined entity
-    pub item_id: ast::NodeId,
+    pub dllimport_foreign_items: Tracked<FxHashSet<DefIndex>>,
 }
 
 pub struct CStore {
@@ -104,13 +99,12 @@ pub struct CStore {
     used_link_args: RefCell<Vec<String>>,
     statically_included_foreign_items: RefCell<FxHashSet<DefIndex>>,
     pub dllimport_foreign_items: RefCell<FxHashSet<DefIndex>>,
-    pub inlined_item_cache: RefCell<DefIdMap<Option<CachedInlinedItem>>>,
-    pub defid_for_inlined_node: RefCell<NodeMap<DefId>>,
     pub visible_parent_map: RefCell<DefIdMap<DefId>>,
+    pub metadata_loader: Box<MetadataLoader>,
 }
 
 impl CStore {
-    pub fn new(dep_graph: &DepGraph) -> CStore {
+    pub fn new(dep_graph: &DepGraph, metadata_loader: Box<MetadataLoader>) -> CStore {
         CStore {
             dep_graph: dep_graph.clone(),
             metas: RefCell::new(FxHashMap()),
@@ -120,8 +114,7 @@ impl CStore {
             statically_included_foreign_items: RefCell::new(FxHashSet()),
             dllimport_foreign_items: RefCell::new(FxHashSet()),
             visible_parent_map: RefCell::new(FxHashMap()),
-            inlined_item_cache: RefCell::new(FxHashMap()),
-            defid_for_inlined_node: RefCell::new(FxHashMap()),
+            metadata_loader: metadata_loader,
         }
     }
 
@@ -262,6 +255,13 @@ impl CStore {
     pub fn do_extern_mod_stmt_cnum(&self, emod_id: ast::NodeId) -> Option<CrateNum> {
         self.extern_mod_crate_map.borrow().get(&emod_id).cloned()
     }
+
+    pub fn read_dep_node(&self, def_id: DefId) {
+        use rustc::middle::cstore::CrateStore;
+        let def_path_hash = self.def_path_hash(def_id);
+        let dep_node = def_path_hash.to_dep_node(::rustc::dep_graph::DepKind::MetaData);
+        self.dep_graph.read(dep_node);
+    }
 }
 
 impl CrateMetadata {
@@ -275,43 +275,62 @@ impl CrateMetadata {
         self.root.disambiguator
     }
 
-    pub fn is_staged_api(&self) -> bool {
-        self.get_item_attrs(CRATE_DEF_INDEX)
-            .iter()
-            .any(|attr| attr.name() == "stable" || attr.name() == "unstable")
-    }
-
-    pub fn is_allocator(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
-        attr::contains_name(&attrs, "allocator")
-    }
-
-    pub fn needs_allocator(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
+    pub fn needs_allocator(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
         attr::contains_name(&attrs, "needs_allocator")
     }
 
-    pub fn is_panic_runtime(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
+    pub fn has_global_allocator(&self, dep_graph: &DepGraph) -> bool {
+        let dep_node = self.metadata_dep_node(GlobalMetaDataKind::Krate);
+        self.root
+            .has_global_allocator
+            .get(dep_graph, dep_node)
+            .clone()
+    }
+
+    pub fn has_default_lib_allocator(&self, dep_graph: &DepGraph) -> bool {
+        let dep_node = self.metadata_dep_node(GlobalMetaDataKind::Krate);
+        self.root
+            .has_default_lib_allocator
+            .get(dep_graph, dep_node)
+            .clone()
+    }
+
+    pub fn is_panic_runtime(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
         attr::contains_name(&attrs, "panic_runtime")
     }
 
-    pub fn needs_panic_runtime(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
+    pub fn needs_panic_runtime(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
         attr::contains_name(&attrs, "needs_panic_runtime")
     }
 
-    pub fn is_compiler_builtins(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
+    pub fn is_compiler_builtins(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
         attr::contains_name(&attrs, "compiler_builtins")
     }
 
-    pub fn is_no_builtins(&self) -> bool {
-        let attrs = self.get_item_attrs(CRATE_DEF_INDEX);
+    pub fn is_sanitizer_runtime(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
+        attr::contains_name(&attrs, "sanitizer_runtime")
+    }
+
+    pub fn is_profiler_runtime(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
+        attr::contains_name(&attrs, "profiler_runtime")
+    }
+
+    pub fn is_no_builtins(&self, dep_graph: &DepGraph) -> bool {
+        let attrs = self.get_item_attrs(CRATE_DEF_INDEX, dep_graph);
         attr::contains_name(&attrs, "no_builtins")
     }
 
-    pub fn panic_strategy(&self) -> PanicStrategy {
-        self.root.panic_strategy.clone()
+    pub fn panic_strategy(&self, dep_graph: &DepGraph) -> PanicStrategy {
+        let dep_node = self.metadata_dep_node(GlobalMetaDataKind::Krate);
+        self.root
+            .panic_strategy
+            .get(dep_graph, dep_node)
+            .clone()
     }
 }

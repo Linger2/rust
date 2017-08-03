@@ -23,18 +23,18 @@
 //! `std::sys` from the standard library.
 
 #![allow(missing_docs)]
+#![allow(missing_debug_implementations)]
 
 use sync::Once;
 use sys;
 
 pub mod at_exit_imp;
-#[cfg(any(not(cargobuild), feature = "backtrace"))]
+#[cfg(feature = "backtrace")]
 pub mod backtrace;
 pub mod condvar;
 pub mod io;
 pub mod memchr;
 pub mod mutex;
-pub mod net;
 pub mod poison;
 pub mod remutex;
 pub mod rwlock;
@@ -44,9 +44,16 @@ pub mod thread_local;
 pub mod util;
 pub mod wtf8;
 
-#[cfg(any(not(cargobuild), feature = "backtrace"))]
+#[cfg(target_os = "redox")]
+pub use sys::net;
+
+#[cfg(not(target_os = "redox"))]
+pub mod net;
+
+#[cfg(feature = "backtrace")]
 #[cfg(any(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "emscripten"))),
-          all(windows, target_env = "gnu")))]
+          all(windows, target_env = "gnu"),
+          target_os = "redox"))]
 pub mod gnu;
 
 // common error constructors

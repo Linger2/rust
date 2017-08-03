@@ -4,10 +4,6 @@ This is an in-progress README which is targeted at helping to explain how Rust
 is bootstrapped and in general some of the technical details of the build
 system.
 
-> **Note**: This build system is currently under active development and is not
-> intended to be the primarily used one just yet. The makefiles are currently
-> the ones that are still "guaranteed to work" as much as possible at least.
-
 ## Using rustbuild
 
 The rustbuild build system has a primary entry point, a top level `x.py` script:
@@ -40,6 +36,15 @@ The script accepts commands, flags, and arguments to determine what to do:
 
   # build a particular crate in stage0
   ./x.py build --stage 0 src/libtest
+  ```
+
+  If files are dirty that would normally be rebuilt from stage 0, that can be
+  overidden using `--keep-stage 0`. Using `--keep-stage n` will skip all steps
+  that belong to stage n or earlier:
+
+  ```
+  # keep old build products for stage 0 and build stage 1
+  ./x.py build --keep-stage 0 --stage 1
   ```
 
 * `test` - a command for executing unit tests. Like the `build` command this
@@ -106,6 +111,42 @@ compiler. What actually happens when you invoke rustbuild is:
 
 The goal of each stage is to (a) leverage Cargo as much as possible and failing
 that (b) leverage Rust as much as possible!
+
+## Incremental builds
+
+You can configure rustbuild to use incremental compilation. Because
+incremental is new and evolving rapidly, if you want to use it, it is
+recommended that you replace the snapshot with a locally installed
+nightly build of rustc. You will want to keep this up to date.
+
+To follow this course of action, first thing you will want to do is to
+install a nightly, presumably using `rustup`. You will then want to
+configure your directory to use this build, like so:
+
+```
+# configure to use local rust instead of downloding a beta.
+# `--local-rust-root` is optional here. If elided, we will
+# use whatever rustc we find on your PATH.
+> configure --enable-rustbuild --local-rust-root=~/.cargo/ --enable-local-rebuild
+```
+
+After that, you can use the `--incremental` flag to actually do
+incremental builds:
+
+```
+> ../x.py build --incremental
+```
+
+The `--incremental` flag will store incremental compilation artifacts
+in `build/<host>/stage0-incremental`. Note that we only use incremental
+compilation for the stage0 -> stage1 compilation -- this is because
+the stage1 compiler is changing, and we don't try to cache and reuse
+incremental artifacts across different versions of the compiler. For
+this reason, `--incremental` defaults to `--stage 1` (though you can
+manually select a higher stage, if you prefer).
+
+You can always drop the `--incremental` to build as normal (but you
+will still be using the local nightly as your bootstrap).
 
 ## Directory Layout
 
@@ -222,8 +263,8 @@ build/
 The current build is unfortunately not quite as simple as `cargo build` in a
 directory, but rather the compiler is split into three different Cargo projects:
 
-* `src/rustc/std_shim` - a project which builds and compiles libstd
-* `src/rustc/test_shim` - a project which builds and compiles libtest
+* `src/libstd` - the standard library
+* `src/libtest` - testing support, depends on libstd
 * `src/rustc` - the actual compiler itself
 
 Each "project" has a corresponding Cargo.lock file with all dependencies, and

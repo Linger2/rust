@@ -27,6 +27,31 @@
 //!
 //! assert!(ecode.success());
 //! ```
+//!
+//! Calling a command with input and reading its output:
+//!
+//! ```no_run
+//! use std::process::{Command, Stdio};
+//! use std::io::Write;
+//!
+//! let mut child = Command::new("/bin/cat")
+//!     .stdin(Stdio::piped())
+//!     .stdout(Stdio::piped())
+//!     .spawn()
+//!     .expect("failed to execute child");
+//!
+//! {
+//!     // limited borrow of stdin
+//!     let stdin = child.stdin.as_mut().expect("failed to get stdin");
+//!     stdin.write_all(b"test").expect("failed to write to stdin");
+//! }
+//!
+//! let output = child
+//!     .wait_with_output()
+//!     .expect("failed to wait on child");
+//!
+//! assert_eq!(b"test", output.stdout.as_slice());
+//! ```
 
 #![stable(feature = "process", since = "1.0.0")]
 
@@ -34,7 +59,8 @@ use io::prelude::*;
 
 use ffi::OsStr;
 use fmt;
-use io;
+use fs;
+use io::{self, Initializer};
 use path::Path;
 use str;
 use sys::pipe::{read2, AnonPipe};
@@ -47,6 +73,15 @@ use sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 /// process is created via the [`Command`] struct, which configures the
 /// spawning process and can itself be constructed using a builder-style
 /// interface.
+///
+/// There is no implementation of [`Drop`] for child processes,
+/// so if you do not ensure the `Child` has exited then it will continue to
+/// run, even after the `Child` handle to the child process has gone out of
+/// scope.
+///
+/// Calling [`wait`](#method.wait) (or other functions that wrap around it) will make
+/// the parent process wait until the child has actually exited before
+/// continuing.
 ///
 /// # Examples
 ///
@@ -63,17 +98,6 @@ use sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 ///
 /// assert!(ecode.success());
 /// ```
-///
-/// # Note
-///
-/// Take note that there is no implementation of [`Drop`] for child processes,
-/// so if you do not ensure the `Child` has exited then it will continue to
-/// run, even after the `Child` handle to the child process has gone out of
-/// scope.
-///
-/// Calling [`wait`][`wait`] (or other functions that wrap around it) will make
-/// the parent process wait until the child has actually exited before
-/// continuing.
 ///
 /// [`Command`]: struct.Command.html
 /// [`Drop`]: ../../core/ops/trait.Drop.html
@@ -114,8 +138,20 @@ impl IntoInner<imp::Process> for Child {
     fn into_inner(self) -> imp::Process { self.handle }
 }
 
-/// A handle to a child process's stdin. This struct is used in the [`stdin`]
-/// field on [`Child`].
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Child {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Child")
+            .field("stdin", &self.stdin)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .finish()
+    }
+}
+
+/// A handle to a child process's stdin.
+///
+/// This struct is used in the [`stdin`] field on [`Child`].
 ///
 /// [`Child`]: struct.Child.html
 /// [`stdin`]: struct.Child.html#structfield.stdin
@@ -149,8 +185,16 @@ impl FromInner<AnonPipe> for ChildStdin {
     }
 }
 
-/// A handle to a child process's stdout. This struct is used in the [`stdout`]
-/// field on [`Child`].
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for ChildStdin {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("ChildStdin { .. }")
+    }
+}
+
+/// A handle to a child process's stdout.
+///
+/// This struct is used in the [`stdout`] field on [`Child`].
 ///
 /// [`Child`]: struct.Child.html
 /// [`stdout`]: struct.Child.html#structfield.stdout
@@ -164,8 +208,9 @@ impl Read for ChildStdout {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.inner.read_to_end(buf)
+    #[inline]
+    unsafe fn initializer(&self) -> Initializer {
+        Initializer::nop()
     }
 }
 
@@ -183,8 +228,16 @@ impl FromInner<AnonPipe> for ChildStdout {
     }
 }
 
-/// A handle to a child process's stderr. This struct is used in the [`stderr`]
-/// field on [`Child`].
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for ChildStdout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("ChildStdout { .. }")
+    }
+}
+
+/// A handle to a child process's stderr.
+///
+/// This struct is used in the [`stderr`] field on [`Child`].
 ///
 /// [`Child`]: struct.Child.html
 /// [`stderr`]: struct.Child.html#structfield.stderr
@@ -198,8 +251,9 @@ impl Read for ChildStderr {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        self.inner.read_to_end(buf)
+    #[inline]
+    unsafe fn initializer(&self) -> Initializer {
+        Initializer::nop()
     }
 }
 
@@ -217,6 +271,13 @@ impl FromInner<AnonPipe> for ChildStderr {
     }
 }
 
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for ChildStderr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("ChildStderr { .. }")
+    }
+}
+
 /// A process builder, providing fine-grained control
 /// over how a new process should be spawned.
 ///
@@ -228,11 +289,18 @@ impl FromInner<AnonPipe> for ChildStderr {
 /// ```
 /// use std::process::Command;
 ///
-/// let output = Command::new("sh")
-///                      .arg("-c")
-///                      .arg("echo hello")
-///                      .output()
-///                      .expect("failed to execute process");
+/// let output = if cfg!(target_os = "windows") {
+///     Command::new("cmd")
+///             .args(&["/C", "echo hello"])
+///             .output()
+///             .expect("failed to execute process")
+/// } else {
+///     Command::new("sh")
+///             .arg("-c")
+///             .arg("echo hello")
+///             .output()
+///             .expect("failed to execute process")
+/// };
 ///
 /// let hello = output.stdout;
 /// ```
@@ -279,6 +347,27 @@ impl Command {
 
     /// Add an argument to pass to the program.
     ///
+    /// Only one argument can be passed per use. So instead of:
+    ///
+    /// ```no_run
+    /// # std::process::Command::new("sh")
+    /// .arg("-C /path/to/repo")
+    /// # ;
+    /// ```
+    ///
+    /// usage would be:
+    ///
+    /// ```no_run
+    /// # std::process::Command::new("sh")
+    /// .arg("-C")
+    /// .arg("/path/to/repo")
+    /// # ;
+    /// ```
+    ///
+    /// To pass multiple arguments see [`args`].
+    ///
+    /// [`args`]: #method.args
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -300,6 +389,10 @@ impl Command {
 
     /// Add multiple arguments to pass to the program.
     ///
+    /// To pass a single argument see [`arg`].
+    ///
+    /// [`arg`]: #method.arg
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -313,7 +406,9 @@ impl Command {
     ///         .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
-    pub fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut Command {
+    pub fn args<I, S>(&mut self, args: I) -> &mut Command
+        where I: IntoIterator<Item=S>, S: AsRef<OsStr>
+    {
         for arg in args {
             self.arg(arg.as_ref());
         }
@@ -342,6 +437,40 @@ impl Command {
         where K: AsRef<OsStr>, V: AsRef<OsStr>
     {
         self.inner.env(key.as_ref(), val.as_ref());
+        self
+    }
+
+    /// Add or update multiple environment variable mappings.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```no_run
+    /// use std::process::{Command, Stdio};
+    /// use std::env;
+    /// use std::collections::HashMap;
+    ///
+    /// let filtered_env : HashMap<String, String> =
+    ///     env::vars().filter(|&(ref k, _)|
+    ///         k == "TERM" || k == "TZ" || k == "LANG" || k == "PATH"
+    ///     ).collect();
+    ///
+    /// Command::new("printenv")
+    ///         .stdin(Stdio::null())
+    ///         .stdout(Stdio::inherit())
+    ///         .env_clear()
+    ///         .envs(&filtered_env)
+    ///         .spawn()
+    ///         .expect("printenv failed to start");
+    /// ```
+    #[stable(feature = "command_envs", since = "1.19.0")]
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Command
+        where I: IntoIterator<Item=(K, V)>, K: AsRef<OsStr>, V: AsRef<OsStr>
+    {
+        for (ref key, ref val) in vars {
+            self.inner.env(key.as_ref(), val.as_ref());
+        }
         self
     }
 
@@ -420,8 +549,8 @@ impl Command {
     ///         .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
-    pub fn stdin(&mut self, cfg: Stdio) -> &mut Command {
-        self.inner.stdin(cfg.0);
+    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.inner.stdin(cfg.into().0);
         self
     }
 
@@ -440,8 +569,8 @@ impl Command {
     ///         .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
-    pub fn stdout(&mut self, cfg: Stdio) -> &mut Command {
-        self.inner.stdout(cfg.0);
+    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.inner.stdout(cfg.into().0);
         self
     }
 
@@ -460,8 +589,8 @@ impl Command {
     ///         .expect("ls command failed to start");
     /// ```
     #[stable(feature = "process", since = "1.0.0")]
-    pub fn stderr(&mut self, cfg: Stdio) -> &mut Command {
-        self.inner.stderr(cfg.0);
+    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+        self.inner.stderr(cfg.into().0);
         self
     }
 
@@ -622,14 +751,56 @@ impl FromInner<imp::Stdio> for Stdio {
     }
 }
 
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Stdio {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("Stdio { .. }")
+    }
+}
+
+#[stable(feature = "stdio_from", since = "1.20.0")]
+impl From<ChildStdin> for Stdio {
+    fn from(child: ChildStdin) -> Stdio {
+        Stdio::from_inner(child.into_inner().into())
+    }
+}
+
+#[stable(feature = "stdio_from", since = "1.20.0")]
+impl From<ChildStdout> for Stdio {
+    fn from(child: ChildStdout) -> Stdio {
+        Stdio::from_inner(child.into_inner().into())
+    }
+}
+
+#[stable(feature = "stdio_from", since = "1.20.0")]
+impl From<ChildStderr> for Stdio {
+    fn from(child: ChildStderr) -> Stdio {
+        Stdio::from_inner(child.into_inner().into())
+    }
+}
+
+#[stable(feature = "stdio_from", since = "1.20.0")]
+impl From<fs::File> for Stdio {
+    fn from(file: fs::File) -> Stdio {
+        Stdio::from_inner(file.into_inner().into())
+    }
+}
+
 /// Describes the result of a process after it has terminated.
+///
+/// This `struct` is used to represent the exit status of a child process.
+/// Child processes are created via the [`Command`] struct and their exit
+/// status is exposed through the [`status`] method.
+///
+/// [`Command`]: struct.Command.html
+/// [`status`]: struct.Command.html#method.status
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ExitStatus(imp::ExitStatus);
 
 impl ExitStatus {
-    /// Was termination successful? Signal termination not considered a success,
-    /// and success is defined as a zero exit status.
+    /// Was termination successful? Signal termination is not considered a
+    /// success, and success is defined as a zero exit status.
     ///
     /// # Examples
     ///
@@ -657,6 +828,22 @@ impl ExitStatus {
     /// On Unix, this will return `None` if the process was terminated
     /// by a signal; `std::os::unix` provides an extension trait for
     /// extracting the signal and other details from the `ExitStatus`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    ///
+    /// let status = Command::new("mkdir")
+    ///                      .arg("projects")
+    ///                      .status()
+    ///                      .expect("failed to execute mkdir");
+    ///
+    /// match status.code() {
+    ///     Some(code) => println!("Exited with status code: {}", code),
+    ///     None       => println!("Process terminated by signal")
+    /// }
+    /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn code(&self) -> Option<i32> {
         self.0.code()
@@ -754,6 +941,45 @@ impl Child {
         self.handle.wait().map(ExitStatus)
     }
 
+    /// Attempts to collect the exit status of the child if it has already
+    /// exited.
+    ///
+    /// This function will not block the calling thread and will only advisorily
+    /// check to see if the child process has exited or not. If the child has
+    /// exited then on Unix the process id is reaped. This function is
+    /// guaranteed to repeatedly return a successful exit status so long as the
+    /// child has already exited.
+    ///
+    /// If the child has exited, then `Ok(Some(status))` is returned. If the
+    /// exit status is not available at this time then `Ok(None)` is returned.
+    /// If an error occurs, then that error is returned.
+    ///
+    /// Note that unlike `wait`, this function will not attempt to drop stdin.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    ///
+    /// let mut child = Command::new("ls").spawn().unwrap();
+    ///
+    /// match child.try_wait() {
+    ///     Ok(Some(status)) => println!("exited with: {}", status),
+    ///     Ok(None) => {
+    ///         println!("status not ready yet, let's really wait");
+    ///         let res = child.wait();
+    ///         println!("result: {:?}", res);
+    ///     }
+    ///     Err(e) => println!("error attempting to wait: {}", e),
+    /// }
+    /// ```
+    #[stable(feature = "process_try_wait", since = "1.18.0")]
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Ok(self.handle.try_wait()?.map(ExitStatus))
+    }
+
     /// Simultaneously waits for the child to exit and collect all remaining
     /// output on the stdout/stderr handles, returning an `Output`
     /// instance.
@@ -828,13 +1054,47 @@ impl Child {
 /// this function at a known point where there are no more destructors left
 /// to run.
 ///
+/// ## Platform-specific behavior
+///
+/// **Unix**: On Unix-like platforms, it is unlikely that all 32 bits of `exit`
+/// will be visible to a parent process inspecting the exit code. On most
+/// Unix-like platforms, only the eight least-significant bits are considered.
+///
 /// # Examples
 ///
+/// Due to this function’s behavior regarding destructors, a conventional way
+/// to use the function is to extract the actual computation to another
+/// function and compute the exit code from its return value:
+///
 /// ```
+/// use std::io::{self, Write};
+///
+/// fn run_app() -> Result<(), ()> {
+///     // Application logic here
+///     Ok(())
+/// }
+///
+/// fn main() {
+///     ::std::process::exit(match run_app() {
+///        Ok(_) => 0,
+///        Err(err) => {
+///            writeln!(io::stderr(), "error: {:?}", err).unwrap();
+///            1
+///        }
+///     });
+/// }
+/// ```
+///
+/// Due to [platform-specific behavior], the exit code for this example will be
+/// `0` on Linux, but `256` on Windows:
+///
+/// ```no_run
 /// use std::process;
 ///
-/// process::exit(0);
+/// process::exit(0x0100);
 /// ```
+///
+/// [platform-specific behavior]: #platform-specific-behavior
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn exit(code: i32) -> ! {
     ::sys_common::cleanup();
@@ -851,7 +1111,42 @@ pub fn exit(code: i32) -> ! {
 /// will be run. If a clean shutdown is needed it is recommended to only call
 /// this function at a known point where there are no more destructors left
 /// to run.
-#[unstable(feature = "process_abort", issue = "37838")]
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::process;
+///
+/// fn main() {
+///     println!("aborting");
+///
+///     process::abort();
+///
+///     // execution never gets here
+/// }
+/// ```
+///
+/// The [`abort`] function terminates the process, so the destructor will not
+/// get run on the example below:
+///
+/// ```no_run
+/// use std::process;
+///
+/// struct HasDrop;
+///
+/// impl Drop for HasDrop {
+///     fn drop(&mut self) {
+///         println!("This will never be printed!");
+///     }
+/// }
+///
+/// fn main() {
+///     let _x = HasDrop;
+///     process::abort();
+///     // the destructor implemented for HasDrop will never get run
+/// }
+/// ```
+#[stable(feature = "process_abort", since = "1.17.0")]
 pub fn abort() -> ! {
     unsafe { ::sys::abort_internal() };
 }
@@ -869,7 +1164,11 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn smoke() {
-        let p = Command::new("true").spawn();
+        let p = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 0"]).spawn()
+        } else {
+            Command::new("true").spawn()
+        };
         assert!(p.is_ok());
         let mut p = p.unwrap();
         assert!(p.wait().unwrap().success());
@@ -887,7 +1186,11 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn exit_reported_right() {
-        let p = Command::new("false").spawn();
+        let p = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 1"]).spawn()
+        } else {
+            Command::new("false").spawn()
+        };
         assert!(p.is_ok());
         let mut p = p.unwrap();
         assert!(p.wait().unwrap().code() == Some(1));
@@ -926,9 +1229,15 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn stdout_works() {
-        let mut cmd = Command::new("echo");
-        cmd.arg("foobar").stdout(Stdio::piped());
-        assert_eq!(run_output(cmd), "foobar\n");
+        if cfg!(target_os = "windows") {
+            let mut cmd = Command::new("cmd");
+            cmd.args(&["/C", "echo foobar"]).stdout(Stdio::piped());
+            assert_eq!(run_output(cmd), "foobar\r\n");
+        } else {
+            let mut cmd = Command::new("echo");
+            cmd.arg("foobar").stdout(Stdio::piped());
+            assert_eq!(run_output(cmd), "foobar\n");
+        }
     }
 
     #[test]
@@ -988,10 +1297,18 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn test_process_status() {
-        let mut status = Command::new("false").status().unwrap();
+        let mut status = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 1"]).status().unwrap()
+        } else {
+            Command::new("false").status().unwrap()
+        };
         assert!(status.code() == Some(1));
 
-        status = Command::new("true").status().unwrap();
+        status = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 0"]).status().unwrap()
+        } else {
+            Command::new("true").status().unwrap()
+        };
         assert!(status.success());
     }
 
@@ -1007,7 +1324,11 @@ mod tests {
     #[cfg_attr(target_os = "android", ignore)]
     fn test_process_output_output() {
         let Output {status, stdout, stderr}
-             = Command::new("echo").arg("hello").output().unwrap();
+             = if cfg!(target_os = "windows") {
+                 Command::new("cmd").args(&["/C", "echo hello"]).output().unwrap()
+             } else {
+                 Command::new("echo").arg("hello").output().unwrap()
+             };
         let output_str = str::from_utf8(&stdout).unwrap();
 
         assert!(status.success());
@@ -1019,7 +1340,11 @@ mod tests {
     #[cfg_attr(target_os = "android", ignore)]
     fn test_process_output_error() {
         let Output {status, stdout, stderr}
-             = Command::new("mkdir").arg(".").output().unwrap();
+             = if cfg!(target_os = "windows") {
+                 Command::new("cmd").args(&["/C", "mkdir ."]).output().unwrap()
+             } else {
+                 Command::new("mkdir").arg(".").output().unwrap()
+             };
 
         assert!(status.code() == Some(1));
         assert_eq!(stdout, Vec::new());
@@ -1029,14 +1354,22 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn test_finish_once() {
-        let mut prog = Command::new("false").spawn().unwrap();
+        let mut prog = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 1"]).spawn().unwrap()
+        } else {
+            Command::new("false").spawn().unwrap()
+        };
         assert!(prog.wait().unwrap().code() == Some(1));
     }
 
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn test_finish_twice() {
-        let mut prog = Command::new("false").spawn().unwrap();
+        let mut prog = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "exit 1"]).spawn().unwrap()
+        } else {
+            Command::new("false").spawn().unwrap()
+        };
         assert!(prog.wait().unwrap().code() == Some(1));
         assert!(prog.wait().unwrap().code() == Some(1));
     }
@@ -1044,8 +1377,12 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "android", ignore)]
     fn test_wait_with_output_once() {
-        let prog = Command::new("echo").arg("hello").stdout(Stdio::piped())
-            .spawn().unwrap();
+        let prog = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(&["/C", "echo hello"]).stdout(Stdio::piped()).spawn().unwrap()
+        } else {
+            Command::new("echo").arg("hello").stdout(Stdio::piped()).spawn().unwrap()
+        };
+
         let Output {status, stdout, stderr} = prog.wait_with_output().unwrap();
         let output_str = str::from_utf8(&stdout).unwrap();
 
@@ -1080,8 +1417,19 @@ mod tests {
         let output = String::from_utf8(result.stdout).unwrap();
 
         for (ref k, ref v) in env::vars() {
-            // don't check android RANDOM variables
-            if cfg!(target_os = "android") && *k == "RANDOM" {
+            // Don't check android RANDOM variable which seems to change
+            // whenever the shell runs, and our `env_cmd` is indeed running a
+            // shell which means it'll get a different RANDOM than we probably
+            // have.
+            //
+            // Also skip env vars with `-` in the name on android because, well,
+            // I'm not sure. It appears though that the `set` command above does
+            // not print env vars with `-` in the name, so we just skip them
+            // here as we won't find them in the output. Note that most env vars
+            // use `_` instead of `-`, but our build system sets a few env vars
+            // with `-` in the name.
+            if cfg!(target_os = "android") &&
+               (*k == "RANDOM" || k.contains("-")) {
                 continue
             }
 

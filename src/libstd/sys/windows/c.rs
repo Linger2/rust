@@ -14,8 +14,9 @@
 #![cfg_attr(test, allow(dead_code))]
 #![unstable(issue = "0", feature = "windows_c")]
 
-use os::raw::{c_int, c_uint, c_ulong, c_long, c_longlong, c_ushort,};
-use os::raw::{c_char, c_ulonglong};
+use os::raw::{c_int, c_uint, c_ulong, c_long, c_longlong, c_ushort, c_char};
+#[cfg(target_arch = "x86_64")]
+use os::raw::c_ulonglong;
 use libc::{wchar_t, size_t, c_void};
 use ptr;
 
@@ -45,9 +46,11 @@ pub type SIZE_T = usize;
 pub type WORD = u16;
 pub type CHAR = c_char;
 pub type HCRYPTPROV = LONG_PTR;
-pub type ULONG_PTR = c_ulonglong;
+pub type ULONG_PTR = usize;
 pub type ULONG = c_ulong;
+#[cfg(target_arch = "x86_64")]
 pub type ULONGLONG = u64;
+#[cfg(target_arch = "x86_64")]
 pub type DWORDLONG = ULONGLONG;
 
 pub type LPBOOL = *mut BOOL;
@@ -66,8 +69,8 @@ pub type LPVOID = *mut c_void;
 pub type LPWCH = *mut WCHAR;
 pub type LPWIN32_FIND_DATAW = *mut WIN32_FIND_DATAW;
 pub type LPWSADATA = *mut WSADATA;
-pub type LPWSAPROTOCOLCHAIN = *mut WSAPROTOCOLCHAIN;
 pub type LPWSAPROTOCOL_INFO = *mut WSAPROTOCOL_INFO;
+pub type LPSTR = *mut CHAR;
 pub type LPWSTR = *mut WCHAR;
 pub type LPFILETIME = *mut FILETIME;
 
@@ -165,6 +168,7 @@ pub const SYMLINK_FLAG_RELATIVE: DWORD = 0x00000001;
 pub const FSCTL_SET_REPARSE_POINT: DWORD = 0x900a4;
 
 pub const SYMBOLIC_LINK_FLAG_DIRECTORY: DWORD = 0x1;
+pub const SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: DWORD = 0x2;
 
 // Note that these are not actually HANDLEs, just values to pass to GetStdHandle
 pub const STD_INPUT_HANDLE: DWORD = -10i32 as DWORD;
@@ -195,7 +199,10 @@ pub const ERROR_TIMEOUT: DWORD = 0x5B4;
 
 pub const INVALID_HANDLE_VALUE: HANDLE = !0 as HANDLE;
 
+pub const FACILITY_NT_BIT: DWORD = 0x1000_0000;
+
 pub const FORMAT_MESSAGE_FROM_SYSTEM: DWORD = 0x00001000;
+pub const FORMAT_MESSAGE_FROM_HMODULE: DWORD = 0x00000800;
 pub const FORMAT_MESSAGE_IGNORE_INSERTS: DWORD = 0x00000200;
 
 pub const TLS_OUT_OF_INDEXES: DWORD = 0xFFFFFFFF;
@@ -243,6 +250,7 @@ pub const IP_ADD_MEMBERSHIP: c_int = 12;
 pub const IP_DROP_MEMBERSHIP: c_int = 13;
 pub const IPV6_ADD_MEMBERSHIP: c_int = 12;
 pub const IPV6_DROP_MEMBERSHIP: c_int = 13;
+pub const MSG_PEEK: c_int = 0x2;
 
 #[repr(C)]
 pub struct ip_mreq {
@@ -264,6 +272,7 @@ pub const FILE_CURRENT: DWORD = 1;
 pub const FILE_END: DWORD = 2;
 
 pub const WAIT_OBJECT_0: DWORD = 0x00000000;
+pub const WAIT_TIMEOUT: DWORD = 258;
 
 #[cfg(target_env = "msvc")]
 pub const MAX_SYM_NAME: usize = 2000;
@@ -281,12 +290,15 @@ pub const EXCEPTION_STACK_OVERFLOW: DWORD = 0xc00000fd;
 pub const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
 
 pub const PIPE_ACCESS_INBOUND: DWORD = 0x00000001;
+pub const PIPE_ACCESS_OUTBOUND: DWORD = 0x00000002;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = 0x00080000;
 pub const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
 pub const PIPE_WAIT: DWORD = 0x00000000;
 pub const PIPE_TYPE_BYTE: DWORD = 0x00000000;
 pub const PIPE_REJECT_REMOTE_CLIENTS: DWORD = 0x00000008;
 pub const PIPE_READMODE_BYTE: DWORD = 0x00000000;
+
+pub const FD_SETSIZE: usize = 64;
 
 #[repr(C)]
 #[cfg(target_arch = "x86")]
@@ -310,8 +322,6 @@ pub struct WSADATA {
     pub szDescription: [u8; WSADESCRIPTION_LEN + 1],
     pub szSystemStatus: [u8; WSASYS_STATUS_LEN + 1],
 }
-
-pub type WSAEVENT = HANDLE;
 
 #[repr(C)]
 pub struct WSAPROTOCOL_INFO {
@@ -819,12 +829,35 @@ pub enum EXCEPTION_DISPOSITION {
     ExceptionCollidedUnwind
 }
 
-#[link(name = "ws2_32")]
-#[link(name = "userenv")]
-#[link(name = "shell32")]
-#[link(name = "advapi32")]
-#[cfg(not(cargobuild))]
-extern {}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CONSOLE_READCONSOLE_CONTROL {
+    pub nLength: ULONG,
+    pub nInitialChars: ULONG,
+    pub dwCtrlWakeupMask: ULONG,
+    pub dwControlKeyState: ULONG,
+}
+pub type PCONSOLE_READCONSOLE_CONTROL = *mut CONSOLE_READCONSOLE_CONTROL;
+
+#[repr(C)]
+#[derive(Copy)]
+pub struct fd_set {
+    pub fd_count: c_uint,
+    pub fd_array: [SOCKET; FD_SETSIZE],
+}
+
+impl Clone for fd_set {
+    fn clone(&self) -> fd_set {
+        *self
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct timeval {
+    pub tv_sec: c_long,
+    pub tv_usec: c_long,
+}
 
 extern "system" {
     pub fn WSAStartup(wVersionRequested: WORD,
@@ -849,12 +882,11 @@ extern "system" {
     pub fn LeaveCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
     pub fn DeleteCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
 
-    // FIXME - pInputControl should be PCONSOLE_READCONSOLE_CONTROL
     pub fn ReadConsoleW(hConsoleInput: HANDLE,
                         lpBuffer: LPVOID,
                         nNumberOfCharsToRead: DWORD,
                         lpNumberOfCharsRead: LPDWORD,
-                        pInputControl: LPVOID) -> BOOL;
+                        pInputControl: PCONSOLE_READCONSOLE_CONTROL) -> BOOL;
 
     pub fn WriteConsoleW(hConsoleOutput: HANDLE,
                          lpBuffer: LPCVOID,
@@ -906,7 +938,7 @@ extern "system" {
     pub fn Sleep(dwMilliseconds: DWORD);
     pub fn GetProcessId(handle: HANDLE) -> DWORD;
     pub fn GetUserProfileDirectoryW(hToken: HANDLE,
-                                    lpProfileDir: LPCWSTR,
+                                    lpProfileDir: LPWSTR,
                                     lpcchSize: *mut DWORD) -> BOOL;
     pub fn SetHandleInformation(hObject: HANDLE,
                                 dwMask: DWORD,
@@ -929,7 +961,6 @@ extern "system" {
                           args: *const c_void)
                           -> DWORD;
     pub fn TlsAlloc() -> DWORD;
-    pub fn TlsFree(dwTlsIndex: DWORD) -> BOOL;
     pub fn TlsGetValue(dwTlsIndex: DWORD) -> LPVOID;
     pub fn TlsSetValue(dwTlsIndex: DWORD, lpTlsvalue: LPVOID) -> BOOL;
     pub fn GetLastError() -> DWORD;
@@ -963,6 +994,14 @@ extern "system" {
     pub fn DeleteFileW(lpPathName: LPCWSTR) -> BOOL;
     pub fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: LPWSTR) -> DWORD;
     pub fn SetCurrentDirectoryW(lpPathName: LPCWSTR) -> BOOL;
+    pub fn WideCharToMultiByte(CodePage: UINT,
+                               dwFlags: DWORD,
+                               lpWideCharStr: LPCWSTR,
+                               cchWideChar: c_int,
+                               lpMultiByteStr: LPSTR,
+                               cbMultiByte: c_int,
+                               lpDefaultChar: LPCSTR,
+                               lpUsedDefaultChar: LPBOOL) -> c_int;
 
     pub fn closesocket(socket: SOCKET) -> c_int;
     pub fn recv(socket: SOCKET, buf: *mut c_void, len: c_int,
@@ -1108,6 +1147,11 @@ extern "system" {
                                lpOverlapped: LPOVERLAPPED,
                                lpNumberOfBytesTransferred: LPDWORD,
                                bWait: BOOL) -> BOOL;
+    pub fn select(nfds: c_int,
+                  readfds: *mut fd_set,
+                  writefds: *mut fd_set,
+                  exceptfds: *mut fd_set,
+                  timeout: *const timeval) -> c_int;
 }
 
 // Functions that aren't available on Windows XP, but we still use them and just
@@ -1168,3 +1212,34 @@ compat_fn! {
         panic!("rwlocks not available")
     }
 }
+
+#[cfg(target_env = "gnu")]
+mod gnu {
+    use super::*;
+
+    pub const PROCESS_QUERY_INFORMATION: DWORD = 0x0400;
+
+    pub const CP_ACP: UINT = 0;
+
+    pub const WC_NO_BEST_FIT_CHARS: DWORD = 0x00000400;
+
+    extern "system" {
+        pub fn OpenProcess(dwDesiredAccess: DWORD,
+                           bInheritHandle: BOOL,
+                           dwProcessId: DWORD) -> HANDLE;
+    }
+
+    compat_fn! {
+        kernel32:
+
+        pub fn QueryFullProcessImageNameW(_hProcess: HANDLE,
+                                          _dwFlags: DWORD,
+                                          _lpExeName: LPWSTR,
+                                          _lpdwSize: LPDWORD) -> BOOL {
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED as DWORD); 0
+        }
+    }
+}
+
+#[cfg(target_env = "gnu")]
+pub use self::gnu::*;

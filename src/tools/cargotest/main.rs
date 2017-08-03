@@ -21,35 +21,40 @@ struct Test {
     lock: Option<&'static str>,
 }
 
-const TEST_REPOS: &'static [Test] = &[Test {
-                                          name: "cargo",
-                                          repo: "https://github.com/rust-lang/cargo",
-                                          sha: "806e3c368a15f618244a3b4e918bf77f9c403fd0",
-                                          lock: None,
-                                      },
-                                      Test {
-                                          name: "iron",
-                                          repo: "https://github.com/iron/iron",
-                                          sha: "16c858ec2901e2992fe5e529780f59fa8ed12903",
-                                          lock: Some(include_str!("lockfiles/iron-Cargo.lock")),
-                                      }];
-
+const TEST_REPOS: &'static [Test] = &[
+    Test {
+        name: "iron",
+        repo: "https://github.com/iron/iron",
+        sha: "21c7dae29c3c214c08533c2a55ac649b418f2fe3",
+        lock: Some(include_str!("lockfiles/iron-Cargo.lock")),
+    },
+    Test {
+        name: "ripgrep",
+        repo: "https://github.com/BurntSushi/ripgrep",
+        sha: "b65bb37b14655e1a89c7cd19c8b011ef3e312791",
+        lock: None,
+    },
+    Test {
+        name: "tokei",
+        repo: "https://github.com/Aaronepower/tokei",
+        sha: "5e11c4852fe4aa086b0e4fe5885822fbe57ba928",
+        lock: None,
+    },
+    Test {
+        name: "treeify",
+        repo: "https://github.com/dzamlo/treeify",
+        sha: "999001b223152441198f117a68fb81f57bc086dd",
+        lock: None,
+    },
+    Test {
+        name: "xsv",
+        repo: "https://github.com/BurntSushi/xsv",
+        sha: "a9a7163f2a2953cea426fee1216bec914fe2f56a",
+        lock: None,
+    },
+];
 
 fn main() {
-    // One of the projects being tested here is Cargo, and when being tested
-    // Cargo will at some point call `nmake.exe` on Windows MSVC. Unfortunately
-    // `nmake` will read these two environment variables below and try to
-    // intepret them. We're likely being run, however, from MSYS `make` which
-    // uses the same variables.
-    //
-    // As a result, to prevent confusion and errors, we remove these variables
-    // from our environment to prevent passing MSYS make flags to nmake, causing
-    // it to blow up.
-    if cfg!(target_env = "msvc") {
-        env::remove_var("MAKE");
-        env::remove_var("MAKEFLAGS");
-    }
-
     let args = env::args().collect::<Vec<_>>();
     let ref cargo = args[1];
     let out_dir = Path::new(&args[2]);

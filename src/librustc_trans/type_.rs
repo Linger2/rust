@@ -11,7 +11,7 @@
 #![allow(non_upper_case_globals)]
 
 use llvm;
-use llvm::{TypeRef, Bool, False, True, TypeKind};
+use llvm::{ContextRef, TypeRef, Bool, False, True, TypeKind};
 use llvm::{Float, Double, X86_FP80, PPC_FP128, FP128};
 
 use context::CrateContext;
@@ -82,6 +82,10 @@ impl Type {
         ty!(llvm::LLVMInt8TypeInContext(ccx.llcx()))
     }
 
+    pub fn i8_llcx(llcx: ContextRef) -> Type {
+        ty!(llvm::LLVMInt8TypeInContext(llcx))
+    }
+
     pub fn i16(ccx: &CrateContext) -> Type {
         ty!(llvm::LLVMInt16TypeInContext(ccx.llcx()))
     }
@@ -92,6 +96,10 @@ impl Type {
 
     pub fn i64(ccx: &CrateContext) -> Type {
         ty!(llvm::LLVMInt64TypeInContext(ccx.llcx()))
+    }
+
+    pub fn i128(ccx: &CrateContext) -> Type {
+        ty!(llvm::LLVMIntTypeInContext(ccx.llcx(), 128))
     }
 
     // Creates an integer type with the given number of bits, e.g. i24
@@ -119,6 +127,10 @@ impl Type {
         Type::i8(ccx).ptr_to()
     }
 
+    pub fn i8p_llcx(llcx: ContextRef) -> Type {
+        Type::i8_llcx(llcx).ptr_to()
+    }
+
     pub fn int(ccx: &CrateContext) -> Type {
         match &ccx.tcx().sess.target.target.target_pointer_width[..] {
             "16" => Type::i16(ccx),
@@ -134,7 +146,8 @@ impl Type {
             ast::IntTy::I8 => Type::i8(ccx),
             ast::IntTy::I16 => Type::i16(ccx),
             ast::IntTy::I32 => Type::i32(ccx),
-            ast::IntTy::I64 => Type::i64(ccx)
+            ast::IntTy::I64 => Type::i64(ccx),
+            ast::IntTy::I128 => Type::i128(ccx),
         }
     }
 
@@ -144,7 +157,8 @@ impl Type {
             ast::UintTy::U8 => Type::i8(ccx),
             ast::UintTy::U16 => Type::i16(ccx),
             ast::UintTy::U32 => Type::i32(ccx),
-            ast::UintTy::U64 => Type::i64(ccx)
+            ast::UintTy::U64 => Type::i64(ccx),
+            ast::UintTy::U128 => Type::i128(ccx),
         }
     }
 
@@ -307,6 +321,7 @@ impl Type {
             I16 => Type::i16(cx),
             I32 => Type::i32(cx),
             I64 => Type::i64(cx),
+            I128 => Type::i128(cx),
         }
     }
 

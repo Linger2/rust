@@ -9,21 +9,20 @@
 // except according to those terms.
 
 
-use dep_graph::DepNode;
-use hir::map as ast_map;
+use hir::map as hir_map;
 use hir::def_id::{CRATE_DEF_INDEX};
 use session::{config, Session};
 use syntax::ast::NodeId;
 use syntax::attr;
 use syntax::entry::EntryPointType;
 use syntax_pos::Span;
-use hir::{Item, ItemFn, ImplItem};
+use hir::{Item, ItemFn, ImplItem, TraitItem};
 use hir::itemlikevisit::ItemLikeVisitor;
 
 struct EntryContext<'a, 'tcx: 'a> {
     session: &'a Session,
 
-    map: &'a ast_map::Map<'tcx>,
+    map: &'a hir_map::Map<'tcx>,
 
     // The top-level function called 'main'
     main_fn: Option<(NodeId, Span)>,
@@ -47,15 +46,16 @@ impl<'a, 'tcx> ItemLikeVisitor<'tcx> for EntryContext<'a, 'tcx> {
         find_item(item, self, at_root);
     }
 
+    fn visit_trait_item(&mut self, _trait_item: &'tcx TraitItem) {
+        // entry fn is never a trait item
+    }
 
     fn visit_impl_item(&mut self, _impl_item: &'tcx ImplItem) {
         // entry fn is never an impl item
     }
 }
 
-pub fn find_entry_point(session: &Session, ast_map: &ast_map::Map) {
-    let _task = ast_map.dep_graph.in_task(DepNode::EntryPoint);
-
+pub fn find_entry_point(session: &Session, hir_map: &hir_map::Map) {
     let any_exe = session.crate_types.borrow().iter().any(|ty| {
         *ty == config::CrateTypeExecutable
     });
@@ -65,21 +65,21 @@ pub fn find_entry_point(session: &Session, ast_map: &ast_map::Map) {
     }
 
     // If the user wants no main function at all, then stop here.
-    if attr::contains_name(&ast_map.krate().attrs, "no_main") {
+    if attr::contains_name(&hir_map.krate().attrs, "no_main") {
         session.entry_type.set(Some(config::EntryNone));
         return
     }
 
     let mut ctxt = EntryContext {
-        session: session,
-        map: ast_map,
+        session,
+        map: hir_map,
         main_fn: None,
         attr_main_fn: None,
         start_fn: None,
         non_main_fns: Vec::new(),
     };
 
-    ast_map.krate().visit_all_item_likes(&mut ctxt);
+    hir_map.krate().visit_all_item_likes(&mut ctxt);
 
     configure_main(&mut ctxt);
 }
@@ -128,8 +128,8 @@ fn find_item(item: &Item, ctxt: &mut EntryContext, at_root: bool) {
             } else {
                 struct_span_err!(ctxt.session, item.span, E0137,
                           "multiple functions with a #[main] attribute")
-                .span_label(item.span, &format!("additional #[main] function"))
-                .span_label(ctxt.attr_main_fn.unwrap().1, &format!("first #[main] function"))
+                .span_label(item.span, "additional #[main] function")
+                .span_label(ctxt.attr_main_fn.unwrap().1, "first #[main] function")
                 .emit();
             }
         },
@@ -141,8 +141,8 @@ fn find_item(item: &Item, ctxt: &mut EntryContext, at_root: bool) {
                     ctxt.session, item.span, E0138,
                     "multiple 'start' functions")
                     .span_label(ctxt.start_fn.unwrap().1,
-                                &format!("previous `start` function here"))
-                    .span_label(item.span, &format!("multiple `start` functions"))
+                                "previous `start` function here")
+                    .span_label(item.span, "multiple `start` functions")
                     .emit();
             }
         },
@@ -162,7 +162,7 @@ fn configure_main(this: &mut EntryContext) {
         this.session.entry_type.set(Some(config::EntryMain));
     } else {
         // No main function
-        let mut err = this.session.struct_err("main function not found");
+        let mut err = struct_err!(this.session, E0601, "main function not found");
         if !this.non_main_fns.is_empty() {
             // There were some functions named 'main' though. Try to give the user a hint.
             err.note("the main function must be defined at the crate level \

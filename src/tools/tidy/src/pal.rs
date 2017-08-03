@@ -26,6 +26,7 @@
 //! exceptions:
 //!
 //! - core may not have platform-specific code
+//! - libcompiler_builtins may have platform-specific code
 //! - liballoc_system may have platform-specific code
 //! - liballoc_jemalloc may have platform-specific code
 //! - libpanic_abort may have platform-specific code
@@ -53,6 +54,7 @@ const EXCEPTION_PATHS: &'static [&'static str] = &[
     // std crates
     "src/liballoc_jemalloc",
     "src/liballoc_system",
+    "src/libcompiler_builtins",
     "src/liblibc",
     "src/libpanic_abort",
     "src/libpanic_unwind",
@@ -73,7 +75,7 @@ const EXCEPTION_PATHS: &'static [&'static str] = &[
     "src/libtest", // Probably should defer to unstable std::sys APIs
 
     // std testing crates, ok for now at least
-    "src/libcoretest",
+    "src/libcore/tests",
 
     // non-std crates
     "src/test",
@@ -124,8 +126,7 @@ fn check_cfgs(contents: &mut String, file: &Path,
             Ok(_) => unreachable!(),
             Err(i) => i + 1
         };
-        println!("{}:{}: platform-specific cfg: {}", file.display(), line, cfg);
-        *bad = true;
+        tidy_error!(bad, "{}:{}: platform-specific cfg: {}", file.display(), line, cfg);
     };
 
     for (idx, cfg) in cfgs.into_iter() {
