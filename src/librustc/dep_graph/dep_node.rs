@@ -62,11 +62,11 @@
 
 use hir::def_id::{CrateNum, DefId};
 use hir::map::DefPathHash;
+use hir::{HirId, ItemLocalId};
 
 use ich::Fingerprint;
 use ty::{TyCtxt, Instance, InstanceDef};
 use ty::fast_reject::SimplifiedType;
-use ty::subst::Substs;
 use rustc_data_structures::stable_hasher::{StableHasher, HashStable};
 use ich::StableHashingContext;
 use std::fmt;
@@ -104,6 +104,8 @@ macro_rules! define_dep_nodes {
                 match *self {
                     $(
                         DepKind :: $variant => {
+                            $(return !anon_attr_to_bool!($anon);)*
+
                             // tuple args
                             $({
                                 return <( $($tuple_arg,)* ) as DepNodeParams>
@@ -112,6 +114,7 @@ macro_rules! define_dep_nodes {
 
                             // struct args
                             $({
+
                                 return <( $($struct_arg_ty,)* ) as DepNodeParams>
                                     ::CAN_RECONSTRUCT_QUERY_KEY;
                             })*
@@ -392,8 +395,9 @@ define_dep_nodes!( <'tcx>
     [] WorkProduct(WorkProductId),
 
     // Represents different phases in the compiler.
-    [] RegionMaps(DefId),
+    [] RegionScopeTree(DefId),
     [] Coherence,
+    [] CoherenceInherentImplOverlapCheck,
     [] Resolve,
     [] CoherenceCheckTrait(DefId),
     [] PrivacyAccessLevels(CrateNum),
@@ -408,6 +412,8 @@ define_dep_nodes!( <'tcx>
 
     [] BorrowCheckKrate,
     [] BorrowCheck(DefId),
+    [] MirBorrowCheck(DefId),
+
     [] RvalueCheck(DefId),
     [] Reachability,
     [] MirKeys,
@@ -429,6 +435,7 @@ define_dep_nodes!( <'tcx>
     [] ImplPolarity(DefId),
     [] ClosureKind(DefId),
     [] FnSignature(DefId),
+    [] GenSignature(DefId),
     [] CoerceUnsizedInfo(DefId),
 
     [] ItemVarianceConstraints(DefId),
@@ -444,17 +451,17 @@ define_dep_nodes!( <'tcx>
     [] TypeckBodiesKrate,
     [] TypeckTables(DefId),
     [] HasTypeckTables(DefId),
-    [] ConstEval { def_id: DefId, substs: &'tcx Substs<'tcx> },
+    [anon] ConstEval,
     [] SymbolName(DefId),
     [] InstanceSymbolName { instance: Instance<'tcx> },
     [] SpecializationGraph(DefId),
     [] ObjectSafety(DefId),
 
-    [anon] IsCopy(DefId),
-    [anon] IsSized(DefId),
-    [anon] IsFreeze(DefId),
-    [anon] NeedsDrop(DefId),
-    [anon] Layout(DefId),
+    [anon] IsCopy,
+    [anon] IsSized,
+    [anon] IsFreeze,
+    [anon] NeedsDrop,
+    [anon] Layout,
 
     // The set of impls for a given trait.
     [] TraitImpls(DefId),
@@ -504,8 +511,8 @@ define_dep_nodes!( <'tcx>
     [] ParamEnv(DefId),
     [] DescribeDef(DefId),
     [] DefSpan(DefId),
-    [] Stability(DefId),
-    [] Deprecation(DefId),
+    [] LookupStability(DefId),
+    [] LookupDeprecationEntry(DefId),
     [] ItemBodyNestedBodies(DefId),
     [] ConstIsRvaluePromotableToStatic(DefId),
     [] ImplParent(DefId),
@@ -514,10 +521,60 @@ define_dep_nodes!( <'tcx>
     [] IsMirAvailable(DefId),
     [] ItemAttrs(DefId),
     [] FnArgNames(DefId),
-    [] DylibDepFormats(DefId),
-    [] IsAllocator(DefId),
-    [] IsPanicRuntime(DefId),
+    [] DylibDepFormats(CrateNum),
+    [] IsPanicRuntime(CrateNum),
+    [] IsCompilerBuiltins(CrateNum),
+    [] HasGlobalAllocator(CrateNum),
     [] ExternCrate(DefId),
+    [] LintLevels,
+    [] Specializes { impl1: DefId, impl2: DefId },
+    [] InScopeTraits(HirId),
+    [] ModuleExports(HirId),
+    [] IsSanitizerRuntime(CrateNum),
+    [] IsProfilerRuntime(CrateNum),
+    [] GetPanicStrategy(CrateNum),
+    [] IsNoBuiltins(CrateNum),
+    [] ImplDefaultness(DefId),
+    [] ExportedSymbols(CrateNum),
+    [] NativeLibraries(CrateNum),
+    [] PluginRegistrarFn(CrateNum),
+    [] DeriveRegistrarFn(CrateNum),
+    [] CrateDisambiguator(CrateNum),
+    [] CrateHash(CrateNum),
+    [] OriginalCrateName(CrateNum),
+
+    [] ImplementationsOfTrait { krate: CrateNum, trait_id: DefId },
+    [] AllTraitImplementations(CrateNum),
+
+    [] IsDllimportForeignItem(DefId),
+    [] IsStaticallyIncludedForeignItem(DefId),
+    [] NativeLibraryKind(DefId),
+    [] LinkArgs,
+
+    [] NamedRegion(HirId),
+    [] IsLateBound(HirId),
+    [] ObjectLifetimeDefaults(HirId),
+
+    [] Visibility(DefId),
+    [] DepKind(CrateNum),
+    [] CrateName(CrateNum),
+    [] ItemChildren(DefId),
+    [] ExternModStmtCnum(HirId),
+    [] GetLangItems,
+    [] DefinedLangItems(CrateNum),
+    [] MissingLangItems(CrateNum),
+    [] ExternConstBody(DefId),
+    [] VisibleParentMap,
+    [] IsDirectExternCrate(CrateNum),
+    [] MissingExternCrateItem(CrateNum),
+    [] UsedCrateSource(CrateNum),
+    [] PostorderCnums,
+
+    [] Freevars(HirId),
+    [] MaybeUnusedTraitImport(HirId),
+    [] MaybeUnusedExternCrates,
+    [] StabilityIndex,
+    [] AllCrateNums,
 );
 
 trait DepNodeParams<'a, 'gcx: 'tcx + 'a, 'tcx: 'a> : fmt::Debug {
@@ -622,6 +679,25 @@ impl<'a, 'gcx: 'tcx + 'a, 'tcx: 'a> DepNodeParams<'a, 'gcx, 'tcx> for (DefIdList
         write!(&mut s, "]").unwrap();
 
         s
+    }
+}
+
+impl<'a, 'gcx: 'tcx + 'a, 'tcx: 'a> DepNodeParams<'a, 'gcx, 'tcx> for (HirId,) {
+    const CAN_RECONSTRUCT_QUERY_KEY: bool = false;
+
+    // We actually would not need to specialize the implementation of this
+    // method but it's faster to combine the hashes than to instantiate a full
+    // hashing context and stable-hashing state.
+    fn to_fingerprint(&self, tcx: TyCtxt) -> Fingerprint {
+        let (HirId {
+            owner,
+            local_id: ItemLocalId(local_id),
+        },) = *self;
+
+        let def_path_hash = tcx.def_path_hash(DefId::local(owner));
+        let local_id = Fingerprint::from_smaller_hash(local_id as u64);
+
+        def_path_hash.0.combine(local_id)
     }
 }
 

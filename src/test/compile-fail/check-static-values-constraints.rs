@@ -12,6 +12,7 @@
 
 // gate-test-drop_types_in_const
 
+#![allow(warnings)]
 #![feature(box_syntax)]
 
 use std::marker;
@@ -85,8 +86,9 @@ static STATIC8: SafeStruct = SafeStruct{field1: SafeEnum::Variant1,
 // This example should fail because field1 in the base struct is not safe
 static STATIC9: SafeStruct = SafeStruct{field1: SafeEnum::Variant1,
                                         ..SafeStruct{field1: SafeEnum::Variant3(WithDtor),
+//~^ ERROR destructors in statics are an unstable feature
+//~| ERROR statics are not allowed to have destructors
                                                      field2: SafeEnum::Variant1}};
-//~^^ ERROR destructors in statics are an unstable feature
 
 struct UnsafeStruct;
 

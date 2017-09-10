@@ -340,6 +340,7 @@ pub enum PrintRequest {
     RelocationModels,
     CodeModels,
     TargetSpec,
+    NativeStaticLibs,
 }
 
 pub enum Input {
@@ -918,6 +919,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "when debug-printing compiler state, do not include spans"), // o/w tests have closure@path
     identify_regions: bool = (false, parse_bool, [UNTRACKED],
         "make unnamed regions display as '# (where # is some non-ident unique id)"),
+    emit_end_regions: bool = (false, parse_bool, [UNTRACKED],
+        "emit EndRegion as part of MIR; enable transforms that solely process EndRegion"),
+    borrowck_mir: bool = (false, parse_bool, [UNTRACKED],
+        "implicitly treat functions as if they have `#[rustc_mir_borrowck]` attribute"),
     time_passes: bool = (false, parse_bool, [UNTRACKED],
         "measure time of each rustc pass"),
     count_llvm_insns: bool = (false, parse_bool,
@@ -993,6 +998,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv)"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
           "enable queries of the dependency graph for regression testing"),
+    profile_queries: bool = (false, parse_bool, [UNTRACKED],
+          "trace and profile the queries of the incremental compilation framework"),
+    profile_queries_and_keys: bool = (false, parse_bool, [UNTRACKED],
+          "trace and profile the queries and keys of the incremental compilation framework"),
     no_analysis: bool = (false, parse_bool, [UNTRACKED],
           "parse and expand the source, but run no analysis"),
     extra_plugins: Vec<String> = (Vec::new(), parse_list, [TRACKED],
@@ -1025,6 +1034,9 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "the directory the MIR is dumped into"),
     dump_mir_exclude_pass_number: bool = (false, parse_bool, [UNTRACKED],
           "if set, exclude the pass number when dumping MIR (used in tests)"),
+    mir_emit_validate: usize = (0, parse_uint, [TRACKED],
+          "emit Validate MIR statements, interpreted e.g. by miri (0: do not emit; 1: if function \
+           contains unsafe block, only validate arguments; 2: always emit full validation)"),
     perf_stats: bool = (false, parse_bool, [UNTRACKED],
           "print some performance-related statistics"),
     hir_stats: bool = (false, parse_bool, [UNTRACKED],
@@ -1287,7 +1299,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
                                print on stdout",
                      "[crate-name|file-names|sysroot|cfg|target-list|\
                        target-cpus|target-features|relocation-models|\
-                       code-models|target-spec-json]"),
+                       code-models|target-spec-json|native-static-deps]"),
         opt::flagmulti_s("g",  "",  "Equivalent to -C debuginfo=2"),
         opt::flagmulti_s("O", "", "Equivalent to -C opt-level=2"),
         opt::opt_s("o", "", "Write output to <filename>", "FILENAME"),
@@ -1633,6 +1645,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
             "target-features" => PrintRequest::TargetFeatures,
             "relocation-models" => PrintRequest::RelocationModels,
             "code-models" => PrintRequest::CodeModels,
+            "native-static-libs" => PrintRequest::NativeStaticLibs,
             "target-spec-json" => {
                 if nightly_options::is_unstable_enabled(matches) {
                     PrintRequest::TargetSpec

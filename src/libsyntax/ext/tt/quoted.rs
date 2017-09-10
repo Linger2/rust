@@ -37,7 +37,7 @@ impl Delimited {
         let open_span = if span == DUMMY_SP {
             DUMMY_SP
         } else {
-            Span { hi: span.lo + BytePos(self.delim.len() as u32), ..span }
+            span.with_lo(span.lo() + BytePos(self.delim.len() as u32))
         };
         TokenTree::Token(open_span, self.open_token())
     }
@@ -46,7 +46,7 @@ impl Delimited {
         let close_span = if span == DUMMY_SP {
             DUMMY_SP
         } else {
-            Span { lo: span.hi - BytePos(self.delim.len() as u32), ..span }
+            span.with_lo(span.hi() - BytePos(self.delim.len() as u32))
         };
         TokenTree::Token(close_span, self.close_token())
     }
@@ -152,7 +152,7 @@ pub fn parse(input: tokenstream::TokenStream, expect_matchers: bool, sess: &Pars
                     Some(tokenstream::TokenTree::Token(span, token::Colon)) => match trees.next() {
                         Some(tokenstream::TokenTree::Token(end_sp, ref tok)) => match tok.ident() {
                             Some(kind) => {
-                                let span = Span { lo: start_sp.lo, ..end_sp };
+                                let span = end_sp.with_lo(start_sp.lo());
                                 result.push(TokenTree::MetaVarDecl(span, ident, kind));
                                 continue
                             }
@@ -191,14 +191,14 @@ fn parse_tree<I>(tree: tokenstream::TokenTree,
                 let name_captures = macro_parser::count_names(&sequence);
                 TokenTree::Sequence(span, Rc::new(SequenceRepetition {
                     tts: sequence,
-                    separator: separator,
-                    op: op,
+                    separator,
+                    op,
                     num_captures: name_captures,
                 }))
             }
             Some(tokenstream::TokenTree::Token(ident_span, ref token)) if token.is_ident() => {
                 let ident = token.ident().unwrap();
-                let span = Span { lo: span.lo, ..ident_span };
+                let span = ident_span.with_lo(span.lo());
                 if ident.name == keywords::Crate.name() {
                     let ident = ast::Ident { name: keywords::DollarCrate.name(), ..ident };
                     TokenTree::Token(span, token::Ident(ident))

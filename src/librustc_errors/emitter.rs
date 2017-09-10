@@ -120,7 +120,7 @@ impl EmitterWriter {
         if color_config.use_color() {
             let dst = Destination::from_stderr();
             EmitterWriter {
-                dst: dst,
+                dst,
                 cm: code_map,
             }
         } else {
@@ -156,7 +156,7 @@ impl EmitterWriter {
                     }
                     // We don't have a line yet, create one
                     slot.lines.push(Line {
-                        line_index: line_index,
+                        line_index,
                         annotations: vec![ann],
                     });
                     slot.lines.sort();
@@ -165,9 +165,9 @@ impl EmitterWriter {
             }
             // This is the first time we're seeing the file
             file_vec.push(FileWithAnnotatedLines {
-                file: file,
+                file,
                 lines: vec![Line {
-                                line_index: line_index,
+                                line_index,
                                 annotations: vec![ann],
                             }],
                 multiline_depth: 0,
@@ -183,8 +183,8 @@ impl EmitterWriter {
                     continue;
                 }
 
-                let lo = cm.lookup_char_pos(span_label.span.lo);
-                let mut hi = cm.lookup_char_pos(span_label.span.hi);
+                let lo = cm.lookup_char_pos(span_label.span.lo());
+                let mut hi = cm.lookup_char_pos(span_label.span.hi());
 
                 // Watch out for "empty spans". If we get a span like 6..6, we
                 // want to just display a `^` at 6, so convert that to
@@ -311,7 +311,9 @@ impl EmitterWriter {
         if line.annotations.len() == 1 {
             if let Some(ref ann) = line.annotations.get(0) {
                 if let AnnotationType::MultilineStart(depth) = ann.annotation_type {
-                    if source_string[0..ann.start_col].trim() == "" {
+                    if source_string.chars()
+                                    .take(ann.start_col)
+                                    .all(|c| c.is_whitespace()) {
                         let style = if ann.is_primary {
                             Style::UnderlinePrimary
                         } else {
@@ -681,7 +683,7 @@ impl EmitterWriter {
         if let Some(ref cm) = self.cm {
             for primary_span in msp.primary_spans() {
                 if primary_span != &DUMMY_SP {
-                    let hi = cm.lookup_char_pos(primary_span.hi);
+                    let hi = cm.lookup_char_pos(primary_span.hi());
                     if hi.line > max {
                         max = hi.line;
                     }
@@ -689,7 +691,7 @@ impl EmitterWriter {
             }
             for span_label in msp.span_labels() {
                 if span_label.span != DUMMY_SP {
-                    let hi = cm.lookup_char_pos(span_label.span.hi);
+                    let hi = cm.lookup_char_pos(span_label.span.hi());
                     if hi.line > max {
                         max = hi.line;
                     }
@@ -822,7 +824,7 @@ impl EmitterWriter {
             .map(|_| " ")
             .collect::<String>();
 
-        /// Return wether `style`, or the override if present and the style is `NoStyle`.
+        /// Return whether `style`, or the override if present and the style is `NoStyle`.
         fn style_or_override(style: Style, override_style: Option<Style>) -> Style {
             if let Some(o) = override_style {
                 if style == Style::NoStyle {
@@ -912,7 +914,7 @@ impl EmitterWriter {
         let (primary_lo, cm) = if let (Some(cm), Some(ref primary_span)) =
             (self.cm.as_ref(), msp.primary_span().as_ref()) {
             if primary_span != &&DUMMY_SP {
-                (cm.lookup_char_pos(primary_span.lo), cm)
+                (cm.lookup_char_pos(primary_span.lo()), cm)
             } else {
                 emit_to_destination(&buffer.render(), level, &mut self.dst)?;
                 return Ok(());
@@ -1089,7 +1091,7 @@ impl EmitterWriter {
                                Some(Style::HeaderMsg));
 
             let suggestions = suggestion.splice_lines(cm.borrow());
-            let span_start_pos = cm.lookup_char_pos(primary_sub.span.lo);
+            let span_start_pos = cm.lookup_char_pos(primary_sub.span.lo());
             let line_start = span_start_pos.line;
             draw_col_separator_no_space(&mut buffer, 1, max_line_num_len + 1);
             let mut row_num = 2;

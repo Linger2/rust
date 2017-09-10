@@ -20,7 +20,7 @@ pub use self::region_inference::{GenericKind, VerifyBound};
 
 use hir::def_id::DefId;
 use middle::free_region::{FreeRegionMap, RegionRelations};
-use middle::region::RegionMaps;
+use middle::region;
 use middle::lang_items;
 use mir::tcx::LvalueTy;
 use ty::subst::{Kind, Subst, Substs};
@@ -274,7 +274,7 @@ pub enum LateBoundRegionConversionTime {
     HigherRankedType,
 
     /// when projecting an associated type
-    AssocTypeProjection(ast::Name), // FIXME(tschottdorf): should contain DefId, not Name
+    AssocTypeProjection(DefId),
 }
 
 /// Reasons to create a region inference variable
@@ -358,8 +358,8 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'gcx> {
 impl<'a, 'gcx, 'tcx> InferCtxtBuilder<'a, 'gcx, 'tcx> {
     /// Used only by `rustc_typeck` during body type-checking/inference,
     /// will initialize `in_progress_tables` with fresh `TypeckTables`.
-    pub fn with_fresh_in_progress_tables(mut self) -> Self {
-        self.fresh_tables = Some(RefCell::new(ty::TypeckTables::empty()));
+    pub fn with_fresh_in_progress_tables(mut self, table_owner: DefId) -> Self {
+        self.fresh_tables = Some(RefCell::new(ty::TypeckTables::empty(Some(table_owner))));
         self
     }
 
@@ -1070,7 +1070,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
 
     pub fn resolve_regions_and_report_errors(&self,
                                              region_context: DefId,
-                                             region_map: &RegionMaps,
+                                             region_map: &region::ScopeTree,
                                              free_regions: &FreeRegionMap<'tcx>) {
         let region_rels = RegionRelations::new(self.tcx,
                                                region_context,
@@ -1084,7 +1084,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             // this infcx was in use.  This is totally hokey but
             // otherwise we have a hard time separating legit region
             // errors from silly ones.
-            self.report_region_errors(&errors); // see error_reporting module
+            self.report_region_errors(region_map, &errors); // see error_reporting module
         }
     }
 
@@ -1158,6 +1158,18 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
         let mut r = resolve::OpportunisticTypeResolver::new(self);
         value.fold_with(&mut r)
+    }
+
+    /// Returns true if `T` contains unresolved type variables. In the
+    /// process of visiting `T`, this will resolve (where possible)
+    /// type variables in `T`, but it never constructs the final,
+    /// resolved type, so it's more efficient than
+    /// `resolve_type_vars_if_possible()`.
+    pub fn any_unresolved_type_vars<T>(&self, value: &T) -> bool
+        where T: TypeFoldable<'tcx>
+    {
+        let mut r = resolve::UnresolvedTypeFinder::new(self);
+        value.visit_with(&mut r)
     }
 
     pub fn resolve_type_and_region_vars_if_possible<T>(&self, value: &T) -> T
@@ -1331,9 +1343,10 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     {
         if let Some(tables) = self.in_progress_tables {
             if let Some(id) = self.tcx.hir.as_local_node_id(def_id) {
+                let hir_id = self.tcx.hir.node_to_hir_id(id);
                 return tables.borrow()
-                             .closure_kinds
-                             .get(&id)
+                             .closure_kinds()
+                             .get(hir_id)
                              .cloned()
                              .map(|(kind, _)| kind);
             }
@@ -1353,13 +1366,27 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     pub fn fn_sig(&self, def_id: DefId) -> ty::PolyFnSig<'tcx> {
         if let Some(tables) = self.in_progress_tables {
             if let Some(id) = self.tcx.hir.as_local_node_id(def_id) {
-                if let Some(&ty) = tables.borrow().closure_tys.get(&id) {
+                let hir_id = self.tcx.hir.node_to_hir_id(id);
+                if let Some(&ty) = tables.borrow().closure_tys().get(hir_id) {
                     return ty;
                 }
             }
         }
 
         self.tcx.fn_sig(def_id)
+    }
+
+    pub fn generator_sig(&self, def_id: DefId) -> Option<ty::PolyGenSig<'tcx>> {
+        if let Some(tables) = self.in_progress_tables {
+            if let Some(id) = self.tcx.hir.as_local_node_id(def_id) {
+                let hir_id = self.tcx.hir.node_to_hir_id(id);
+                if let Some(&ty) = tables.borrow().generator_sigs().get(hir_id) {
+                    return ty.map(|t| ty::Binder(t));
+                }
+            }
+        }
+
+        self.tcx.generator_sig(def_id)
     }
 }
 

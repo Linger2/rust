@@ -26,6 +26,7 @@ use rustc::util::nodemap::DefIdMap;
 
 use syntax::abi::Abi;
 use syntax::ast;
+use syntax::attr;
 use rustc::hir::{self, Expr};
 use syntax_pos::Span;
 
@@ -105,7 +106,7 @@ impl<'a, 'tcx> ConstContext<'a, 'tcx> {
     }
 
     /// Evaluate a constant expression in a context where the expression isn't
-    /// guaranteed to be evaluatable.
+    /// guaranteed to be evaluable.
     pub fn eval(&self, e: &Expr) -> EvalResult<'tcx> {
         if self.tables.tainted_by_errors {
             signal!(e, TypeckError);
@@ -274,8 +275,8 @@ fn eval_const_expr_partial<'a, 'tcx>(cx: &ConstContext<'a, 'tcx>,
         }
       }
       hir::ExprPath(ref qpath) => {
-        let substs = cx.tables.node_substs(e.id).subst(tcx, cx.substs);
-          match cx.tables.qpath_def(qpath, e.id) {
+        let substs = cx.tables.node_substs(e.hir_id).subst(tcx, cx.substs);
+          match cx.tables.qpath_def(qpath, e.hir_id) {
               Def::Const(def_id) |
               Def::AssociatedConst(def_id) => {
                     match tcx.at(e.span).const_eval(cx.param_env.and((def_id, substs))) {
@@ -326,7 +327,7 @@ fn eval_const_expr_partial<'a, 'tcx>(cx: &ConstContext<'a, 'tcx>,
                     ConstEvalErr { span: e.span, kind: LayoutError(err) }
                 })
             };
-            match &tcx.item_name(def_id).as_str()[..] {
+            match &tcx.item_name(def_id)[..] {
                 "size_of" => {
                     let size = layout_of(substs.type_at(0))?.size(tcx);
                     return Ok(Integral(Usize(ConstUsize::new(size.bytes(),
@@ -353,7 +354,7 @@ fn eval_const_expr_partial<'a, 'tcx>(cx: &ConstContext<'a, 'tcx>,
             }
           } else {
             if tcx.is_const_fn(def_id) {
-                tcx.sess.cstore.item_body(tcx, def_id)
+                tcx.extern_const_body(def_id)
             } else {
                 signal!(e, TypeckError)
             }
@@ -378,7 +379,7 @@ fn eval_const_expr_partial<'a, 'tcx>(cx: &ConstContext<'a, 'tcx>,
             tcx,
             param_env: cx.param_env,
             tables: tcx.typeck_tables_of(def_id),
-            substs: substs,
+            substs,
             fn_args: Some(call_args)
           };
           callee_cx.eval(&body.value)?
@@ -560,8 +561,15 @@ fn cast_const_int<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         ty::TyUint(ast::UintTy::Us) => {
             Ok(Integral(Usize(ConstUsize::new_truncating(v, tcx.sess.target.uint_type))))
         },
-        ty::TyFloat(ast::FloatTy::F64) => Ok(Float(F64(val.to_f64()))),
-        ty::TyFloat(ast::FloatTy::F32) => Ok(Float(F32(val.to_f32()))),
+        ty::TyFloat(fty) => {
+            if let Some(i) = val.to_u128() {
+                Ok(Float(ConstFloat::from_u128(i, fty)))
+            } else {
+                // The value must be negative, go through signed integers.
+                let i = val.to_u128_unchecked() as i128;
+                Ok(Float(ConstFloat::from_i128(i, fty)))
+            }
+        }
         ty::TyRawPtr(_) => Err(ErrKind::UnimplementedConstVal("casting an address to a raw ptr")),
         ty::TyChar => match val {
             U8(u) => Ok(Char(u as char)),
@@ -574,30 +582,25 @@ fn cast_const_int<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 fn cast_const_float<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                               val: ConstFloat,
                               ty: Ty<'tcx>) -> CastResult<'tcx> {
+    let int_width = |ty| {
+        ty::layout::Integer::from_attr(tcx, ty).size().bits() as usize
+    };
     match ty.sty {
-        ty::TyInt(_) | ty::TyUint(_) => {
-            let i = match val {
-                F32(f) if f >= 0.0 => U128(f as u128),
-                F64(f) if f >= 0.0 => U128(f as u128),
-
-                F32(f) => I128(f as i128),
-                F64(f) => I128(f as i128)
-            };
-
-            if let (I128(_), &ty::TyUint(_)) = (i, &ty.sty) {
-                return Err(CannotCast);
+        ty::TyInt(ity) => {
+            if let Some(i) = val.to_i128(int_width(attr::SignedInt(ity))) {
+                cast_const_int(tcx, I128(i), ty)
+            } else {
+                Err(CannotCast)
             }
-
-            cast_const_int(tcx, i, ty)
         }
-        ty::TyFloat(ast::FloatTy::F64) => Ok(Float(F64(match val {
-            F32(f) => f as f64,
-            F64(f) => f
-        }))),
-        ty::TyFloat(ast::FloatTy::F32) => Ok(Float(F32(match val {
-            F64(f) => f as f32,
-            F32(f) => f
-        }))),
+        ty::TyUint(uty) => {
+            if let Some(i) = val.to_u128(int_width(attr::UnsignedInt(uty))) {
+                cast_const_int(tcx, U128(i), ty)
+            } else {
+                Err(CannotCast)
+            }
+        }
+        ty::TyFloat(fty) => Ok(Float(val.convert(fty))),
         _ => Err(CannotCast),
     }
 }
@@ -691,11 +694,7 @@ fn lit_to_const<'a, 'tcx>(lit: &ast::LitKind,
 
 fn parse_float<'tcx>(num: &str, fty: ast::FloatTy)
                      -> Result<ConstFloat, ErrKind<'tcx>> {
-    let val = match fty {
-        ast::FloatTy::F32 => num.parse::<f32>().map(F32),
-        ast::FloatTy::F64 => num.parse::<f64>().map(F64)
-    };
-    val.map_err(|_| {
+    ConstFloat::from_str(num, fty).map_err(|_| {
         // FIXME(#31407) this is only necessary because float parsing is buggy
         UnimplementedConstVal("could not evaluate float literal (see issue #31407)")
     })
@@ -775,7 +774,7 @@ fn const_eval<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         tcx.mir_const_qualif(def_id);
         tcx.hir.body(tcx.hir.body_owned_by(id))
     } else {
-        tcx.sess.cstore.item_body(tcx, def_id)
+        tcx.extern_const_body(def_id)
     };
     ConstContext::new(tcx, key.param_env.and(substs), tables).eval(&body.value)
 }

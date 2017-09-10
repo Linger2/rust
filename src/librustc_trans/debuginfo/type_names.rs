@@ -36,7 +36,7 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                                           t: Ty<'tcx>,
                                           qualified: bool,
                                           output: &mut String) {
-    // When targeting MSVC, emit C++ style type names for compatability with
+    // When targeting MSVC, emit C++ style type names for compatibility with
     // .natvis visualizers (and perhaps other existing native debuggers?)
     let cpp_like_names = cx.sess().target.target.options.is_like_msvc;
 
@@ -165,6 +165,9 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         ty::TyClosure(..) => {
             output.push_str("closure");
         }
+        ty::TyGenerator(..) => {
+            output.push_str("generator");
+        }
         ty::TyError |
         ty::TyInfer(_) |
         ty::TyProjection(..) |
@@ -186,7 +189,7 @@ pub fn push_debuginfo_type_name<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                 output.push_str(&path_element.data.as_interned_str());
             }
         } else {
-            output.push_str(&cx.tcx().item_name(def_id).as_str());
+            output.push_str(&cx.tcx().item_name(def_id));
         }
     }
 

@@ -38,6 +38,11 @@ impl<'a, 'gcx, 'tcx> Deref for ConfirmContext<'a, 'gcx, 'tcx> {
     }
 }
 
+pub struct ConfirmResult<'tcx> {
+    pub callee: MethodCallee<'tcx>,
+    pub illegal_sized_bound: bool,
+}
+
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     pub fn confirm_method(&self,
                           span: Span,
@@ -46,7 +51,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                           unadjusted_self_ty: Ty<'tcx>,
                           pick: probe::Pick<'tcx>,
                           segment: &hir::PathSegment)
-                          -> MethodCallee<'tcx> {
+                          -> ConfirmResult<'tcx> {
         debug!("confirm(unadjusted_self_ty={:?}, pick={:?}, generic_args={:?})",
                unadjusted_self_ty,
                pick,
@@ -64,10 +69,10 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
            call_expr: &'gcx hir::Expr)
            -> ConfirmContext<'a, 'gcx, 'tcx> {
         ConfirmContext {
-            fcx: fcx,
-            span: span,
-            self_expr: self_expr,
-            call_expr: call_expr,
+            fcx,
+            span,
+            self_expr,
+            call_expr,
         }
     }
 
@@ -75,7 +80,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
                unadjusted_self_ty: Ty<'tcx>,
                pick: probe::Pick<'tcx>,
                segment: &hir::PathSegment)
-               -> MethodCallee<'tcx> {
+               -> ConfirmResult<'tcx> {
         // Adjust the self expression the user provided and obtain the adjusted type.
         let self_ty = self.adjust_self_ty(unadjusted_self_ty, &pick);
 
@@ -91,12 +96,26 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         // Create the final signature for the method, replacing late-bound regions.
         let (method_sig, method_predicates) = self.instantiate_method_sig(&pick, all_substs);
 
+        // If there is a `Self: Sized` bound and `Self` is a trait object, it is possible that
+        // something which derefs to `Self` actually implements the trait and the caller
+        // wanted to make a static dispatch on it but forgot to import the trait.
+        // See test `src/test/ui/issue-35976.rs`.
+        //
+        // In that case, we'll error anyway, but we'll also re-run the search with all traits
+        // in scope, and if we find another method which can be used, we'll output an
+        // appropriate hint suggesting to import the trait.
+        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(&method_predicates);
+
         // Unify the (adjusted) self type with what the method expects.
         self.unify_receivers(self_ty, method_sig.inputs()[0]);
 
         // Add any trait/regions obligations specified on the method's type parameters.
-        let method_ty = self.tcx.mk_fn_ptr(ty::Binder(method_sig));
-        self.add_obligations(method_ty, all_substs, &method_predicates);
+        // We won't add these if we encountered an illegal sized bound, so that we can use
+        // a custom error in that case.
+        if !illegal_sized_bound {
+            let method_ty = self.tcx.mk_fn_ptr(ty::Binder(method_sig));
+            self.add_obligations(method_ty, all_substs, &method_predicates);
+        }
 
         // Create the final `MethodCallee`.
         let callee = MethodCallee {
@@ -109,7 +128,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             self.convert_lvalue_derefs_to_mutable();
         }
 
-        callee
+        ConfirmResult { callee, illegal_sized_bound }
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -213,24 +232,6 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
                 })
             }
 
-            probe::ExtensionImplPick(impl_def_id) => {
-                // The method being invoked is the method as defined on the trait,
-                // so return the substitutions from the trait. Consider:
-                //
-                //     impl<A,B,C> Trait<A,B> for Foo<C> { ... }
-                //
-                // If we instantiate A, B, and C with $A, $B, and $C
-                // respectively, then we want to return the type
-                // parameters from the trait ([$A,$B]), not those from
-                // the impl ([$A,$B,$C]) not the receiver type ([$C]).
-                let impl_polytype = self.impl_self_ty(self.span, impl_def_id);
-                let impl_trait_ref =
-                    self.instantiate_type_scheme(self.span,
-                                                 impl_polytype.substs,
-                                                 &self.tcx.impl_trait_ref(impl_def_id).unwrap());
-                impl_trait_ref.substs
-            }
-
             probe::TraitPick => {
                 let trait_def_id = pick.item.container.id();
 
@@ -292,17 +293,14 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
 
         // Create subst for early-bound lifetime parameters, combining
         // parameters from the type and those from the method.
-        let (supplied_types, supplied_lifetimes) = match segment.parameters {
-            hir::AngleBracketedParameters(ref data) => (&data.types, &data.lifetimes),
-            _ => bug!("unexpected generic arguments: {:?}", segment.parameters),
-        };
         assert_eq!(method_generics.parent_count(), parent_substs.len());
+        let provided = &segment.parameters;
         Substs::for_item(self.tcx, pick.item.def_id, |def, _| {
             let i = def.index as usize;
             if i < parent_substs.len() {
                 parent_substs.region_at(i)
-            } else if let Some(lifetime) =
-                    supplied_lifetimes.get(i - parent_substs.len()) {
+            } else if let Some(lifetime)
+                    = provided.lifetimes.get(i - parent_substs.len()) {
                 AstConv::ast_region_to_region(self.fcx, lifetime, Some(def))
             } else {
                 self.region_var_for_def(self.span, def)
@@ -311,8 +309,8 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             let i = def.index as usize;
             if i < parent_substs.len() {
                 parent_substs.type_at(i)
-            } else if let Some(ast_ty) =
-                    supplied_types.get(i - parent_substs.len() - method_generics.regions.len()) {
+            } else if let Some(ast_ty)
+                    = provided.types.get(i - parent_substs.len() - method_generics.regions.len()) {
                 self.to_ty(ast_ty)
             } else {
                 self.type_var_for_def(self.span, def, cur_substs)
@@ -426,11 +424,14 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             // Fix up the autoderefs. Autorefs can only occur immediately preceding
             // overloaded lvalue ops, and will be fixed by them in order to get
             // the correct region.
-            let mut source = self.node_ty(expr.id);
+            let mut source = self.node_ty(expr.hir_id);
             // Do not mutate adjustments in place, but rather take them,
             // and replace them after mutating them, to avoid having the
             // tables borrowed during (`deref_mut`) method resolution.
-            let previous_adjustments = self.tables.borrow_mut().adjustments.remove(&expr.id);
+            let previous_adjustments = self.tables
+                                           .borrow_mut()
+                                           .adjustments_mut()
+                                           .remove(expr.hir_id);
             if let Some(mut adjustments) = previous_adjustments {
                 let pref = LvaluePreference::PreferMutLvalue;
                 for adjustment in &mut adjustments {
@@ -447,12 +448,12 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
                     }
                     source = adjustment.target;
                 }
-                self.tables.borrow_mut().adjustments.insert(expr.id, adjustments);
+                self.tables.borrow_mut().adjustments_mut().insert(expr.hir_id, adjustments);
             }
 
             match expr.node {
                 hir::ExprIndex(ref base_expr, ref index_expr) => {
-                    let index_expr_ty = self.node_ty(index_expr.id);
+                    let index_expr_ty = self.node_ty(index_expr.hir_id);
                     self.convert_lvalue_op_to_mutable(
                         LvalueOp::Index, expr, base_expr, &[index_expr_ty]);
                 }
@@ -479,7 +480,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         }
 
         let base_ty = self.tables.borrow().expr_adjustments(base_expr).last()
-            .map_or_else(|| self.node_ty(expr.id), |adj| adj.target);
+            .map_or_else(|| self.node_ty(expr.hir_id), |adj| adj.target);
         let base_ty = self.resolve_type_vars_if_possible(&base_ty);
 
         // Need to deref because overloaded lvalue ops take self by-reference.
@@ -494,7 +495,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             None => return self.tcx.sess.delay_span_bug(expr.span, "re-trying op failed")
         };
         debug!("convert_lvalue_op_to_mutable: method={:?}", method);
-        self.write_method_call(expr.id, method);
+        self.write_method_call(expr.hir_id, method);
 
         let (region, mutbl) = if let ty::TyRef(r, mt) = method.sig.inputs()[0].sty {
             (r, mt.mutbl)
@@ -504,8 +505,11 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
 
         // Convert the autoref in the base expr to mutable with the correct
         // region and mutability.
-        let base_expr_ty = self.node_ty(base_expr.id);
-        if let Some(adjustments) = self.tables.borrow_mut().adjustments.get_mut(&base_expr.id) {
+        let base_expr_ty = self.node_ty(base_expr.hir_id);
+        if let Some(adjustments) = self.tables
+                                       .borrow_mut()
+                                       .adjustments_mut()
+                                       .get_mut(base_expr.hir_id) {
             let mut source = base_expr_ty;
             for adjustment in &mut adjustments[..] {
                 if let Adjust::Borrow(AutoBorrow::Ref(..)) = adjustment.kind {
@@ -532,6 +536,30 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
 
     ///////////////////////////////////////////////////////////////////////////
     // MISCELLANY
+
+    fn predicates_require_illegal_sized_bound(&self,
+                                              predicates: &ty::InstantiatedPredicates<'tcx>)
+                                              -> bool {
+        let sized_def_id = match self.tcx.lang_items().sized_trait() {
+            Some(def_id) => def_id,
+            None => return false,
+        };
+
+        traits::elaborate_predicates(self.tcx, predicates.predicates.clone())
+            .filter_map(|predicate| {
+                match predicate {
+                    ty::Predicate::Trait(trait_pred) if trait_pred.def_id() == sized_def_id =>
+                        Some(trait_pred),
+                    _ => None,
+                }
+            })
+            .any(|trait_pred| {
+                match trait_pred.0.self_ty().sty {
+                    ty::TyDynamic(..) => true,
+                    _ => false,
+                }
+            })
+    }
 
     fn enforce_illegal_method_limitations(&self, pick: &probe::Pick) {
         // Disallow calls to the method `drop` defined in the `Drop` trait.

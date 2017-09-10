@@ -384,6 +384,11 @@ pub unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 /// over time. That being said, the semantics will almost always end up pretty
 /// similar to [C11's definition of volatile][c11].
 ///
+/// The compiler shouldn't change the relative order or number of volatile
+/// memory operations. However, volatile memory operations on zero-sized types
+/// (e.g. if a zero-sized type is passed to `read_volatile`) are no-ops
+/// and may be ignored.
+///
 /// [c11]: http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 ///
 /// # Safety
@@ -426,6 +431,11 @@ pub unsafe fn read_volatile<T>(src: *const T) -> T {
 /// so the precise semantics of what "volatile" means here is subject to change
 /// over time. That being said, the semantics will almost always end up pretty
 /// similar to [C11's definition of volatile][c11].
+///
+/// The compiler shouldn't change the relative order or number of volatile
+/// memory operations. However, volatile memory operations on zero-sized types
+/// (e.g. if a zero-sized type is passed to `write_volatile`) are no-ops
+/// and may be ignored.
 ///
 /// [c11]: http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 ///
@@ -865,33 +875,9 @@ pub fn eq<T: ?Sized>(a: *const T, b: *const T) -> bool {
     a == b
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Clone for *const T {
-    #[inline]
-    fn clone(&self) -> *const T {
-        *self
-    }
-}
-
-#[stable(feature = "rust1", since = "1.0.0")]
-impl<T: ?Sized> Clone for *mut T {
-    #[inline]
-    fn clone(&self) -> *mut T {
-        *self
-    }
-}
-
 // Impls for function pointers
 macro_rules! fnptr_impls_safety_abi {
     ($FnTy: ty, $($Arg: ident),*) => {
-        #[stable(feature = "rust1", since = "1.0.0")]
-        impl<Ret, $($Arg),*> Clone for $FnTy {
-            #[inline]
-            fn clone(&self) -> Self {
-                *self
-            }
-        }
-
         #[stable(feature = "fnptr_impls", since = "1.4.0")]
         impl<Ret, $($Arg),*> PartialEq for $FnTy {
             #[inline]

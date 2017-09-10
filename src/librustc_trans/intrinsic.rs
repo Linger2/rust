@@ -104,7 +104,7 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
     let sig = tcx.erase_late_bound_regions_and_normalize(&sig);
     let arg_tys = sig.inputs();
     let ret_ty = sig.output();
-    let name = &*tcx.item_name(def_id).as_str();
+    let name = &*tcx.item_name(def_id);
 
     let llret_ty = type_of::type_of(ccx, ret_ty);
 
@@ -246,7 +246,11 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
                 let val = if fn_ty.args[1].is_indirect() {
                     bcx.load(llargs[1], None)
                 } else {
-                    from_immediate(bcx, llargs[1])
+                    if !type_is_zero_size(ccx, tp_ty) {
+                        from_immediate(bcx, llargs[1])
+                    } else {
+                        C_nil(ccx)
+                    }
                 };
                 let ptr = bcx.pointercast(llargs[0], val_ty(val).ptr_to());
                 let store = bcx.volatile_store(val, ptr);
@@ -378,6 +382,18 @@ pub fn trans_intrinsic_call<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
                 }
                 _ => C_null(llret_ty)
             }
+        }
+
+        "align_offset" => {
+            // `ptr as usize`
+            let ptr_val = bcx.ptrtoint(llargs[0], bcx.ccx.int_type());
+            // `ptr_val % align`
+            let offset = bcx.urem(ptr_val, llargs[1]);
+            let zero = C_null(bcx.ccx.int_type());
+            // `offset == 0`
+            let is_zero = bcx.icmp(llvm::IntPredicate::IntEQ, offset, zero);
+            // `if offset == 0 { 0 } else { offset - align }`
+            bcx.select(is_zero, zero, bcx.sub(offset, llargs[1]))
         }
         name if name.starts_with("simd_") => {
             generic_simd_intrinsic(bcx, name,
@@ -806,7 +822,7 @@ fn trans_msvc_try<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
         catchswitch.add_handler(cs, catchpad.llbb());
 
         let tcx = ccx.tcx();
-        let tydesc = match tcx.lang_items.msvc_try_filter() {
+        let tydesc = match tcx.lang_items().msvc_try_filter() {
             Some(did) => ::consts::get_static(ccx, did),
             None => bug!("msvc_try_filter not defined"),
         };

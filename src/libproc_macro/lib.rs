@@ -23,10 +23,7 @@
 //!
 //! See [the book](../book/first-edition/procedural-macros.html) for more.
 
-#![crate_name = "proc_macro"]
 #![stable(feature = "proc_macro_lib", since = "1.15.0")]
-#![crate_type = "rlib"]
-#![crate_type = "dylib"]
 #![deny(warnings)]
 #![deny(missing_docs)]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -45,6 +42,12 @@
 #[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
+extern crate rustc_errors;
+
+mod diagnostic;
+
+#[unstable(feature = "proc_macro", issue = "38356")]
+pub use diagnostic::{Diagnostic, Level};
 
 use std::{ascii, fmt, iter};
 use std::str::FromStr;
@@ -92,10 +95,7 @@ impl FromStr for TokenStream {
             // notify the expansion info that it is unhygienic
             let mark = Mark::fresh(mark);
             mark.set_expn_info(expn_info);
-            let span = syntax_pos::Span {
-                ctxt: SyntaxContext::empty().apply_mark(mark),
-                ..call_site
-            };
+            let span = call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark));
             let stream = parse::parse_stream_from_source_str(name, src, sess, Some(span));
             Ok(__internal::token_stream_wrap(stream))
         })
@@ -111,7 +111,7 @@ impl fmt::Display for TokenStream {
 
 /// `quote!(..)` accepts arbitrary tokens and expands into a `TokenStream` describing the input.
 /// For example, `quote!(a + b)` will produce a expression, that, when evaluated, constructs
-/// constructs the `TokenStream` `[Word("a"), Op('+', Alone), Word("b")]`.
+/// the `TokenStream` `[Word("a"), Op('+', Alone), Word("b")]`.
 ///
 /// Unquoting is done with `$`, and works by taking the single next ident as the unquoted term.
 /// To quote `$` itself, use `$$`.
@@ -180,10 +180,10 @@ pub struct Span(syntax_pos::Span);
 #[unstable(feature = "proc_macro", issue = "38356")]
 impl Default for Span {
     fn default() -> Span {
-        ::__internal::with_sess(|(_, mark)| Span(syntax_pos::Span {
-            ctxt: SyntaxContext::empty().apply_mark(mark),
-            ..mark.expn_info().unwrap().call_site
-        }))
+        ::__internal::with_sess(|(_, mark)| {
+            let call_site = mark.expn_info().unwrap().call_site;
+            Span(call_site.with_ctxt(SyntaxContext::empty().apply_mark(mark)))
+        })
     }
 }
 
@@ -194,12 +194,28 @@ pub fn quote_span(span: Span) -> TokenStream {
     TokenStream(quote::Quote::quote(&span.0))
 }
 
+macro_rules! diagnostic_method {
+    ($name:ident, $level:expr) => (
+        /// Create a new `Diagnostic` with the given `message` at the span
+        /// `self`.
+        #[unstable(feature = "proc_macro", issue = "38356")]
+        pub fn $name<T: Into<String>>(self, message: T) -> Diagnostic {
+            Diagnostic::spanned(self, $level, message)
+        }
+    )
+}
+
 impl Span {
     /// The span of the invocation of the current procedural macro.
     #[unstable(feature = "proc_macro", issue = "38356")]
     pub fn call_site() -> Span {
         ::__internal::with_sess(|(_, mark)| Span(mark.expn_info().unwrap().call_site))
     }
+
+    diagnostic_method!(error, Level::Error);
+    diagnostic_method!(warning, Level::Warning);
+    diagnostic_method!(note, Level::Note);
+    diagnostic_method!(help, Level::Help);
 }
 
 /// A single token or a delimited sequence of token trees (e.g. `[1, (), ..]`).
@@ -241,14 +257,14 @@ pub enum TokenNode {
 }
 
 /// Describes how a sequence of token trees is delimited.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[unstable(feature = "proc_macro", issue = "38356")]
 pub enum Delimiter {
     /// `( ... )`
     Parenthesis,
-    /// `[ ... ]`
-    Brace,
     /// `{ ... }`
+    Brace,
+    /// `[ ... ]`
     Bracket,
     /// An implicit delimiter, e.g. `$var`, where $var is  `...`.
     None,
@@ -274,7 +290,7 @@ impl Term {
 }
 
 /// Whether an `Op` is either followed immediately by another `Op` or followed by whitespace.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[unstable(feature = "proc_macro", issue = "38356")]
 pub enum Spacing {
     /// e.g. `+` is `Alone` in `+ =`.
@@ -573,7 +589,7 @@ impl TokenTree {
                 }).into();
             },
             TokenNode::Term(symbol) => {
-                let ident = ast::Ident { name: symbol.0, ctxt: self.span.0.ctxt };
+                let ident = ast::Ident { name: symbol.0, ctxt: self.span.0.ctxt() };
                 let token =
                     if symbol.0.as_str().starts_with("'") { Lifetime(ident) } else { Ident(ident) };
                 return TokenTree::Token(self.span.0, token).into();

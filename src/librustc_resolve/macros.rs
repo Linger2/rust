@@ -273,7 +273,7 @@ impl<'a> base::Resolver for Resolver<'a> {
                         id: attr::mk_attr_id(),
                         style: ast::AttrStyle::Outer,
                         is_sugared_doc: false,
-                        span: span,
+                        span,
                     });
                 }
             }
@@ -313,14 +313,14 @@ impl<'a> base::Resolver for Resolver<'a> {
     fn check_unused_macros(&self) {
         for did in self.unused_macros.iter() {
             let id_span = match *self.macro_map[did] {
-                SyntaxExtension::NormalTT(_, isp, _) => isp,
+                SyntaxExtension::NormalTT { def_info, .. } => def_info,
                 SyntaxExtension::DeclMacro(.., osp) => osp,
                 _ => None,
             };
             if let Some((id, span)) = id_span {
                 let lint = lint::builtin::UNUSED_MACROS;
-                let msg = "unused macro definition".to_string();
-                self.session.add_lint(lint, id, span, msg);
+                let msg = "unused macro definition";
+                self.session.buffer_lint(lint, id, span, msg);
             } else {
                 bug!("attempted to create unused macro error, but span not available");
             }
@@ -402,7 +402,8 @@ impl<'a> Resolver<'a> {
         let ast::Path { ref segments, span } = *path;
         let path: Vec<_> = segments.iter().map(|seg| respan(seg.span, seg.identifier)).collect();
         let invocation = self.invocations[&scope];
-        self.current_module = invocation.module.get();
+        let module = invocation.module.get();
+        self.current_module = if module.is_trait() { module.parent.unwrap() } else { module };
 
         if path.len() > 1 {
             if !self.use_extern_macros && self.gated_errors.insert(span) {
@@ -491,7 +492,7 @@ impl<'a> Resolver<'a> {
                             let name = ident.name;
                             self.ambiguity_errors.push(AmbiguityError {
                                 span: path_span,
-                                name: name,
+                                name,
                                 b1: shadower,
                                 b2: binding,
                                 lexical: true,
@@ -777,7 +778,7 @@ impl<'a> Resolver<'a> {
             _ => return,
         };
 
-        let crate_name = self.session.cstore.crate_name(krate);
+        let crate_name = self.session.cstore.crate_name_untracked(krate);
 
         self.session.struct_span_err(use_span, warn_msg)
             .help(&format!("instead, import the procedural macro like any other item: \

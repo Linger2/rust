@@ -362,6 +362,10 @@ Here are some simple examples of where you'll run into this error:
 struct Foo { x: &bool }        // error
 struct Foo<'a> { x: &'a bool } // correct
 
+struct Bar { x: Foo }
+               ^^^ expected lifetime parameter
+struct Bar<'a> { x: Foo<'a> } // correct
+
 enum Bar { A(u8), B(&bool), }        // error
 enum Bar<'a> { A(u8), B(&'a bool), } // correct
 
@@ -683,6 +687,108 @@ attributes:
 See also https://doc.rust-lang.org/book/first-edition/no-stdlib.html
 "##,
 
+E0214: r##"
+A generic type was described using parentheses rather than angle brackets.
+For example:
+
+```compile_fail,E0214
+fn main() {
+    let v: Vec(&str) = vec!["foo"];
+}
+```
+
+This is not currently supported: `v` should be defined as `Vec<&str>`.
+Parentheses are currently only used with generic types when defining parameters
+for `Fn`-family traits.
+"##,
+
+E0230: r##"
+The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
+message for when a particular trait isn't implemented on a type placed in a
+position that needs that trait. For example, when the following code is
+compiled:
+
+```compile_fail
+#![feature(on_unimplemented)]
+
+fn foo<T: Index<u8>>(x: T){}
+
+#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
+trait Index<Idx> { /* ... */ }
+
+foo(true); // `bool` does not implement `Index<u8>`
+```
+
+There will be an error about `bool` not implementing `Index<u8>`, followed by a
+note saying "the type `bool` cannot be indexed by `u8`".
+
+As you can see, you can specify type parameters in curly braces for
+substitution with the actual types (using the regular format string syntax) in
+a given situation. Furthermore, `{Self}` will substitute to the type (in this
+case, `bool`) that we tried to use.
+
+This error appears when the curly braces contain an identifier which doesn't
+match with any of the type parameters or the string `Self`. This might happen
+if you misspelled a type parameter, or if you intended to use literal curly
+braces. If it is the latter, escape the curly braces with a second curly brace
+of the same type; e.g. a literal `{` is `{{`.
+"##,
+
+E0231: r##"
+The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
+message for when a particular trait isn't implemented on a type placed in a
+position that needs that trait. For example, when the following code is
+compiled:
+
+```compile_fail
+#![feature(on_unimplemented)]
+
+fn foo<T: Index<u8>>(x: T){}
+
+#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
+trait Index<Idx> { /* ... */ }
+
+foo(true); // `bool` does not implement `Index<u8>`
+```
+
+there will be an error about `bool` not implementing `Index<u8>`, followed by a
+note saying "the type `bool` cannot be indexed by `u8`".
+
+As you can see, you can specify type parameters in curly braces for
+substitution with the actual types (using the regular format string syntax) in
+a given situation. Furthermore, `{Self}` will substitute to the type (in this
+case, `bool`) that we tried to use.
+
+This error appears when the curly braces do not contain an identifier. Please
+add one of the same name as a type parameter. If you intended to use literal
+braces, use `{{` and `}}` to escape them.
+"##,
+
+E0232: r##"
+The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
+message for when a particular trait isn't implemented on a type placed in a
+position that needs that trait. For example, when the following code is
+compiled:
+
+```compile_fail
+#![feature(on_unimplemented)]
+
+fn foo<T: Index<u8>>(x: T){}
+
+#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
+trait Index<Idx> { /* ... */ }
+
+foo(true); // `bool` does not implement `Index<u8>`
+```
+
+there will be an error about `bool` not implementing `Index<u8>`, followed by a
+note saying "the type `bool` cannot be indexed by `u8`".
+
+For this to work, some note must be specified. An empty attribute will not do
+anything, please remove the attribute or add some helpful note for users of the
+trait.
+"##,
+
 E0261: r##"
 When using a lifetime like `'a` in a type, it must be declared before being
 used.
@@ -898,92 +1004,6 @@ for v in &vs {
 ```
 "##,
 
-E0272: r##"
-The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
-message for when a particular trait isn't implemented on a type placed in a
-position that needs that trait. For example, when the following code is
-compiled:
-
-```compile_fail
-#![feature(on_unimplemented)]
-
-fn foo<T: Index<u8>>(x: T){}
-
-#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
-trait Index<Idx> { /* ... */ }
-
-foo(true); // `bool` does not implement `Index<u8>`
-```
-
-There will be an error about `bool` not implementing `Index<u8>`, followed by a
-note saying "the type `bool` cannot be indexed by `u8`".
-
-As you can see, you can specify type parameters in curly braces for
-substitution with the actual types (using the regular format string syntax) in
-a given situation. Furthermore, `{Self}` will substitute to the type (in this
-case, `bool`) that we tried to use.
-
-This error appears when the curly braces contain an identifier which doesn't
-match with any of the type parameters or the string `Self`. This might happen
-if you misspelled a type parameter, or if you intended to use literal curly
-braces. If it is the latter, escape the curly braces with a second curly brace
-of the same type; e.g. a literal `{` is `{{`.
-"##,
-
-E0273: r##"
-The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
-message for when a particular trait isn't implemented on a type placed in a
-position that needs that trait. For example, when the following code is
-compiled:
-
-```compile_fail
-#![feature(on_unimplemented)]
-
-fn foo<T: Index<u8>>(x: T){}
-
-#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
-trait Index<Idx> { /* ... */ }
-
-foo(true); // `bool` does not implement `Index<u8>`
-```
-
-there will be an error about `bool` not implementing `Index<u8>`, followed by a
-note saying "the type `bool` cannot be indexed by `u8`".
-
-As you can see, you can specify type parameters in curly braces for
-substitution with the actual types (using the regular format string syntax) in
-a given situation. Furthermore, `{Self}` will substitute to the type (in this
-case, `bool`) that we tried to use.
-
-This error appears when the curly braces do not contain an identifier. Please
-add one of the same name as a type parameter. If you intended to use literal
-braces, use `{{` and `}}` to escape them.
-"##,
-
-E0274: r##"
-The `#[rustc_on_unimplemented]` attribute lets you specify a custom error
-message for when a particular trait isn't implemented on a type placed in a
-position that needs that trait. For example, when the following code is
-compiled:
-
-```compile_fail
-#![feature(on_unimplemented)]
-
-fn foo<T: Index<u8>>(x: T){}
-
-#[rustc_on_unimplemented = "the type `{Self}` cannot be indexed by `{Idx}`"]
-trait Index<Idx> { /* ... */ }
-
-foo(true); // `bool` does not implement `Index<u8>`
-```
-
-there will be an error about `bool` not implementing `Index<u8>`, followed by a
-note saying "the type `bool` cannot be indexed by `u8`".
-
-For this to work, some note must be specified. An empty attribute will not do
-anything, please remove the attribute or add some helpful note for users of the
-trait.
-"##,
 
 E0275: r##"
 This error occurs when there was a recursive trait requirement that overflowed
@@ -1992,6 +2012,9 @@ register_diagnostics! {
 //  E0102, // replaced with E0282
 //  E0134,
 //  E0135,
+//  E0272, // on_unimplemented #0
+//  E0273, // on_unimplemented #1
+//  E0274, // on_unimplemented #2
     E0278, // requirement is not satisfied
     E0279, // requirement is not satisfied
     E0280, // requirement is not satisfied
@@ -2026,4 +2049,5 @@ register_diagnostics! {
     E0495, // cannot infer an appropriate lifetime due to conflicting requirements
     E0566, // conflicting representation hints
     E0623, // lifetime mismatch where both parameters are anonymous regions
+    E0628, // generators cannot have explicit arguments
 }

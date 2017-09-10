@@ -69,8 +69,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         span: pattern.span,
                         match_pairs: vec![MatchPair::new(discriminant_lvalue.clone(), pattern)],
                         bindings: vec![],
-                        guard: guard,
-                        arm_index: arm_index,
+                        guard,
+                        arm_index,
                     }
                 })
                 .collect();
@@ -179,7 +179,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 var_scope = Some(this.new_visibility_scope(scope_span));
             }
             let source_info = SourceInfo {
-                span: span,
+                span,
                 scope: var_scope.unwrap()
             };
             this.declare_binding(source_info, mutability, name, var, ty);
@@ -193,8 +193,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         let local_id = self.var_indices[&var];
         let source_info = self.source_info(span);
         self.cfg.push(block, Statement {
-            source_info: source_info,
-            kind: StatementKind::StorageLive(Lvalue::Local(local_id))
+            source_info,
+            kind: StatementKind::StorageLive(local_id)
         });
         Lvalue::Local(local_id)
     }
@@ -202,11 +202,12 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     pub fn schedule_drop_for_binding(&mut self, var: NodeId, span: Span) {
         let local_id = self.var_indices[&var];
         let var_ty = self.local_decls[local_id].ty;
-        let extent = self.hir.region_maps.var_scope(var);
-        self.schedule_drop(span, extent, &Lvalue::Local(local_id), var_ty);
+        let hir_id = self.hir.tcx().hir.node_to_hir_id(var);
+        let region_scope = self.hir.region_scope_tree.var_scope(hir_id.local_id);
+        self.schedule_drop(span, region_scope, &Lvalue::Local(local_id), var_ty);
     }
 
-    pub fn visit_bindings<F>(&mut self, pattern: &Pattern<'tcx>, mut f: &mut F)
+    pub fn visit_bindings<F>(&mut self, pattern: &Pattern<'tcx>, f: &mut F)
         where F: FnMut(&mut Self, Mutability, Name, NodeId, Span, Ty<'tcx>)
     {
         match *pattern.kind {
@@ -708,10 +709,11 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                var_id, name, var_ty, source_info);
 
         let var = self.local_decls.push(LocalDecl::<'tcx> {
-            mutability: mutability,
+            mutability,
             ty: var_ty.clone(),
             name: Some(name),
-            source_info: source_info,
+            source_info,
+            internal: false,
             is_user_variable: true,
         });
         self.var_indices.insert(var_id, var);

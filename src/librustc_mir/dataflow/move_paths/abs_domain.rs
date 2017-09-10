@@ -21,8 +21,7 @@
 //! `a[x]` would still overlap them both. But that is not this
 //! representation does today.)
 
-use rustc::mir::LvalueElem;
-use rustc::mir::{Operand, ProjectionElem};
+use rustc::mir::{Local, LvalueElem, Operand, ProjectionElem};
 use rustc::ty::Ty;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -37,6 +36,10 @@ pub trait Lift {
     fn lift(&self) -> Self::Abstract;
 }
 impl<'tcx> Lift for Operand<'tcx> {
+    type Abstract = AbstractOperand;
+    fn lift(&self) -> Self::Abstract { AbstractOperand }
+}
+impl Lift for Local {
     type Abstract = AbstractOperand;
     fn lift(&self) -> Self::Abstract { AbstractOperand }
 }
@@ -58,9 +61,9 @@ impl<'tcx> Lift for LvalueElem<'tcx> {
                 ProjectionElem::Subslice { from: from, to: to },
             ProjectionElem::ConstantIndex {offset,min_length,from_end} =>
                 ProjectionElem::ConstantIndex {
-                    offset: offset,
-                    min_length: min_length,
-                    from_end: from_end
+                    offset,
+                    min_length,
+                    from_end,
                 },
             ProjectionElem::Downcast(a, u) =>
                 ProjectionElem::Downcast(a.clone(), u.clone()),

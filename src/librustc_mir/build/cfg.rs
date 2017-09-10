@@ -14,8 +14,9 @@
 //! Routines for manipulating the control-flow graph.
 
 use build::CFG;
-use rustc::middle::region::CodeExtent;
+use rustc::middle::region;
 use rustc::mir::*;
+use rustc::ty;
 
 impl<'tcx> CFG<'tcx> {
     pub fn block_data(&self, blk: BasicBlock) -> &BasicBlockData<'tcx> {
@@ -44,14 +45,17 @@ impl<'tcx> CFG<'tcx> {
         self.block_data_mut(block).statements.push(statement);
     }
 
-    pub fn push_end_region(&mut self,
-                           block: BasicBlock,
-                           source_info: SourceInfo,
-                           extent: CodeExtent) {
-        self.push(block, Statement {
-            source_info: source_info,
-            kind: StatementKind::EndRegion(extent),
-        });
+    pub fn push_end_region<'a, 'gcx:'a+'tcx>(&mut self,
+                                             tcx: ty::TyCtxt<'a, 'gcx, 'tcx>,
+                                             block: BasicBlock,
+                                             source_info: SourceInfo,
+                                             region_scope: region::Scope) {
+        if tcx.sess.emit_end_regions() {
+            self.push(block, Statement {
+                source_info,
+                kind: StatementKind::EndRegion(region_scope),
+            });
+        }
     }
 
     pub fn push_assign(&mut self,
@@ -60,7 +64,7 @@ impl<'tcx> CFG<'tcx> {
                        lvalue: &Lvalue<'tcx>,
                        rvalue: Rvalue<'tcx>) {
         self.push(block, Statement {
-            source_info: source_info,
+            source_info,
             kind: StatementKind::Assign(lvalue.clone(), rvalue)
         });
     }
@@ -93,8 +97,8 @@ impl<'tcx> CFG<'tcx> {
                       block,
                       self.block_data(block));
         self.block_data_mut(block).terminator = Some(Terminator {
-            source_info: source_info,
-            kind: kind,
+            source_info,
+            kind,
         });
     }
 }

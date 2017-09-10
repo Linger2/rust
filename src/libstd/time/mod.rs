@@ -33,10 +33,10 @@ pub use self::duration::Duration;
 
 mod duration;
 
-/// A measurement of a monotonically increasing clock.
+/// A measurement of a monotonically nondecreasing clock.
 /// Opaque and useful only with `Duration`.
 ///
-/// Instants are always guaranteed to be greater than any previously measured
+/// Instants are always guaranteed to be no less than any previously measured
 /// instant when created, and are often useful for tasks such as measuring
 /// benchmarks or timing how long an operation takes.
 ///
@@ -112,7 +112,7 @@ pub struct Instant(time::Instant);
 ///            println!("{}", elapsed.as_secs());
 ///        }
 ///        Err(e) => {
-///            // an error occured!
+///            // an error occurred!
 ///            println!("Error: {:?}", e);
 ///        }
 ///    }
@@ -382,6 +382,17 @@ impl fmt::Debug for SystemTime {
 /// [`SystemTime`] instance to represent another fixed point in time.
 ///
 /// [`SystemTime`]: ../../std/time/struct.SystemTime.html
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::{SystemTime, UNIX_EPOCH};
+///
+/// match SystemTime::now().duration_since(UNIX_EPOCH) {
+///     Ok(n) => println!("1970-01-01 00:00:00 UTC was {} seconds ago!", n.as_secs()),
+///     Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+/// }
+/// ```
 #[stable(feature = "time2", since = "1.8.0")]
 pub const UNIX_EPOCH: SystemTime = SystemTime(time::UNIX_EPOCH);
 

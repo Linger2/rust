@@ -218,7 +218,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     discr: Operand::Consume(discr),
                     switch_ty: discr_ty,
                     values: From::from(values),
-                    targets: targets
+                    targets,
                 });
                 target_blocks
             }
@@ -249,9 +249,9 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                     ).collect();
                     (targets.clone(), TerminatorKind::SwitchInt {
                         discr: Operand::Consume(lvalue.clone()),
-                        switch_ty: switch_ty,
+                        switch_ty,
                         values: From::from(values),
-                        targets: targets,
+                        targets,
                     })
                 };
                 self.cfg.terminate(block, source_info, terminator);
@@ -299,7 +299,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 let fail = self.cfg.start_new_block();
                 if let ty::TyRef(_, mt) = ty.sty {
                     assert!(ty.is_slice());
-                    let eq_def_id = self.hir.tcx().lang_items.eq_trait().unwrap();
+                    let eq_def_id = self.hir.tcx().lang_items().eq_trait().unwrap();
                     let ty = mt.ty;
                     let (mty, method) = self.hir.trait_method(eq_def_id, "eq", ty, &[ty]);
 
@@ -315,7 +315,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                         }),
                         args: vec![val, expect],
                         destination: Some((eq_result.clone(), eq_block)),
-                        cleanup: cleanup,
+                        cleanup,
                     });
 
                     // check the result

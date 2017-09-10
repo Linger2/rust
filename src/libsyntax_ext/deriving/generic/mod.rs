@@ -23,7 +23,7 @@
 //!   and lifetimes for methods.)
 //! - Additional bounds on the type parameters (`TraitDef.additional_bounds`)
 //!
-//! The most important thing for implementers is the `Substructure` and
+//! The most important thing for implementors is the `Substructure` and
 //! `SubstructureFields` objects. The latter groups 5 possibilities of the
 //! arguments:
 //!
@@ -375,16 +375,16 @@ fn find_type_parameters(ty: &ast::Ty,
         }
 
         fn visit_mac(&mut self, mac: &ast::Mac) {
-            let span = Span { ctxt: self.span.ctxt, ..mac.span };
+            let span = mac.span.with_ctxt(self.span.ctxt());
             self.cx.span_err(span, "`derive` cannot be used on items with type macros");
         }
     }
 
     let mut visitor = Visitor {
-        ty_param_names: ty_param_names,
+        ty_param_names,
         types: Vec::new(),
-        span: span,
-        cx: cx,
+        span,
+        cx,
     };
 
     visit::Visitor::visit_ty(&mut visitor, ty);
@@ -499,7 +499,7 @@ impl<'a> TraitDef<'a> {
             ast::ImplItem {
                 id: ast::DUMMY_NODE_ID,
                 span: self.span,
-                ident: ident,
+                ident,
                 vis: ast::Visibility::Inherited,
                 defaultness: ast::Defaultness::Final,
                 attrs: Vec::new(),
@@ -596,7 +596,7 @@ impl<'a> TraitDef<'a> {
                         span: self.span,
                         bound_lifetimes: vec![],
                         bounded_ty: ty,
-                        bounds: bounds,
+                        bounds,
                     };
 
                     let predicate = ast::WherePredicate::BoundPredicate(predicate);
@@ -606,10 +606,10 @@ impl<'a> TraitDef<'a> {
         }
 
         let trait_generics = Generics {
-            lifetimes: lifetimes,
-            ty_params: ty_params,
-            where_clause: where_clause,
-            span: span,
+            lifetimes,
+            ty_params,
+            where_clause,
+            span,
         };
 
         // Create the reference to the trait.
@@ -807,11 +807,11 @@ impl<'a> MethodDef<'a> {
                                 fields: &SubstructureFields)
                                 -> P<Expr> {
         let substructure = Substructure {
-            type_ident: type_ident,
+            type_ident,
             method_ident: cx.ident_of(self.name),
-            self_args: self_args,
-            nonself_args: nonself_args,
-            fields: fields,
+            self_args,
+            nonself_args,
+            fields,
         };
         let mut f = self.combine_substructure.borrow_mut();
         let f: &mut CombineSubstructureFunc = &mut *f;
@@ -924,8 +924,8 @@ impl<'a> MethodDef<'a> {
             ident: method_ident,
             node: ast::ImplItemKind::Method(ast::MethodSig {
                                                 generics: fn_generics,
-                                                abi: abi,
-                                                unsafety: unsafety,
+                                                abi,
+                                                unsafety,
                                                 constness:
                                                     dummy_spanned(ast::Constness::NotConst),
                                                 decl: fn_decl,
@@ -985,7 +985,7 @@ impl<'a> MethodDef<'a> {
             let mut other_fields: Vec<vec::IntoIter<_>> = raw_fields.collect();
             first_field.map(|(span, opt_id, field, attrs)| {
                     FieldInfo {
-                        span: span,
+                        span,
                         name: opt_id,
                         self_: field,
                         other: other_fields.iter_mut()
@@ -995,7 +995,7 @@ impl<'a> MethodDef<'a> {
                                 }
                             })
                             .collect(),
-                        attrs: attrs,
+                        attrs,
                     }
                 })
                 .collect()
@@ -1246,7 +1246,7 @@ impl<'a> MethodDef<'a> {
                                     name: opt_ident,
                                     self_: self_getter_expr,
                                     other: others,
-                                    attrs: attrs,
+                                    attrs,
                         }
                     }).collect::<Vec<FieldInfo>>();
 
@@ -1464,7 +1464,7 @@ impl<'a> MethodDef<'a> {
             .iter()
             .map(|v| {
                 let ident = v.node.name;
-                let sp = Span { ctxt: trait_.span.ctxt, ..v.span };
+                let sp = v.span.with_ctxt(trait_.span.ctxt());
                 let summary = trait_.summarise_struct(cx, &v.node.data);
                 (ident, sp, summary)
             })
@@ -1484,7 +1484,7 @@ impl<'a> TraitDef<'a> {
         let mut named_idents = Vec::new();
         let mut just_spans = Vec::new();
         for field in struct_def.fields() {
-            let sp = Span { ctxt: self.span.ctxt, ..field.span };
+            let sp = field.span.with_ctxt(self.span.ctxt());
             match field.ident {
                 Some(ident) => named_idents.push((ident, sp)),
                 _ => just_spans.push(sp),
@@ -1529,7 +1529,7 @@ impl<'a> TraitDef<'a> {
         let mut paths = Vec::new();
         let mut ident_exprs = Vec::new();
         for (i, struct_field) in struct_def.fields().iter().enumerate() {
-            let sp = Span { ctxt: self.span.ctxt, ..struct_field.span };
+            let sp = struct_field.span.with_ctxt(self.span.ctxt());
             let ident = cx.ident_of(&format!("{}_{}", prefix, i));
             paths.push(codemap::Spanned {
                 span: sp,
@@ -1550,10 +1550,10 @@ impl<'a> TraitDef<'a> {
                             cx.span_bug(sp, "a braced struct with unnamed fields in `derive`");
                         }
                         codemap::Spanned {
-                            span: Span { ctxt: self.span.ctxt, ..pat.span },
+                            span: pat.span.with_ctxt(self.span.ctxt()),
                             node: ast::FieldPat {
                                 ident: ident.unwrap(),
-                                pat: pat,
+                                pat,
                                 is_shorthand: false,
                                 attrs: ast::ThinVec::new(),
                             },
@@ -1582,7 +1582,7 @@ impl<'a> TraitDef<'a> {
          mutbl: ast::Mutability)
          -> (P<ast::Pat>, Vec<(Span, Option<Ident>, P<Expr>, &'a [ast::Attribute])>) {
         let variant_ident = variant.node.name;
-        let sp = Span { ctxt: self.span.ctxt, ..variant.span };
+        let sp = variant.span.with_ctxt(self.span.ctxt());
         let variant_path = cx.path(sp, vec![enum_ident, variant_ident]);
         self.create_struct_pattern(cx, variant_path, &variant.node.data, prefix, mutbl)
     }

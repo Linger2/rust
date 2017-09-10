@@ -629,10 +629,12 @@ extern "rust-intrinsic" {
     /// Aborts the execution of the process.
     pub fn abort() -> !;
 
-    /// Tells LLVM that this point in the code is not reachable,
-    /// enabling further optimizations.
+    /// Tells LLVM that this point in the code is not reachable, enabling
+    /// further optimizations.
     ///
-    /// NB: This is very different from the `unreachable!()` macro!
+    /// NB: This is very different from the `unreachable!()` macro: Unlike the
+    /// macro, which panics when it is executed, it is *undefined behavior* to
+    /// reach code marked with this function.
     pub fn unreachable() -> !;
 
     /// Informs the optimizer that a condition is always true.
@@ -1042,20 +1044,23 @@ extern "rust-intrinsic" {
     /// a size of `count` * `size_of::<T>()` and an alignment of
     /// `min_align_of::<T>()`
     ///
-    /// The volatile parameter is set to `true`, so it will not be optimized out.
+    /// The volatile parameter is set to `true`, so it will not be optimized out
+    /// unless size is equal to zero.
     pub fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T,
                                                   count: usize);
     /// Equivalent to the appropriate `llvm.memmove.p0i8.0i8.*` intrinsic, with
     /// a size of `count` * `size_of::<T>()` and an alignment of
     /// `min_align_of::<T>()`
     ///
-    /// The volatile parameter is set to `true`, so it will not be optimized out.
+    /// The volatile parameter is set to `true`, so it will not be optimized out
+    /// unless size is equal to zero..
     pub fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);
     /// Equivalent to the appropriate `llvm.memset.p0i8.*` intrinsic, with a
     /// size of `count` * `size_of::<T>()` and an alignment of
     /// `min_align_of::<T>()`.
     ///
-    /// The volatile parameter is set to `true`, so it will not be optimized out.
+    /// The volatile parameter is set to `true`, so it will not be optimized out
+    /// unless size is equal to zero.
     pub fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);
 
     /// Perform a volatile load from the `src` pointer.
@@ -1338,4 +1343,81 @@ extern "rust-intrinsic" {
     /// on MSVC it's `*mut [usize; 2]`. For more information see the compiler's
     /// source as well as std's catch implementation.
     pub fn try(f: fn(*mut u8), data: *mut u8, local_ptr: *mut u8) -> i32;
+
+    /// Computes the byte offset that needs to be applied to `ptr` in order to
+    /// make it aligned to `align`.
+    /// If it is not possible to align `ptr`, the implementation returns
+    /// `usize::max_value()`.
+    ///
+    /// There are no guarantees whatsover that offsetting the pointer will not
+    /// overflow or go beyond the allocation that `ptr` points into.
+    /// It is up to the caller to ensure that the returned offset is correct
+    /// in all terms other than alignment.
+    ///
+    /// # Examples
+    ///
+    /// Accessing adjacent `u8` as `u16`
+    ///
+    /// ```
+    /// # #![feature(core_intrinsics)]
+    /// # fn foo(n: usize) {
+    /// # use std::intrinsics::align_offset;
+    /// # use std::mem::align_of;
+    /// # unsafe {
+    /// let x = [5u8, 6u8, 7u8, 8u8, 9u8];
+    /// let ptr = &x[n] as *const u8;
+    /// let offset = align_offset(ptr as *const (), align_of::<u16>());
+    /// if offset < x.len() - n - 1 {
+    ///     let u16_ptr = ptr.offset(offset as isize) as *const u16;
+    ///     assert_ne!(*u16_ptr, 500);
+    /// } else {
+    ///     // while the pointer can be aligned via `offset`, it would point
+    ///     // outside the allocation
+    /// }
+    /// # } }
+    /// ```
+    #[cfg(not(stage0))]
+    pub fn align_offset(ptr: *const (), align: usize) -> usize;
+}
+
+#[cfg(stage0)]
+/// Computes the byte offset that needs to be applied to `ptr` in order to
+/// make it aligned to `align`.
+/// If it is not possible to align `ptr`, the implementation returns
+/// `usize::max_value()`.
+///
+/// There are no guarantees whatsover that offsetting the pointer will not
+/// overflow or go beyond the allocation that `ptr` points into.
+/// It is up to the caller to ensure that the returned offset is correct
+/// in all terms other than alignment.
+///
+/// # Examples
+///
+/// Accessing adjacent `u8` as `u16`
+///
+/// ```
+/// # #![feature(core_intrinsics)]
+/// # fn foo(n: usize) {
+/// # use std::intrinsics::align_offset;
+/// # use std::mem::align_of;
+/// # unsafe {
+/// let x = [5u8, 6u8, 7u8, 8u8, 9u8];
+/// let ptr = &x[n] as *const u8;
+/// let offset = align_offset(ptr as *const (), align_of::<u16>());
+/// if offset < x.len() - n - 1 {
+///     let u16_ptr = ptr.offset(offset as isize) as *const u16;
+///     assert_ne!(*u16_ptr, 500);
+/// } else {
+///     // while the pointer can be aligned via `offset`, it would point
+///     // outside the allocation
+/// }
+/// # } }
+/// ```
+pub unsafe fn align_offset(ptr: *const (), align: usize) -> usize {
+    let offset = ptr as usize % align;
+    if offset == 0 {
+        0
+    } else {
+        align - offset
+    }
 }

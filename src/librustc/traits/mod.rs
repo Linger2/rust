@@ -17,10 +17,10 @@ pub use self::ObligationCauseCode::*;
 
 use hir;
 use hir::def_id::DefId;
-use middle::region::RegionMaps;
+use middle::region;
 use middle::free_region::FreeRegionMap;
 use ty::subst::Substs;
-use ty::{self, Ty, TyCtxt, TypeFoldable, ToPredicate};
+use ty::{self, AdtKind, Ty, TyCtxt, TypeFoldable, ToPredicate};
 use ty::error::{ExpectedFound, TypeError};
 use infer::{InferCtxt};
 
@@ -28,17 +28,17 @@ use std::rc::Rc;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 
-pub use self::coherence::orphan_check;
-pub use self::coherence::overlapping_impls;
-pub use self::coherence::OrphanCheckErr;
+pub use self::coherence::{orphan_check, overlapping_impls, OrphanCheckErr, OverlapResult};
 pub use self::fulfill::{FulfillmentContext, RegionObligation};
 pub use self::project::MismatchedProjectionTypes;
 pub use self::project::{normalize, normalize_projection_type, Normalized};
 pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, Reveal};
 pub use self::object_safety::ObjectSafetyViolation;
 pub use self::object_safety::MethodViolationCode;
+pub use self::on_unimplemented::{OnUnimplementedDirective, OnUnimplementedNote};
 pub use self::select::{EvaluationCache, SelectionContext, SelectionCache};
-pub use self::specialize::{OverlapError, specialization_graph, specializes, translate_substs};
+pub use self::select::IntercrateAmbiguityCause;
+pub use self::specialize::{OverlapError, specialization_graph, translate_substs};
 pub use self::specialize::{SpecializesCache, find_associated_item};
 pub use self::util::elaborate_predicates;
 pub use self::util::supertraits;
@@ -52,6 +52,7 @@ mod error_reporting;
 mod fulfill;
 mod project;
 mod object_safety;
+mod on_unimplemented;
 mod select;
 mod specialize;
 mod structural_impls;
@@ -133,7 +134,7 @@ pub enum ObligationCauseCode<'tcx> {
     RepeatVec,
 
     /// Types of fields (other than the last) in a struct must be sized.
-    FieldSized,
+    FieldSized(AdtKind),
 
     /// Constant expressions must be sized.
     ConstSized,
@@ -310,6 +311,9 @@ pub enum Vtable<'tcx, N> {
 
     /// Same as above, but for a fn pointer type with the given signature.
     VtableFnPointer(VtableFnPointerData<'tcx, N>),
+
+    /// Vtable automatically generated for a generator
+    VtableGenerator(VtableGeneratorData<'tcx, N>),
 }
 
 /// Identifies a particular impl in the source, along with a set of
@@ -326,6 +330,15 @@ pub enum Vtable<'tcx, N> {
 pub struct VtableImplData<'tcx, N> {
     pub impl_def_id: DefId,
     pub substs: &'tcx Substs<'tcx>,
+    pub nested: Vec<N>
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct VtableGeneratorData<'tcx, N> {
+    pub closure_def_id: DefId,
+    pub substs: ty::ClosureSubsts<'tcx>,
+    /// Nested obligations. This can be non-empty if the generator
+    /// signature contains associated types.
     pub nested: Vec<N>
 }
 
@@ -520,9 +533,9 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         debug!("normalize_param_env_or_error: normalized predicates={:?}",
             predicates);
 
-        let region_maps = RegionMaps::new();
+        let region_scope_tree = region::ScopeTree::default();
         let free_regions = FreeRegionMap::new();
-        infcx.resolve_regions_and_report_errors(region_context, &region_maps, &free_regions);
+        infcx.resolve_regions_and_report_errors(region_context, &region_scope_tree, &free_regions);
         let predicates = match infcx.fully_resolve(&predicates) {
             Ok(predicates) => predicates,
             Err(fixup_err) => {
@@ -560,7 +573,7 @@ pub fn fully_normalize<'a, 'gcx, 'tcx, T>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
 {
     debug!("fully_normalize(value={:?})", value);
 
-    let mut selcx = &mut SelectionContext::new(infcx);
+    let selcx = &mut SelectionContext::new(infcx);
     // FIXME (@jroesch) ISSUE 26721
     // I'm not sure if this is a bug or not, needs further investigation.
     // It appears that by reusing the fulfillment_cx here we incur more
@@ -743,6 +756,7 @@ impl<'tcx, N> Vtable<'tcx, N> {
             VtableBuiltin(i) => i.nested,
             VtableDefaultImpl(d) => d.nested,
             VtableClosure(c) => c.nested,
+            VtableGenerator(c) => c.nested,
             VtableObject(d) => d.nested,
             VtableFnPointer(d) => d.nested,
         }
@@ -754,6 +768,7 @@ impl<'tcx, N> Vtable<'tcx, N> {
             &mut VtableParam(ref mut n) => n,
             &mut VtableBuiltin(ref mut i) => &mut i.nested,
             &mut VtableDefaultImpl(ref mut d) => &mut d.nested,
+            &mut VtableGenerator(ref mut c) => &mut c.nested,
             &mut VtableClosure(ref mut c) => &mut c.nested,
             &mut VtableObject(ref mut d) => &mut d.nested,
             &mut VtableFnPointer(ref mut d) => &mut d.nested,
@@ -784,6 +799,11 @@ impl<'tcx, N> Vtable<'tcx, N> {
                 fn_ty: p.fn_ty,
                 nested: p.nested.into_iter().map(f).collect(),
             }),
+            VtableGenerator(c) => VtableGenerator(VtableGeneratorData {
+                closure_def_id: c.closure_def_id,
+                substs: c.substs,
+                nested: c.nested.into_iter().map(f).collect(),
+            }),
             VtableClosure(c) => VtableClosure(VtableClosureData {
                 closure_def_id: c.closure_def_id,
                 substs: c.substs,
@@ -812,6 +832,7 @@ pub fn provide(providers: &mut ty::maps::Providers) {
     *providers = ty::maps::Providers {
         is_object_safe: object_safety::is_object_safe_provider,
         specialization_graph_of: specialize::specialization_graph_provider,
+        specializes: specialize::specializes,
         ..*providers
     };
 }
@@ -820,6 +841,7 @@ pub fn provide_extern(providers: &mut ty::maps::Providers) {
     *providers = ty::maps::Providers {
         is_object_safe: object_safety::is_object_safe_provider,
         specialization_graph_of: specialize::specialization_graph_provider,
+        specializes: specialize::specializes,
         ..*providers
     };
 }

@@ -67,7 +67,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
                 None
-            },
+            }
             Err(e) => {
                 Some(self.report_mismatched_types(cause, expected, actual, e))
             }
@@ -82,7 +82,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
     // Checks that the type of `expr` can be coerced to `expected`.
     //
-    // NB: This code relies on `self.diverges` to be accurate.  In
+    // NB: This code relies on `self.diverges` to be accurate. In
     // particular, assignments to `!` will be permitted if the
     // diverges flag is currently "always".
     pub fn demand_coerce_diag(&self,
@@ -207,7 +207,29 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                  expected: Ty<'tcx>)
                  -> Option<String> {
         match (&expected.sty, &checked_ty.sty) {
-            (&ty::TyRef(_, _), &ty::TyRef(_, _)) => None,
+            (&ty::TyRef(_, exp), &ty::TyRef(_, check)) => match (&exp.ty.sty, &check.ty.sty) {
+                (&ty::TyStr, &ty::TyArray(arr, _)) |
+                (&ty::TyStr, &ty::TySlice(arr)) if arr == self.tcx.types.u8 => {
+                    if let hir::ExprLit(_) = expr.node {
+                        let sp = self.sess().codemap().call_span_if_macro(expr.span);
+                        if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(sp) {
+                            return Some(format!("try `{}`", &src[1..]));
+                        }
+                    }
+                    None
+                },
+                (&ty::TyArray(arr, _), &ty::TyStr) |
+                (&ty::TySlice(arr), &ty::TyStr) if arr == self.tcx.types.u8 => {
+                    if let hir::ExprLit(_) = expr.node {
+                        let sp = self.sess().codemap().call_span_if_macro(expr.span);
+                        if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(sp) {
+                            return Some(format!("try `b{}`", src));
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            },
             (&ty::TyRef(_, mutability), _) => {
                 // Check if it can work when put into a ref. For example:
                 //

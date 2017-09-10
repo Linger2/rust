@@ -9,13 +9,20 @@
 // except according to those terms.
 
 use dep_graph::{DepConstructor, DepNode, DepNodeIndex};
-use hir::def_id::{CrateNum, CRATE_DEF_INDEX, DefId, LOCAL_CRATE};
-use hir::def::Def;
-use hir;
+use errors::{Diagnostic, DiagnosticBuilder};
+use hir::def_id::{CrateNum, DefId, LOCAL_CRATE, DefIndex};
+use hir::def::{Def, Export};
+use hir::{self, TraitCandidate, HirId};
+use hir::svh::Svh;
+use lint;
 use middle::const_val;
-use middle::cstore::{ExternCrate, LinkagePreference};
+use middle::cstore::{ExternCrate, LinkagePreference, NativeLibrary};
+use middle::cstore::{NativeLibraryKind, DepKind, CrateSource};
 use middle::privacy::AccessLevels;
-use middle::region::RegionMaps;
+use middle::region;
+use middle::resolve_lifetime::{Region, ObjectLifetimeDefault};
+use middle::stability::{self, DeprecationEntry};
+use middle::lang_items::{LanguageItems, LangItem};
 use mir;
 use mir::transform::{MirSuite, MirPassIndex};
 use session::CompileResult;
@@ -26,11 +33,14 @@ use ty::item_path;
 use ty::steal::Steal;
 use ty::subst::Substs;
 use ty::fast_reject::SimplifiedType;
-use util::nodemap::{DefIdSet, NodeSet};
+use util::nodemap::{DefIdSet, NodeSet, DefIdMap};
+use util::common::{profq_msg, ProfileQueriesMsg};
 
+use rustc_data_structures::indexed_set::IdxSetBuf;
+use rustc_back::PanicStrategy;
 use rustc_data_structures::indexed_vec::IndexVec;
 use rustc_data_structures::fx::FxHashMap;
-use std::cell::{RefCell, RefMut};
+use std::cell::{RefCell, RefMut, Cell};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -73,6 +83,15 @@ impl Key for CrateNum {
         *self
     }
     fn default_span(&self, _: TyCtxt) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl Key for HirId {
+    fn map_crate(&self) -> CrateNum {
+        LOCAL_CRATE
+    }
+    fn default_span(&self, _tcx: TyCtxt) -> Span {
         DUMMY_SP
     }
 }
@@ -186,7 +205,18 @@ impl<'tcx> Value<'tcx> for ty::SymbolName {
 
 struct QueryMap<D: QueryDescription> {
     phantom: PhantomData<D>,
-    map: FxHashMap<D::Key, (D::Value, DepNodeIndex)>,
+    map: FxHashMap<D::Key, QueryValue<D::Value>>,
+}
+
+struct QueryValue<T> {
+    value: T,
+    index: DepNodeIndex,
+    diagnostics: Option<Box<QueryDiagnostics>>,
+}
+
+struct QueryDiagnostics {
+    diagnostics: Vec<Diagnostic>,
+    emitted_diagnostics: Cell<bool>,
 }
 
 impl<M: QueryDescription> QueryMap<M> {
@@ -198,13 +228,15 @@ impl<M: QueryDescription> QueryMap<M> {
     }
 }
 
-pub struct CycleError<'a, 'tcx: 'a> {
+struct CycleError<'a, 'tcx: 'a> {
     span: Span,
     cycle: RefMut<'a, [(Span, Query<'tcx>)]>,
 }
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
-    pub fn report_cycle(self, CycleError { span, cycle }: CycleError) {
+    fn report_cycle(self, CycleError { span, cycle }: CycleError)
+        -> DiagnosticBuilder<'a>
+    {
         // Subtle: release the refcell lock before invoking `describe()`
         // below by dropping `cycle`.
         let stack = cycle.to_vec();
@@ -233,8 +265,8 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             err.note(&format!("...which then again requires {}, completing the cycle.",
                               stack[0].1.describe(self)));
 
-            err.emit();
-        });
+            return err
+        })
     }
 
     fn cycle_check<F, R>(self, span: Span, query: Query<'gcx>, compute: F)
@@ -402,13 +434,13 @@ impl<'tcx> QueryDescription for queries::def_span<'tcx> {
 }
 
 
-impl<'tcx> QueryDescription for queries::stability<'tcx> {
+impl<'tcx> QueryDescription for queries::lookup_stability<'tcx> {
     fn describe(_: TyCtxt, _: DefId) -> String {
         bug!("stability")
     }
 }
 
-impl<'tcx> QueryDescription for queries::deprecation<'tcx> {
+impl<'tcx> QueryDescription for queries::lookup_deprecation_entry<'tcx> {
     fn describe(_: TyCtxt, _: DefId) -> String {
         bug!("deprecation")
     }
@@ -470,12 +502,6 @@ impl<'tcx> QueryDescription for queries::trait_impls_of<'tcx> {
     }
 }
 
-impl<'tcx> QueryDescription for queries::relevant_trait_impls_for<'tcx> {
-    fn describe(tcx: TyCtxt, (def_id, ty): (DefId, SimplifiedType)) -> String {
-        format!("relevant impls for: `({}, {:?})`", tcx.item_path_str(def_id), ty)
-    }
-}
-
 impl<'tcx> QueryDescription for queries::is_object_safe<'tcx> {
     fn describe(tcx: TyCtxt, def_id: DefId) -> String {
         format!("determine object safety of trait `{}`", tcx.item_path_str(def_id))
@@ -489,20 +515,26 @@ impl<'tcx> QueryDescription for queries::is_const_fn<'tcx> {
 }
 
 impl<'tcx> QueryDescription for queries::dylib_dependency_formats<'tcx> {
-    fn describe(_: TyCtxt, _: DefId) -> String {
+    fn describe(_: TyCtxt, _: CrateNum) -> String {
         "dylib dependency formats of crate".to_string()
     }
 }
 
-impl<'tcx> QueryDescription for queries::is_allocator<'tcx> {
-    fn describe(_: TyCtxt, _: DefId) -> String {
-        "checking if the crate is_allocator".to_string()
+impl<'tcx> QueryDescription for queries::is_panic_runtime<'tcx> {
+    fn describe(_: TyCtxt, _: CrateNum) -> String {
+        "checking if the crate is_panic_runtime".to_string()
     }
 }
 
-impl<'tcx> QueryDescription for queries::is_panic_runtime<'tcx> {
-    fn describe(_: TyCtxt, _: DefId) -> String {
-        "checking if the crate is_panic_runtime".to_string()
+impl<'tcx> QueryDescription for queries::is_compiler_builtins<'tcx> {
+    fn describe(_: TyCtxt, _: CrateNum) -> String {
+        "checking if the crate is_compiler_builtins".to_string()
+    }
+}
+
+impl<'tcx> QueryDescription for queries::has_global_allocator<'tcx> {
+    fn describe(_: TyCtxt, _: CrateNum) -> String {
+        "checking if the crate has_global_allocator".to_string()
     }
 }
 
@@ -512,10 +544,249 @@ impl<'tcx> QueryDescription for queries::extern_crate<'tcx> {
     }
 }
 
+impl<'tcx> QueryDescription for queries::lint_levels<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("computing the lint levels for items in this crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::specializes<'tcx> {
+    fn describe(_tcx: TyCtxt, _: (DefId, DefId)) -> String {
+        format!("computing whether impls specialize one another")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::in_scope_traits<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("fetching the traits in scope at a particular ast node")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::module_exports<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("fetching the exported items for a module")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::is_no_builtins<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("test whether a crate has #![no_builtins]")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::panic_strategy<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("query a crate's configured panic strategy")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::is_profiler_runtime<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("query a crate is #![profiler_runtime]")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::is_sanitizer_runtime<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("query a crate is #![sanitizer_runtime]")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::exported_symbols<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the exported symbols of a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::native_libraries<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the native libraries of a linked crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::plugin_registrar_fn<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the plugin registrar for a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::derive_registrar_fn<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the derive registrar for a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::crate_disambiguator<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the disambiguator a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::crate_hash<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the hash a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::original_crate_name<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up the original name a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::implementations_of_trait<'tcx> {
+    fn describe(_tcx: TyCtxt, _: (CrateNum, DefId)) -> String {
+        format!("looking up implementations of a trait in a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::all_trait_implementations<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up all (?) trait implementations")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::link_args<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up link arguments for a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::named_region<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("fetching info about a named region")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::is_late_bound<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("testing whether a lifetime is late bound")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::object_lifetime_defaults<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("fetching a list of ObjectLifetimeDefault for a lifetime")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::dep_kind<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("fetching what a dependency looks like")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::crate_name<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("fetching what a crate is named")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::extern_mod_stmt_cnum<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("looking up the CrateNum for an `extern mod` statement")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::get_lang_items<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("calculating the lang items map")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::defined_lang_items<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("calculating the lang items defined in a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::missing_lang_items<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("calculating the missing lang items in a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::visible_parent_map<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("calculating the visible parent map")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::missing_extern_crate_item<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("seeing if we're missing an `extern crate` item for this crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::used_crate_source<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking at the source for a crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::postorder_cnums<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("generating a postorder list of CrateNums")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::freevars<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("looking up free variables for a node")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::maybe_unused_trait_import<'tcx> {
+    fn describe(_tcx: TyCtxt, _: HirId) -> String {
+        format!("testing if a trait import is unused")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::maybe_unused_extern_crates<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("looking up all possibly unused extern crates")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::stability_index<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("calculating the stability index for the local crate")
+    }
+}
+
+impl<'tcx> QueryDescription for queries::all_crate_nums<'tcx> {
+    fn describe(_tcx: TyCtxt, _: CrateNum) -> String {
+        format!("fetching all foreign CrateNum instances")
+    }
+}
+
+// If enabled, send a message to the profile-queries thread
+macro_rules! profq_msg {
+    ($tcx:expr, $msg:expr) => {
+        if cfg!(debug_assertions) {
+            if  $tcx.sess.profile_queries() {
+                profq_msg($msg)
+            }
+        }
+    }
+}
+
+// If enabled, format a key using its debug string, which can be
+// expensive to compute (in terms of time).
+macro_rules! profq_key {
+    ($tcx:expr, $key:expr) => {
+        if cfg!(debug_assertions) {
+            if $tcx.sess.profile_queries_and_keys() {
+                Some(format!("{:?}", $key))
+            } else { None }
+        } else { None }
+    }
+}
+
 macro_rules! define_maps {
     (<$tcx:tt>
      $($(#[$attr:meta])*
-       [$($modifiers:tt)*] $name:ident: $node:ident($K:ty) -> $V:ty,)*) => {
+       [$($modifiers:tt)*] fn $name:ident: $node:ident($K:ty) -> $V:ty,)*) => {
         define_map_struct! {
             tcx: $tcx,
             input: ($(([$($modifiers)*] [$($attr)*] [$name]))*)
@@ -538,10 +809,23 @@ macro_rules! define_maps {
             $($(#[$attr])* $name($K)),*
         }
 
+        #[allow(bad_style)]
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub enum QueryMsg {
+            $($name(Option<String>)),*
+        }
+
         impl<$tcx> Query<$tcx> {
             pub fn describe(&self, tcx: TyCtxt) -> String {
-                match *self {
-                    $(Query::$name(key) => queries::$name::describe(tcx, key)),*
+                let (r, name) = match *self {
+                    $(Query::$name(key) => {
+                        (queries::$name::describe(tcx, key), stringify!($name))
+                    })*
+                };
+                if tcx.sess.verbose() {
+                    format!("{} [{}]", r, name)
+                } else {
+                    r
                 }
             }
         }
@@ -580,52 +864,92 @@ macro_rules! define_maps {
                        key,
                        span);
 
-                if let Some(&(ref result, dep_node_index)) = tcx.maps.$name.borrow().map.get(&key) {
-                    tcx.dep_graph.read_index(dep_node_index);
-                    return Ok(f(result));
+                profq_msg!(tcx,
+                    ProfileQueriesMsg::QueryBegin(
+                        span.clone(),
+                        QueryMsg::$name(profq_key!(tcx, key))
+                    )
+                );
+
+                if let Some(value) = tcx.maps.$name.borrow().map.get(&key) {
+                    if let Some(ref d) = value.diagnostics {
+                        if !d.emitted_diagnostics.get() {
+                            d.emitted_diagnostics.set(true);
+                            let handle = tcx.sess.diagnostic();
+                            for diagnostic in d.diagnostics.iter() {
+                                DiagnosticBuilder::new_diagnostic(handle, diagnostic.clone())
+                                    .emit();
+                            }
+                        }
+                    }
+                    profq_msg!(tcx, ProfileQueriesMsg::CacheHit);
+                    tcx.dep_graph.read_index(value.index);
+                    return Ok(f(&value.value));
                 }
+                // else, we are going to run the provider:
+                profq_msg!(tcx, ProfileQueriesMsg::ProviderBegin);
 
                 // FIXME(eddyb) Get more valid Span's on queries.
-                // def_span guard is necesary to prevent a recursive loop,
+                // def_span guard is necessary to prevent a recursive loop,
                 // default_span calls def_span query internally.
                 if span == DUMMY_SP && stringify!($name) != "def_span" {
                     span = key.default_span(tcx)
                 }
 
-                let (result, dep_node_index) = tcx.cycle_check(span, Query::$name(key), || {
+                let res = tcx.cycle_check(span, Query::$name(key), || {
                     let dep_node = Self::to_dep_node(tcx, &key);
 
-                    if dep_node.kind.is_anon() {
-                        tcx.dep_graph.with_anon_task(dep_node.kind, || {
-                            let provider = tcx.maps.providers[key.map_crate()].$name;
-                            provider(tcx.global_tcx(), key)
-                        })
-                    } else {
-                        fn run_provider<'a, 'tcx, 'lcx>(tcx: TyCtxt<'a, 'tcx, 'lcx>,
-                                                        key: $K)
-                                                        -> $V {
-                            let provider = tcx.maps.providers[key.map_crate()].$name;
-                            provider(tcx.global_tcx(), key)
-                        }
+                    tcx.sess.diagnostic().track_diagnostics(|| {
+                        if dep_node.kind.is_anon() {
+                            tcx.dep_graph.with_anon_task(dep_node.kind, || {
+                                let provider = tcx.maps.providers[key.map_crate()].$name;
+                                provider(tcx.global_tcx(), key)
+                            })
+                        } else {
+                            fn run_provider<'a, 'tcx, 'lcx>(tcx: TyCtxt<'a, 'tcx, 'lcx>,
+                                                            key: $K)
+                                                            -> $V {
+                                let provider = tcx.maps.providers[key.map_crate()].$name;
+                                provider(tcx.global_tcx(), key)
+                            }
 
-                        tcx.dep_graph.with_task(dep_node, tcx, key, run_provider)
-                    }
+                            tcx.dep_graph.with_task(dep_node, tcx, key, run_provider)
+                        }
+                    })
                 })?;
+                profq_msg!(tcx, ProfileQueriesMsg::ProviderEnd);
+                let ((result, dep_node_index), diagnostics) = res;
 
                 tcx.dep_graph.read_index(dep_node_index);
+
+                let value = QueryValue {
+                    value: result,
+                    index: dep_node_index,
+                    diagnostics: if diagnostics.len() == 0 {
+                        None
+                    } else {
+                        Some(Box::new(QueryDiagnostics {
+                            diagnostics,
+                            emitted_diagnostics: Cell::new(true),
+                        }))
+                    },
+                };
 
                 Ok(f(&tcx.maps
                          .$name
                          .borrow_mut()
                          .map
                          .entry(key)
-                         .or_insert((result, dep_node_index))
-                         .0))
+                         .or_insert(value)
+                         .value))
             }
 
             pub fn try_get(tcx: TyCtxt<'a, $tcx, 'lcx>, span: Span, key: $K)
-                           -> Result<$V, CycleError<'a, $tcx>> {
-                Self::try_get_with(tcx, span, key, Clone::clone)
+                           -> Result<$V, DiagnosticBuilder<'a>> {
+                match Self::try_get_with(tcx, span, key, Clone::clone) {
+                    Ok(e) => Ok(e),
+                    Err(e) => Err(tcx.report_cycle(e)),
+                }
             }
 
             pub fn force(tcx: TyCtxt<'a, $tcx, 'lcx>, span: Span, key: $K) {
@@ -634,7 +958,7 @@ macro_rules! define_maps {
 
                 match Self::try_get_with(tcx, span, key, |_| ()) {
                     Ok(()) => {}
-                    Err(e) => tcx.report_cycle(e)
+                    Err(e) => tcx.report_cycle(e).emit(),
                 }
             }
         })*
@@ -671,8 +995,8 @@ macro_rules! define_maps {
         impl<'a, $tcx, 'lcx> TyCtxtAt<'a, $tcx, 'lcx> {
             $($(#[$attr])*
             pub fn $name(self, key: $K) -> $V {
-                queries::$name::try_get(self.tcx, self.span, key).unwrap_or_else(|e| {
-                    self.report_cycle(e);
+                queries::$name::try_get(self.tcx, self.span, key).unwrap_or_else(|mut e| {
+                    e.emit();
                     Value::from_cycle_error(self.global_tcx())
                 })
             })*
@@ -823,12 +1147,12 @@ macro_rules! define_provider_struct {
 // the driver creates (using several `rustc_*` crates).
 define_maps! { <'tcx>
     /// Records the type of every item.
-    [] type_of: TypeOfItem(DefId) -> Ty<'tcx>,
+    [] fn type_of: TypeOfItem(DefId) -> Ty<'tcx>,
 
     /// Maps from the def-id of an item (trait/struct/enum/fn) to its
     /// associated generics and predicates.
-    [] generics_of: GenericsOfItem(DefId) -> &'tcx ty::Generics,
-    [] predicates_of: PredicatesOfItem(DefId) -> ty::GenericPredicates<'tcx>,
+    [] fn generics_of: GenericsOfItem(DefId) -> &'tcx ty::Generics,
+    [] fn predicates_of: PredicatesOfItem(DefId) -> ty::GenericPredicates<'tcx>,
 
     /// Maps from the def-id of a trait to the list of
     /// super-predicates. This is a subset of the full list of
@@ -836,142 +1160,145 @@ define_maps! { <'tcx>
     /// evaluate them even during type conversion, often before the
     /// full predicates are available (note that supertraits have
     /// additional acyclicity requirements).
-    [] super_predicates_of: SuperPredicatesOfItem(DefId) -> ty::GenericPredicates<'tcx>,
+    [] fn super_predicates_of: SuperPredicatesOfItem(DefId) -> ty::GenericPredicates<'tcx>,
 
     /// To avoid cycles within the predicates of a single item we compute
     /// per-type-parameter predicates for resolving `T::AssocTy`.
-    [] type_param_predicates: type_param_predicates((DefId, DefId))
+    [] fn type_param_predicates: type_param_predicates((DefId, DefId))
         -> ty::GenericPredicates<'tcx>,
 
-    [] trait_def: TraitDefOfItem(DefId) -> &'tcx ty::TraitDef,
-    [] adt_def: AdtDefOfItem(DefId) -> &'tcx ty::AdtDef,
-    [] adt_destructor: AdtDestructor(DefId) -> Option<ty::Destructor>,
-    [] adt_sized_constraint: SizedConstraint(DefId) -> &'tcx [Ty<'tcx>],
-    [] adt_dtorck_constraint: DtorckConstraint(DefId) -> ty::DtorckConstraint<'tcx>,
+    [] fn trait_def: TraitDefOfItem(DefId) -> &'tcx ty::TraitDef,
+    [] fn adt_def: AdtDefOfItem(DefId) -> &'tcx ty::AdtDef,
+    [] fn adt_destructor: AdtDestructor(DefId) -> Option<ty::Destructor>,
+    [] fn adt_sized_constraint: SizedConstraint(DefId) -> &'tcx [Ty<'tcx>],
+    [] fn adt_dtorck_constraint: DtorckConstraint(DefId) -> ty::DtorckConstraint<'tcx>,
 
     /// True if this is a const fn
-    [] is_const_fn: IsConstFn(DefId) -> bool,
+    [] fn is_const_fn: IsConstFn(DefId) -> bool,
 
     /// True if this is a foreign item (i.e., linked via `extern { ... }`).
-    [] is_foreign_item: IsForeignItem(DefId) -> bool,
+    [] fn is_foreign_item: IsForeignItem(DefId) -> bool,
 
     /// True if this is a default impl (aka impl Foo for ..)
-    [] is_default_impl: IsDefaultImpl(DefId) -> bool,
+    [] fn is_default_impl: IsDefaultImpl(DefId) -> bool,
 
     /// Get a map with the variance of every item; use `item_variance`
     /// instead.
-    [] crate_variances: crate_variances(CrateNum) -> Rc<ty::CrateVariancesMap>,
+    [] fn crate_variances: crate_variances(CrateNum) -> Rc<ty::CrateVariancesMap>,
 
     /// Maps from def-id of a type or region parameter to its
     /// (inferred) variance.
-    [] variances_of: ItemVariances(DefId) -> Rc<Vec<ty::Variance>>,
+    [] fn variances_of: ItemVariances(DefId) -> Rc<Vec<ty::Variance>>,
 
     /// Maps from an impl/trait def-id to a list of the def-ids of its items
-    [] associated_item_def_ids: AssociatedItemDefIds(DefId) -> Rc<Vec<DefId>>,
+    [] fn associated_item_def_ids: AssociatedItemDefIds(DefId) -> Rc<Vec<DefId>>,
 
     /// Maps from a trait item to the trait item "descriptor"
-    [] associated_item: AssociatedItems(DefId) -> ty::AssociatedItem,
+    [] fn associated_item: AssociatedItems(DefId) -> ty::AssociatedItem,
 
-    [] impl_trait_ref: ImplTraitRef(DefId) -> Option<ty::TraitRef<'tcx>>,
-    [] impl_polarity: ImplPolarity(DefId) -> hir::ImplPolarity,
+    [] fn impl_trait_ref: ImplTraitRef(DefId) -> Option<ty::TraitRef<'tcx>>,
+    [] fn impl_polarity: ImplPolarity(DefId) -> hir::ImplPolarity,
 
     /// Maps a DefId of a type to a list of its inherent impls.
     /// Contains implementations of methods that are inherent to a type.
     /// Methods in these implementations don't need to be exported.
-    [] inherent_impls: InherentImpls(DefId) -> Rc<Vec<DefId>>,
+    [] fn inherent_impls: InherentImpls(DefId) -> Rc<Vec<DefId>>,
 
     /// Set of all the def-ids in this crate that have MIR associated with
     /// them. This includes all the body owners, but also things like struct
     /// constructors.
-    [] mir_keys: mir_keys(CrateNum) -> Rc<DefIdSet>,
+    [] fn mir_keys: mir_keys(CrateNum) -> Rc<DefIdSet>,
 
     /// Maps DefId's that have an associated Mir to the result
     /// of the MIR qualify_consts pass. The actual meaning of
     /// the value isn't known except to the pass itself.
-    [] mir_const_qualif: MirConstQualif(DefId) -> u8,
+    [] fn mir_const_qualif: MirConstQualif(DefId) -> (u8, Rc<IdxSetBuf<mir::Local>>),
 
     /// Fetch the MIR for a given def-id up till the point where it is
     /// ready for const evaluation.
     ///
     /// See the README for the `mir` module for details.
-    [] mir_const: MirConst(DefId) -> &'tcx Steal<mir::Mir<'tcx>>,
+    [] fn mir_const: MirConst(DefId) -> &'tcx Steal<mir::Mir<'tcx>>,
 
-    [] mir_validated: MirValidated(DefId) -> &'tcx Steal<mir::Mir<'tcx>>,
+    [] fn mir_validated: MirValidated(DefId) -> &'tcx Steal<mir::Mir<'tcx>>,
 
     /// MIR after our optimization passes have run. This is MIR that is ready
     /// for trans. This is also the only query that can fetch non-local MIR, at present.
-    [] optimized_mir: MirOptimized(DefId) -> &'tcx mir::Mir<'tcx>,
+    [] fn optimized_mir: MirOptimized(DefId) -> &'tcx mir::Mir<'tcx>,
 
     /// Type of each closure. The def ID is the ID of the
     /// expression defining the closure.
-    [] closure_kind: ClosureKind(DefId) -> ty::ClosureKind,
+    [] fn closure_kind: ClosureKind(DefId) -> ty::ClosureKind,
 
     /// The signature of functions and closures.
-    [] fn_sig: FnSignature(DefId) -> ty::PolyFnSig<'tcx>,
+    [] fn fn_sig: FnSignature(DefId) -> ty::PolyFnSig<'tcx>,
+
+    /// Records the signature of each generator. The def ID is the ID of the
+    /// expression defining the closure.
+    [] fn generator_sig: GenSignature(DefId) -> Option<ty::PolyGenSig<'tcx>>,
 
     /// Caches CoerceUnsized kinds for impls on custom types.
-    [] coerce_unsized_info: CoerceUnsizedInfo(DefId)
+    [] fn coerce_unsized_info: CoerceUnsizedInfo(DefId)
         -> ty::adjustment::CoerceUnsizedInfo,
 
-    [] typeck_item_bodies: typeck_item_bodies_dep_node(CrateNum) -> CompileResult,
+    [] fn typeck_item_bodies: typeck_item_bodies_dep_node(CrateNum) -> CompileResult,
 
-    [] typeck_tables_of: TypeckTables(DefId) -> &'tcx ty::TypeckTables<'tcx>,
+    [] fn typeck_tables_of: TypeckTables(DefId) -> &'tcx ty::TypeckTables<'tcx>,
 
-    [] has_typeck_tables: HasTypeckTables(DefId) -> bool,
+    [] fn has_typeck_tables: HasTypeckTables(DefId) -> bool,
 
-    [] coherent_trait: coherent_trait_dep_node((CrateNum, DefId)) -> (),
+    [] fn coherent_trait: coherent_trait_dep_node((CrateNum, DefId)) -> (),
 
-    [] borrowck: BorrowCheck(DefId) -> (),
+    [] fn borrowck: BorrowCheck(DefId) -> (),
+    // FIXME: shouldn't this return a `Result<(), BorrowckErrors>` instead?
+    [] fn mir_borrowck: MirBorrowCheck(DefId) -> (),
 
     /// Gets a complete map from all types to their inherent impls.
     /// Not meant to be used directly outside of coherence.
     /// (Defined only for LOCAL_CRATE)
-    [] crate_inherent_impls: crate_inherent_impls_dep_node(CrateNum) -> CrateInherentImpls,
+    [] fn crate_inherent_impls: crate_inherent_impls_dep_node(CrateNum) -> CrateInherentImpls,
 
     /// Checks all types in the krate for overlap in their inherent impls. Reports errors.
     /// Not meant to be used directly outside of coherence.
     /// (Defined only for LOCAL_CRATE)
-    [] crate_inherent_impls_overlap_check: crate_inherent_impls_dep_node(CrateNum) -> (),
+    [] fn crate_inherent_impls_overlap_check: inherent_impls_overlap_check_dep_node(CrateNum) -> (),
 
     /// Results of evaluating const items or constants embedded in
     /// other items (such as enum variant explicit discriminants).
-    [] const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
+    [] fn const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
         -> const_val::EvalResult<'tcx>,
 
     /// Performs the privacy check and computes "access levels".
-    [] privacy_access_levels: PrivacyAccessLevels(CrateNum) -> Rc<AccessLevels>,
+    [] fn privacy_access_levels: PrivacyAccessLevels(CrateNum) -> Rc<AccessLevels>,
 
-    [] reachable_set: reachability_dep_node(CrateNum) -> Rc<NodeSet>,
+    [] fn reachable_set: reachability_dep_node(CrateNum) -> Rc<NodeSet>,
 
-    /// Per-function `RegionMaps`. The `DefId` should be the owner-def-id for the fn body;
-    /// in the case of closures or "inline" expressions, this will be redirected to the enclosing
-    /// fn item.
-    [] region_maps: RegionMaps(DefId) -> Rc<RegionMaps>,
+    /// Per-body `region::ScopeTree`. The `DefId` should be the owner-def-id for the body;
+    /// in the case of closures, this will be redirected to the enclosing function.
+    [] fn region_scope_tree: RegionScopeTree(DefId) -> Rc<region::ScopeTree>,
 
-    [] mir_shims: mir_shim_dep_node(ty::InstanceDef<'tcx>) -> &'tcx mir::Mir<'tcx>,
+    [] fn mir_shims: mir_shim_dep_node(ty::InstanceDef<'tcx>) -> &'tcx mir::Mir<'tcx>,
 
-    [] def_symbol_name: SymbolName(DefId) -> ty::SymbolName,
-    [] symbol_name: symbol_name_dep_node(ty::Instance<'tcx>) -> ty::SymbolName,
+    [] fn def_symbol_name: SymbolName(DefId) -> ty::SymbolName,
+    [] fn symbol_name: symbol_name_dep_node(ty::Instance<'tcx>) -> ty::SymbolName,
 
-    [] describe_def: DescribeDef(DefId) -> Option<Def>,
-    [] def_span: DefSpan(DefId) -> Span,
-    [] stability: Stability(DefId) -> Option<attr::Stability>,
-    [] deprecation: Deprecation(DefId) -> Option<attr::Deprecation>,
-    [] item_attrs: ItemAttrs(DefId) -> Rc<[ast::Attribute]>,
-    [] fn_arg_names: FnArgNames(DefId) -> Vec<ast::Name>,
-    [] impl_parent: ImplParent(DefId) -> Option<DefId>,
-    [] trait_of_item: TraitOfItem(DefId) -> Option<DefId>,
-    [] is_exported_symbol: IsExportedSymbol(DefId) -> bool,
-    [] item_body_nested_bodies: ItemBodyNestedBodies(DefId) -> Rc<BTreeMap<hir::BodyId, hir::Body>>,
-    [] const_is_rvalue_promotable_to_static: ConstIsRvaluePromotableToStatic(DefId) -> bool,
-    [] is_mir_available: IsMirAvailable(DefId) -> bool,
+    [] fn describe_def: DescribeDef(DefId) -> Option<Def>,
+    [] fn def_span: DefSpan(DefId) -> Span,
+    [] fn lookup_stability: LookupStability(DefId) -> Option<&'tcx attr::Stability>,
+    [] fn lookup_deprecation_entry: LookupDeprecationEntry(DefId) -> Option<DeprecationEntry>,
+    [] fn item_attrs: ItemAttrs(DefId) -> Rc<[ast::Attribute]>,
+    [] fn fn_arg_names: FnArgNames(DefId) -> Vec<ast::Name>,
+    [] fn impl_parent: ImplParent(DefId) -> Option<DefId>,
+    [] fn trait_of_item: TraitOfItem(DefId) -> Option<DefId>,
+    [] fn is_exported_symbol: IsExportedSymbol(DefId) -> bool,
+    [] fn item_body_nested_bodies: ItemBodyNestedBodies(DefId)
+        -> Rc<BTreeMap<hir::BodyId, hir::Body>>,
+    [] fn const_is_rvalue_promotable_to_static: ConstIsRvaluePromotableToStatic(DefId) -> bool,
+    [] fn is_mir_available: IsMirAvailable(DefId) -> bool,
 
-    [] trait_impls_of: TraitImpls(DefId) -> ty::trait_def::TraitImpls,
-    // Note that TraitDef::for_each_relevant_impl() will do type simplication for you.
-    [] relevant_trait_impls_for: relevant_trait_impls_for((DefId, SimplifiedType))
-        -> ty::trait_def::TraitImpls,
-    [] specialization_graph_of: SpecializationGraph(DefId) -> Rc<specialization_graph::Graph>,
-    [] is_object_safe: ObjectSafety(DefId) -> bool,
+    [] fn trait_impls_of: TraitImpls(DefId) -> Rc<ty::trait_def::TraitImpls>,
+    [] fn specialization_graph_of: SpecializationGraph(DefId) -> Rc<specialization_graph::Graph>,
+    [] fn is_object_safe: ObjectSafety(DefId) -> bool,
 
     // Get the ParameterEnvironment for a given item; this environment
     // will be in "user-facing" mode, meaning that it is suitabe for
@@ -979,24 +1306,83 @@ define_maps! { <'tcx>
     // associated types. This is almost always what you want,
     // unless you are doing MIR optimizations, in which case you
     // might want to use `reveal_all()` method to change modes.
-    [] param_env: ParamEnv(DefId) -> ty::ParamEnv<'tcx>,
+    [] fn param_env: ParamEnv(DefId) -> ty::ParamEnv<'tcx>,
 
     // Trait selection queries. These are best used by invoking `ty.moves_by_default()`,
     // `ty.is_copy()`, etc, since that will prune the environment where possible.
-    [] is_copy_raw: is_copy_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
-    [] is_sized_raw: is_sized_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
-    [] is_freeze_raw: is_freeze_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
-    [] needs_drop_raw: needs_drop_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
-    [] layout_raw: layout_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>)
+    [] fn is_copy_raw: is_copy_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
+    [] fn is_sized_raw: is_sized_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
+    [] fn is_freeze_raw: is_freeze_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
+    [] fn needs_drop_raw: needs_drop_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> bool,
+    [] fn layout_raw: layout_dep_node(ty::ParamEnvAnd<'tcx, Ty<'tcx>>)
                                   -> Result<&'tcx Layout, LayoutError<'tcx>>,
 
-    [] dylib_dependency_formats: DylibDepFormats(DefId)
+    [] fn dylib_dependency_formats: DylibDepFormats(CrateNum)
                                     -> Rc<Vec<(CrateNum, LinkagePreference)>>,
 
-    [] is_allocator: IsAllocator(DefId) -> bool,
-    [] is_panic_runtime: IsPanicRuntime(DefId) -> bool,
+    [] fn is_panic_runtime: IsPanicRuntime(CrateNum) -> bool,
+    [] fn is_compiler_builtins: IsCompilerBuiltins(CrateNum) -> bool,
+    [] fn has_global_allocator: HasGlobalAllocator(CrateNum) -> bool,
+    [] fn is_sanitizer_runtime: IsSanitizerRuntime(CrateNum) -> bool,
+    [] fn is_profiler_runtime: IsProfilerRuntime(CrateNum) -> bool,
+    [] fn panic_strategy: GetPanicStrategy(CrateNum) -> PanicStrategy,
+    [] fn is_no_builtins: IsNoBuiltins(CrateNum) -> bool,
 
-    [] extern_crate: ExternCrate(DefId) -> Rc<Option<ExternCrate>>,
+    [] fn extern_crate: ExternCrate(DefId) -> Rc<Option<ExternCrate>>,
+
+    [] fn specializes: specializes_node((DefId, DefId)) -> bool,
+    [] fn in_scope_traits: InScopeTraits(HirId) -> Option<Rc<Vec<TraitCandidate>>>,
+    [] fn module_exports: ModuleExports(HirId) -> Option<Rc<Vec<Export>>>,
+    [] fn lint_levels: lint_levels_node(CrateNum) -> Rc<lint::LintLevelMap>,
+
+    [] fn impl_defaultness: ImplDefaultness(DefId) -> hir::Defaultness,
+    [] fn exported_symbols: ExportedSymbols(CrateNum) -> Rc<Vec<DefId>>,
+    [] fn native_libraries: NativeLibraries(CrateNum) -> Rc<Vec<NativeLibrary>>,
+    [] fn plugin_registrar_fn: PluginRegistrarFn(CrateNum) -> Option<DefId>,
+    [] fn derive_registrar_fn: DeriveRegistrarFn(CrateNum) -> Option<DefId>,
+    [] fn crate_disambiguator: CrateDisambiguator(CrateNum) -> Symbol,
+    [] fn crate_hash: CrateHash(CrateNum) -> Svh,
+    [] fn original_crate_name: OriginalCrateName(CrateNum) -> Symbol,
+
+    [] fn implementations_of_trait: implementations_of_trait_node((CrateNum, DefId))
+        -> Rc<Vec<DefId>>,
+    [] fn all_trait_implementations: AllTraitImplementations(CrateNum)
+        -> Rc<Vec<DefId>>,
+
+    [] fn is_dllimport_foreign_item: IsDllimportForeignItem(DefId) -> bool,
+    [] fn is_statically_included_foreign_item: IsStaticallyIncludedForeignItem(DefId) -> bool,
+    [] fn native_library_kind: NativeLibraryKind(DefId)
+        -> Option<NativeLibraryKind>,
+    [] fn link_args: link_args_node(CrateNum) -> Rc<Vec<String>>,
+
+    [] fn named_region: NamedRegion(HirId) -> Option<Region>,
+    [] fn is_late_bound: IsLateBound(HirId) -> bool,
+    [] fn object_lifetime_defaults: ObjectLifetimeDefaults(HirId)
+        -> Option<Rc<Vec<ObjectLifetimeDefault>>>,
+
+    [] fn visibility: Visibility(DefId) -> ty::Visibility,
+    [] fn dep_kind: DepKind(CrateNum) -> DepKind,
+    [] fn crate_name: CrateName(CrateNum) -> Symbol,
+    [] fn item_children: ItemChildren(DefId) -> Rc<Vec<Export>>,
+    [] fn extern_mod_stmt_cnum: ExternModStmtCnum(HirId) -> Option<CrateNum>,
+
+    [] fn get_lang_items: get_lang_items_node(CrateNum) -> Rc<LanguageItems>,
+    [] fn defined_lang_items: DefinedLangItems(CrateNum) -> Rc<Vec<(DefIndex, usize)>>,
+    [] fn missing_lang_items: MissingLangItems(CrateNum) -> Rc<Vec<LangItem>>,
+    [] fn extern_const_body: ExternConstBody(DefId) -> &'tcx hir::Body,
+    [] fn visible_parent_map: visible_parent_map_node(CrateNum)
+        -> Rc<DefIdMap<DefId>>,
+    [] fn missing_extern_crate_item: MissingExternCrateItem(CrateNum) -> bool,
+    [] fn used_crate_source: UsedCrateSource(CrateNum) -> Rc<CrateSource>,
+    [] fn postorder_cnums: postorder_cnums_node(CrateNum) -> Rc<Vec<CrateNum>>,
+
+    [] fn freevars: Freevars(HirId) -> Option<Rc<Vec<hir::Freevar>>>,
+    [] fn maybe_unused_trait_import: MaybeUnusedTraitImport(HirId) -> bool,
+    [] fn maybe_unused_extern_crates: maybe_unused_extern_crates_node(CrateNum)
+        -> Rc<Vec<(HirId, Span)>>,
+
+    [] fn stability_index: stability_index_node(CrateNum) -> Rc<stability::Index<'tcx>>,
+    [] fn all_crate_nums: all_crate_nums_node(CrateNum) -> Rc<Vec<CrateNum>>,
 }
 
 fn type_param_predicates<'tcx>((item_id, param_id): (DefId, DefId)) -> DepConstructor<'tcx> {
@@ -1012,6 +1398,10 @@ fn coherent_trait_dep_node<'tcx>((_, def_id): (CrateNum, DefId)) -> DepConstruct
 
 fn crate_inherent_impls_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::Coherence
+}
+
+fn inherent_impls_overlap_check_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::CoherenceInherentImplOverlapCheck
 }
 
 fn reachability_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
@@ -1032,10 +1422,9 @@ fn typeck_item_bodies_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::TypeckBodiesKrate
 }
 
-fn const_eval_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
+fn const_eval_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
                              -> DepConstructor<'tcx> {
-    let (def_id, substs) = key.value;
-    DepConstructor::ConstEval { def_id, substs }
+    DepConstructor::ConstEval
 }
 
 fn mir_keys<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
@@ -1046,36 +1435,64 @@ fn crate_variances<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
     DepConstructor::CrateVariances
 }
 
-fn relevant_trait_impls_for<'tcx>((def_id, t): (DefId, SimplifiedType)) -> DepConstructor<'tcx> {
-    DepConstructor::RelevantTraitImpls(def_id, t)
+fn is_copy_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
+    DepConstructor::IsCopy
 }
 
-fn is_copy_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
-    let def_id = ty::item_path::characteristic_def_id_of_type(key.value)
-        .unwrap_or(DefId::local(CRATE_DEF_INDEX));
-    DepConstructor::IsCopy(def_id)
+fn is_sized_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
+    DepConstructor::IsSized
 }
 
-fn is_sized_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
-    let def_id = ty::item_path::characteristic_def_id_of_type(key.value)
-        .unwrap_or(DefId::local(CRATE_DEF_INDEX));
-    DepConstructor::IsSized(def_id)
+fn is_freeze_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
+    DepConstructor::IsFreeze
 }
 
-fn is_freeze_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
-    let def_id = ty::item_path::characteristic_def_id_of_type(key.value)
-        .unwrap_or(DefId::local(CRATE_DEF_INDEX));
-    DepConstructor::IsFreeze(def_id)
+fn needs_drop_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
+    DepConstructor::NeedsDrop
 }
 
-fn needs_drop_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
-    let def_id = ty::item_path::characteristic_def_id_of_type(key.value)
-        .unwrap_or(DefId::local(CRATE_DEF_INDEX));
-    DepConstructor::NeedsDrop(def_id)
+fn layout_dep_node<'tcx>(_: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
+    DepConstructor::Layout
 }
 
-fn layout_dep_node<'tcx>(key: ty::ParamEnvAnd<'tcx, Ty<'tcx>>) -> DepConstructor<'tcx> {
-    let def_id = ty::item_path::characteristic_def_id_of_type(key.value)
-        .unwrap_or(DefId::local(CRATE_DEF_INDEX));
-    DepConstructor::Layout(def_id)
+fn lint_levels_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::LintLevels
+}
+
+fn specializes_node<'tcx>((a, b): (DefId, DefId)) -> DepConstructor<'tcx> {
+    DepConstructor::Specializes { impl1: a, impl2: b }
+}
+
+fn implementations_of_trait_node<'tcx>((krate, trait_id): (CrateNum, DefId))
+    -> DepConstructor<'tcx>
+{
+    DepConstructor::ImplementationsOfTrait { krate, trait_id }
+}
+
+fn link_args_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::LinkArgs
+}
+
+fn get_lang_items_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::GetLangItems
+}
+
+fn visible_parent_map_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::VisibleParentMap
+}
+
+fn postorder_cnums_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::PostorderCnums
+}
+
+fn maybe_unused_extern_crates_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::MaybeUnusedExternCrates
+}
+
+fn stability_index_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::StabilityIndex
+}
+
+fn all_crate_nums_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::AllCrateNums
 }

@@ -14,9 +14,6 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![crate_name = "syntax_pos"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -28,6 +25,7 @@
 #![feature(optin_builtin_traits)]
 #![allow(unused_attributes)]
 #![feature(specialization)]
+#![feature(staged_api)]
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -47,7 +45,7 @@ extern crate serialize;
 extern crate serialize as rustc_serialize; // used by deriving
 
 pub mod hygiene;
-pub use hygiene::{SyntaxContext, ExpnInfo, ExpnFormat, NameAndSpan};
+pub use hygiene::{SyntaxContext, ExpnInfo, ExpnFormat, NameAndSpan, CompilerDesugaringKind};
 
 pub mod symbol;
 
@@ -63,12 +61,21 @@ pub type FileName = String;
 /// range between files.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Span {
+    #[unstable(feature = "rustc_private", issue = "27812")]
+    #[rustc_deprecated(since = "1.21", reason = "use getters/setters instead")]
     pub lo: BytePos,
+    #[unstable(feature = "rustc_private", issue = "27812")]
+    #[rustc_deprecated(since = "1.21", reason = "use getters/setters instead")]
     pub hi: BytePos,
     /// Information about where the macro came from, if this piece of
     /// code was created by a macro expansion.
+    #[unstable(feature = "rustc_private", issue = "27812")]
+    #[rustc_deprecated(since = "1.21", reason = "use getters/setters instead")]
     pub ctxt: SyntaxContext,
 }
+
+#[allow(deprecated)]
+pub const DUMMY_SP: Span = Span { lo: BytePos(0), hi: BytePos(0), ctxt: NO_EXPANSION };
 
 /// A collection of spans. Spans have two orthogonal attributes:
 ///
@@ -83,16 +90,50 @@ pub struct MultiSpan {
 }
 
 impl Span {
+    #[allow(deprecated)]
+    #[inline]
+    pub fn new(lo: BytePos, hi: BytePos, ctxt: SyntaxContext) -> Self {
+        if lo <= hi { Span { lo, hi, ctxt } } else { Span { lo: hi, hi: lo, ctxt } }
+    }
+
+    #[allow(deprecated)]
+    #[inline]
+    pub fn lo(self) -> BytePos {
+        self.lo
+    }
+    #[inline]
+    pub fn with_lo(self, lo: BytePos) -> Span {
+        Span::new(lo, self.hi(), self.ctxt())
+    }
+    #[allow(deprecated)]
+    #[inline]
+    pub fn hi(self) -> BytePos {
+        self.hi
+    }
+    #[inline]
+    pub fn with_hi(self, hi: BytePos) -> Span {
+        Span::new(self.lo(), hi, self.ctxt())
+    }
+    #[allow(deprecated)]
+    #[inline]
+    pub fn ctxt(self) -> SyntaxContext {
+        self.ctxt
+    }
+    #[inline]
+    pub fn with_ctxt(self, ctxt: SyntaxContext) -> Span {
+        Span::new(self.lo(), self.hi(), ctxt)
+    }
+
     /// Returns a new span representing just the end-point of this span
     pub fn end_point(self) -> Span {
-        let lo = cmp::max(self.hi.0 - 1, self.lo.0);
-        Span { lo: BytePos(lo), ..self }
+        let lo = cmp::max(self.hi().0 - 1, self.lo().0);
+        self.with_lo(BytePos(lo))
     }
 
     /// Returns a new span representing the next character after the end-point of this span
     pub fn next_point(self) -> Span {
-        let lo = cmp::max(self.hi.0, self.lo.0 + 1);
-        Span { lo: BytePos(lo), hi: BytePos(lo), ..self }
+        let lo = cmp::max(self.hi().0, self.lo().0 + 1);
+        Span::new(BytePos(lo), BytePos(lo), self.ctxt())
     }
 
     /// Returns `self` if `self` is not the dummy span, and `other` otherwise.
@@ -102,7 +143,7 @@ impl Span {
 
     /// Return true if `self` fully encloses `other`.
     pub fn contains(self, other: Span) -> bool {
-        self.lo <= other.lo && other.hi <= self.hi
+        self.lo() <= other.lo() && other.hi() <= self.hi()
     }
 
     /// Return true if the spans are equal with regards to the source text.
@@ -110,13 +151,13 @@ impl Span {
     /// Use this instead of `==` when either span could be generated code,
     /// and you only care that they point to the same bytes of source text.
     pub fn source_equal(&self, other: &Span) -> bool {
-        self.lo == other.lo && self.hi == other.hi
+        self.lo() == other.lo() && self.hi() == other.hi()
     }
 
     /// Returns `Some(span)`, where the start is trimmed by the end of `other`
     pub fn trim_start(self, other: Span) -> Option<Span> {
-        if self.hi > other.hi {
-            Some(Span { lo: cmp::max(self.lo, other.hi), .. self })
+        if self.hi() > other.hi() {
+            Some(self.with_lo(cmp::max(self.lo(), other.hi())))
         } else {
             None
         }
@@ -125,7 +166,7 @@ impl Span {
     /// Return the source span - this is either the supplied span, or the span for
     /// the macro callsite that expanded to it.
     pub fn source_callsite(self) -> Span {
-        self.ctxt.outer().expn_info().map(|info| info.call_site.source_callsite()).unwrap_or(self)
+        self.ctxt().outer().expn_info().map(|info| info.call_site.source_callsite()).unwrap_or(self)
     }
 
     /// Return the source callee.
@@ -135,20 +176,53 @@ impl Span {
     /// corresponding to the source callsite.
     pub fn source_callee(self) -> Option<NameAndSpan> {
         fn source_callee(info: ExpnInfo) -> NameAndSpan {
-            match info.call_site.ctxt.outer().expn_info() {
+            match info.call_site.ctxt().outer().expn_info() {
                 Some(info) => source_callee(info),
                 None => info.callee,
             }
         }
-        self.ctxt.outer().expn_info().map(source_callee)
+        self.ctxt().outer().expn_info().map(source_callee)
     }
 
     /// Check if a span is "internal" to a macro in which #[unstable]
     /// items can be used (that is, a macro marked with
     /// `#[allow_internal_unstable]`).
     pub fn allows_unstable(&self) -> bool {
-        match self.ctxt.outer().expn_info() {
+        match self.ctxt().outer().expn_info() {
             Some(info) => info.callee.allow_internal_unstable,
+            None => false,
+        }
+    }
+
+    /// Check if this span arises from a compiler desugaring of kind `kind`.
+    pub fn is_compiler_desugaring(&self, kind: CompilerDesugaringKind) -> bool {
+        match self.ctxt().outer().expn_info() {
+            Some(info) => match info.callee.format {
+                ExpnFormat::CompilerDesugaring(k) => k == kind,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Return the compiler desugaring that created this span, or None
+    /// if this span is not from a desugaring.
+    pub fn compiler_desugaring_kind(&self) -> Option<CompilerDesugaringKind> {
+        match self.ctxt().outer().expn_info() {
+            Some(info) => match info.callee.format {
+                ExpnFormat::CompilerDesugaring(k) => Some(k),
+                _ => None
+            },
+            None => None
+        }
+    }
+
+    /// Check if a span is "internal" to a macro in which `unsafe`
+    /// can be used without triggering the `unsafe_code` lint
+    //  (that is, a macro marked with `#[allow_internal_unsafe]`).
+    pub fn allows_unsafe(&self) -> bool {
+        match self.ctxt().outer().expn_info() {
+            Some(info) => info.callee.allow_internal_unsafe,
             None => false,
         }
     }
@@ -157,7 +231,7 @@ impl Span {
         let mut prev_span = DUMMY_SP;
         let mut result = vec![];
         loop {
-            let info = match self.ctxt.outer().expn_info() {
+            let info = match self.ctxt().outer().expn_info() {
                 Some(info) => info,
                 None => break,
             };
@@ -174,8 +248,8 @@ impl Span {
             if !info.call_site.source_equal(&prev_span) {
                 result.push(MacroBacktrace {
                     call_site: info.call_site,
-                    macro_decl_name: macro_decl_name,
-                    def_site_span: def_site_span,
+                    macro_decl_name,
+                    def_site_span,
                 });
             }
 
@@ -187,42 +261,30 @@ impl Span {
 
     /// Return a `Span` that would enclose both `self` and `end`.
     pub fn to(self, end: Span) -> Span {
-        Span {
-            lo: cmp::min(self.lo, end.lo),
-            hi: cmp::max(self.hi, end.hi),
+        Span::new(
+            cmp::min(self.lo(), end.lo()),
+            cmp::max(self.hi(), end.hi()),
             // FIXME(jseyfried): self.ctxt should always equal end.ctxt here (c.f. issue #23480)
-            ctxt: if self.ctxt == SyntaxContext::empty() {
-                end.ctxt
-            } else {
-                self.ctxt
-            },
-        }
+            if self.ctxt() == SyntaxContext::empty() { end.ctxt() } else { self.ctxt() },
+        )
     }
 
     /// Return a `Span` between the end of `self` to the beginning of `end`.
     pub fn between(self, end: Span) -> Span {
-        Span {
-            lo: self.hi,
-            hi: end.lo,
-            ctxt: if end.ctxt == SyntaxContext::empty() {
-                end.ctxt
-            } else {
-                self.ctxt
-            }
-        }
+        Span::new(
+            self.hi(),
+            end.lo(),
+            if end.ctxt() == SyntaxContext::empty() { end.ctxt() } else { self.ctxt() },
+        )
     }
 
     /// Return a `Span` between the beginning of `self` to the beginning of `end`.
     pub fn until(self, end: Span) -> Span {
-        Span {
-            lo: self.lo,
-            hi: end.lo,
-            ctxt: if end.ctxt == SyntaxContext::empty() {
-                end.ctxt
-            } else {
-                self.ctxt
-            }
-        }
+        Span::new(
+            self.lo(),
+            end.lo(),
+            if end.ctxt() == SyntaxContext::empty() { end.ctxt() } else { self.ctxt() },
+        )
     }
 }
 
@@ -249,11 +311,11 @@ impl serialize::UseSpecializedEncodable for Span {
     fn default_encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
         s.emit_struct("Span", 2, |s| {
             s.emit_struct_field("lo", 0, |s| {
-                self.lo.encode(s)
+                self.lo().encode(s)
             })?;
 
             s.emit_struct_field("hi", 1, |s| {
-                self.hi.encode(s)
+                self.hi().encode(s)
             })
         })
     }
@@ -264,14 +326,14 @@ impl serialize::UseSpecializedDecodable for Span {
         d.read_struct("Span", 2, |d| {
             let lo = d.read_struct_field("lo", 0, Decodable::decode)?;
             let hi = d.read_struct_field("hi", 1, Decodable::decode)?;
-            Ok(Span { lo: lo, hi: hi, ctxt: NO_EXPANSION })
+            Ok(Span::new(lo, hi, NO_EXPANSION))
         })
     }
 }
 
 fn default_span_debug(span: Span, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "Span {{ lo: {:?}, hi: {:?}, ctxt: {:?} }}",
-           span.lo, span.hi, span.ctxt)
+           span.lo(), span.hi(), span.ctxt())
 }
 
 impl fmt::Debug for Span {
@@ -279,8 +341,6 @@ impl fmt::Debug for Span {
         SPAN_DEBUG.with(|span_debug| span_debug.get()(*self, f))
     }
 }
-
-pub const DUMMY_SP: Span = Span { lo: BytePos(0), hi: BytePos(0), ctxt: NO_EXPANSION };
 
 impl MultiSpan {
     pub fn new() -> MultiSpan {
@@ -348,7 +408,7 @@ impl MultiSpan {
 
         for &(span, ref label) in &self.span_labels {
             span_labels.push(SpanLabel {
-                span: span,
+                span,
                 is_primary: is_primary(span),
                 label: Some(label.clone())
             });
@@ -357,7 +417,7 @@ impl MultiSpan {
         for &span in &self.primary_spans {
             if !span_labels.iter().any(|sl| sl.span == span) {
                 span_labels.push(SpanLabel {
-                    span: span,
+                    span,
                     is_primary: true,
                     label: None
                 });
@@ -546,16 +606,16 @@ impl Decodable for FileMap {
             let multibyte_chars: Vec<MultiByteChar> =
                 d.read_struct_field("multibyte_chars", 5, |d| Decodable::decode(d))?;
             Ok(FileMap {
-                name: name,
-                name_was_remapped: name_was_remapped,
+                name,
+                name_was_remapped,
                 // `crate_of_origin` has to be set by the importer.
                 // This value matches up with rustc::hir::def_id::INVALID_CRATE.
                 // That constant is not available here unfortunately :(
                 crate_of_origin: ::std::u32::MAX - 1,
-                start_pos: start_pos,
-                end_pos: end_pos,
+                start_pos,
+                end_pos,
                 src: None,
-                src_hash: src_hash,
+                src_hash,
                 external_src: RefCell::new(ExternalSource::AbsentOk),
                 lines: RefCell::new(lines),
                 multibyte_chars: RefCell::new(multibyte_chars)
@@ -584,13 +644,13 @@ impl FileMap {
         let end_pos = start_pos.to_usize() + src.len();
 
         FileMap {
-            name: name,
-            name_was_remapped: name_was_remapped,
+            name,
+            name_was_remapped,
             crate_of_origin: 0,
             src: Some(Rc::new(src)),
-            src_hash: src_hash,
+            src_hash,
             external_src: RefCell::new(ExternalSource::Unneeded),
-            start_pos: start_pos,
+            start_pos,
             end_pos: Pos::from_usize(end_pos),
             lines: RefCell::new(Vec::new()),
             multibyte_chars: RefCell::new(Vec::new()),
@@ -677,8 +737,8 @@ impl FileMap {
     pub fn record_multibyte_char(&self, pos: BytePos, bytes: usize) {
         assert!(bytes >=2 && bytes <= 4);
         let mbc = MultiByteChar {
-            pos: pos,
-            bytes: bytes,
+            pos,
+            bytes,
         };
         self.multibyte_chars.borrow_mut().push(mbc);
     }

@@ -26,7 +26,7 @@ use core::str::Split;
 /// [`split_whitespace`]: ../../std/primitive.str.html#method.split_whitespace
 /// [`str`]: ../../std/primitive.str.html
 #[stable(feature = "split_whitespace", since = "1.1.0")]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SplitWhitespace<'a> {
     inner: Filter<Split<'a, IsWhitespace>, IsNotEmpty>,
 }
@@ -87,7 +87,7 @@ impl<I> Utf16Encoder<I> {
         where I: Iterator<Item = char>
     {
         Utf16Encoder {
-            chars: chars,
+            chars,
             extra: 0,
         }
     }

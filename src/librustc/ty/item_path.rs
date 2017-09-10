@@ -13,7 +13,7 @@ use hir::def_id::{CrateNum, DefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use ty::{self, Ty, TyCtxt};
 use syntax::ast;
 use syntax::symbol::Symbol;
-use syntax_pos::DUMMY_SP;
+use syntax::symbol::InternedString;
 
 use std::cell::Cell;
 
@@ -125,13 +125,13 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
     /// If possible, this pushes a global path resolving to `external_def_id` that is visible
     /// from at least one local module and returns true. If the crate defining `external_def_id` is
-    /// declared with an `extern crate`, the path is guarenteed to use the `extern crate`.
+    /// declared with an `extern crate`, the path is guaranteed to use the `extern crate`.
     pub fn try_push_visible_item_path<T>(self, buffer: &mut T, external_def_id: DefId) -> bool
         where T: ItemPathBuffer
     {
-        let visible_parent_map = self.sess.cstore.visible_parent_map(self.sess);
+        let visible_parent_map = self.visible_parent_map(LOCAL_CRATE);
 
-        let (mut cur_def, mut cur_path) = (external_def_id, Vec::<ast::Name>::new());
+        let (mut cur_def, mut cur_path) = (external_def_id, Vec::<InternedString>::new());
         loop {
             // If `cur_def` is a direct or injected extern crate, push the path to the crate
             // followed by the path to the item within the crate and return.
@@ -139,12 +139,12 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 match *self.extern_crate(cur_def) {
                     Some(ref extern_crate) if extern_crate.direct => {
                         self.push_item_path(buffer, extern_crate.def_id);
-                        cur_path.iter().rev().map(|segment| buffer.push(&segment.as_str())).count();
+                        cur_path.iter().rev().map(|segment| buffer.push(&segment)).count();
                         return true;
                     }
                     None => {
                         buffer.push(&self.crate_name(cur_def.krate).as_str());
-                        cur_path.iter().rev().map(|segment| buffer.push(&segment.as_str())).count();
+                        cur_path.iter().rev().map(|segment| buffer.push(&segment)).count();
                         return true;
                     }
                     _ => {},
@@ -153,7 +153,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
             cur_path.push(self.sess.cstore.def_key(cur_def)
                               .disambiguated_data.data.get_opt_name().unwrap_or_else(||
-                Symbol::intern("<unnamed>")));
+                Symbol::intern("<unnamed>").as_str()));
             match visible_parent_map.get(&cur_def) {
                 Some(&def) => cur_def = def,
                 None => return false,
@@ -222,11 +222,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         let use_types = !self.is_default_impl(impl_def_id) && (!impl_def_id.is_local() || {
             // Otherwise, use filename/line-number if forced.
             let force_no_types = FORCE_IMPL_FILENAME_LINE.with(|f| f.get());
-            !force_no_types && {
-                // Otherwise, use types if we can query them without inducing a cycle.
-                ty::queries::impl_trait_ref::try_get(self, DUMMY_SP, impl_def_id).is_ok() &&
-                    ty::queries::type_of::try_get(self, DUMMY_SP, impl_def_id).is_ok()
-            }
+            !force_no_types
         });
 
         if !use_types {
@@ -350,6 +346,7 @@ pub fn characteristic_def_id_of_type(ty: Ty) -> Option<DefId> {
 
         ty::TyFnDef(def_id, _) |
         ty::TyClosure(def_id, _) => Some(def_id),
+        ty::TyGenerator(def_id, _, _) => Some(def_id),
 
         ty::TyBool |
         ty::TyChar |

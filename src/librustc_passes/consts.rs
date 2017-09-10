@@ -76,30 +76,25 @@ impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
                 ErroneousReferencedConstant(_) => {}
                 TypeckError => {}
                 _ => {
-                    self.tcx.sess.add_lint(CONST_ERR,
-                                           expr.id,
-                                           expr.span,
-                                           format!("constant evaluation error: {}. This will \
-                                                    become a HARD ERROR in the future",
-                                                   err.description().into_oneline()))
+                    self.tcx.lint_node(CONST_ERR,
+                                       expr.id,
+                                       expr.span,
+                                       &format!("constant evaluation error: {}. This will \
+                                                 become a HARD ERROR in the future",
+                                                err.description().into_oneline()));
                 }
             }
         }
     }
 
-    // Adds the worst effect out of all the values of one type.
-    fn add_type(&mut self, ty: Ty<'gcx>) {
-        if !ty.is_freeze(self.tcx, self.param_env, DUMMY_SP) {
-            self.promotable = false;
-        }
-
-        if ty.needs_drop(self.tcx, self.param_env) {
-            self.promotable = false;
-        }
+    // Returns true iff all the values of the type are promotable.
+    fn type_has_only_promotable_values(&mut self, ty: Ty<'gcx>) -> bool {
+        ty.is_freeze(self.tcx, self.param_env, DUMMY_SP) &&
+        !ty.needs_drop(self.tcx, self.param_env)
     }
 
     fn handle_const_fn_call(&mut self, def_id: DefId, ret_ty: Ty<'gcx>) {
-        self.add_type(ret_ty);
+        self.promotable &= self.type_has_only_promotable_values(ret_ty);
 
         self.promotable &= if let Some(fn_id) = self.tcx.hir.as_local_node_id(def_id) {
             FnLikeNode::from_node(self.tcx.hir.get(fn_id)).map_or(false, |fn_like| {
@@ -148,8 +143,8 @@ impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
 
         let tcx = self.tcx;
         let param_env = self.param_env;
-        let region_maps = self.tcx.region_maps(item_def_id);
-        euv::ExprUseVisitor::new(self, tcx, param_env, &region_maps, self.tables)
+        let region_scope_tree = self.tcx.region_scope_tree(item_def_id);
+        euv::ExprUseVisitor::new(self, tcx, param_env, &region_scope_tree, self.tables)
             .consume_body(body);
 
         self.visit_body(body);
@@ -219,7 +214,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
         let outer = self.promotable;
         self.promotable = true;
 
-        let node_ty = self.tables.node_id_to_type(ex.id);
+        let node_ty = self.tables.node_id_to_type(ex.hir_id);
         check_expr(self, ex, node_ty);
         check_adjustments(self, ex);
 
@@ -260,10 +255,10 @@ impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
                     kind: LayoutError(ty::layout::LayoutError::Unknown(_)), ..
                 }) => {}
                 Err(msg) => {
-                    self.tcx.sess.add_lint(CONST_ERR,
-                                           ex.id,
-                                           msg.span,
-                                           msg.description().into_oneline().into_owned())
+                    self.tcx.lint_node(CONST_ERR,
+                                       ex.id,
+                                       msg.span,
+                                       &msg.description().into_oneline().into_owned());
                 }
             }
         }
@@ -297,7 +292,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             v.promotable = false;
         }
         hir::ExprUnary(op, ref inner) => {
-            match v.tables.node_id_to_type(inner.id).sty {
+            match v.tables.node_id_to_type(inner.hir_id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op == hir::UnDeref);
 
@@ -307,7 +302,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprBinary(op, ref lhs, _) => {
-            match v.tables.node_id_to_type(lhs.id).sty {
+            match v.tables.node_id_to_type(lhs.hir_id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op.node == hir::BiEq || op.node == hir::BiNe ||
                             op.node == hir::BiLe || op.node == hir::BiLt ||
@@ -320,7 +315,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         }
         hir::ExprCast(ref from, _) => {
             debug!("Checking const cast(id={})", from.id);
-            match v.tables.cast_kinds.get(&from.id) {
+            match v.tables.cast_kinds().get(from.hir_id) {
                 None => span_bug!(e.span, "no kind for cast"),
                 Some(&CastKind::PtrAddrCast) | Some(&CastKind::FnPtrAddrCast) => {
                     v.promotable = false;
@@ -329,24 +324,34 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprPath(ref qpath) => {
-            let def = v.tables.qpath_def(qpath, e.id);
+            let def = v.tables.qpath_def(qpath, e.hir_id);
             match def {
                 Def::VariantCtor(..) | Def::StructCtor(..) |
                 Def::Fn(..) | Def::Method(..) => {}
-                Def::AssociatedConst(_) => v.add_type(node_ty),
-                Def::Const(did) => {
-                    v.promotable &= if let Some(node_id) = v.tcx.hir.as_local_node_id(did) {
-                        match v.tcx.hir.expect_item(node_id).node {
-                            hir::ItemConst(_, body) => {
+
+                Def::Const(did) |
+                Def::AssociatedConst(did) => {
+                    let promotable = if v.tcx.trait_of_item(did).is_some() {
+                        // Don't peek inside trait associated constants.
+                        false
+                    } else if let Some(node_id) = v.tcx.hir.as_local_node_id(did) {
+                        match v.tcx.hir.maybe_body_owned_by(node_id) {
+                            Some(body) => {
                                 v.visit_nested_body(body);
                                 v.tcx.rvalue_promotable_to_static.borrow()[&body.node_id]
                             }
-                            _ => false
+                            None => false
                         }
                     } else {
                         v.tcx.const_is_rvalue_promotable_to_static(did)
                     };
+
+                    // Just in case the type is more specific than the definition,
+                    // e.g. impl associated const with type parameters, check it.
+                    // Also, trait associated consts are relaxed by this.
+                    v.promotable &= promotable || v.type_has_only_promotable_values(node_ty);
                 }
+
                 _ => {
                     v.promotable = false;
                 }
@@ -365,7 +370,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
             // The callee is an arbitrary expression, it doesn't necessarily have a definition.
             let def = if let hir::ExprPath(ref qpath) = callee.node {
-                v.tables.qpath_def(qpath, callee.id)
+                v.tables.qpath_def(qpath, callee.hir_id)
             } else {
                 Def::Err
             };
@@ -387,7 +392,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
             }
         }
         hir::ExprMethodCall(..) => {
-            let def_id = v.tables.type_dependent_defs[&e.id].def_id();
+            let def_id = v.tables.type_dependent_defs()[e.hir_id].def_id();
             match v.tcx.associated_item(def_id).container {
                 ty::ImplContainer(_) => v.handle_const_fn_call(def_id, node_ty),
                 ty::TraitContainer(_) => v.promotable = false
@@ -396,7 +401,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprStruct(..) => {
             if let ty::TyAdt(adt, ..) = v.tables.expr_ty(e).sty {
                 // unsafe_cell_type doesn't necessarily exist with no_core
-                if Some(adt.did) == v.tcx.lang_items.unsafe_cell_type() {
+                if Some(adt.did) == v.tcx.lang_items().unsafe_cell_type() {
                     v.promotable = false;
                 }
             }
@@ -435,6 +440,9 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node
         hir::ExprAgain(_) |
         hir::ExprRet(_) |
 
+        // Generator expressions
+        hir::ExprYield(_) |
+
         // Expressions with side-effects.
         hir::ExprAssign(..) |
         hir::ExprAssignOp(..) |
@@ -470,8 +478,8 @@ fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Exp
 
 pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     tcx.hir.krate().visit_all_item_likes(&mut CheckCrateVisitor {
-        tcx: tcx,
-        tables: &ty::TypeckTables::empty(),
+        tcx,
+        tables: &ty::TypeckTables::empty(None),
         in_fn: false,
         promotable: false,
         mut_rvalue_borrows: NodeSet(),

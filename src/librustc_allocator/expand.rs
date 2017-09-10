@@ -36,9 +36,9 @@ pub fn modify(sess: &ParseSess,
               krate: Crate,
               handler: &rustc_errors::Handler) -> ast::Crate {
     ExpandAllocatorDirectives {
-        handler: handler,
-        sess: sess,
-        resolver: resolver,
+        handler,
+        sess,
+        resolver,
         found: false,
     }.fold_crate(krate)
 }
@@ -79,15 +79,13 @@ impl<'a> Folder for ExpandAllocatorDirectives<'a> {
                 format: MacroAttribute(Symbol::intern(name)),
                 span: None,
                 allow_internal_unstable: true,
+                allow_internal_unsafe: false,
             }
         });
-        let span = Span {
-            ctxt: SyntaxContext::empty().apply_mark(mark),
-            ..item.span
-        };
+        let span = item.span.with_ctxt(SyntaxContext::empty().apply_mark(mark));
         let ecfg = ExpansionConfig::default(name.to_string());
         let mut f = AllocFnFactory {
-            span: span,
+            span,
             kind: AllocatorKind::Global,
             global: item.ident,
             alloc: Ident::from_str("alloc"),
@@ -188,7 +186,7 @@ impl<'a> AllocFnFactory<'a> {
     fn arg_ty(&self,
               ty: &AllocatorTy,
               args: &mut Vec<Arg>,
-              mut ident: &mut FnMut() -> Ident) -> P<Expr> {
+              ident: &mut FnMut() -> Ident) -> P<Expr> {
         match *ty {
             AllocatorTy::Layout => {
                 let usize = self.cx.path_ident(self.span, Ident::from_str("usize"));
@@ -263,7 +261,7 @@ impl<'a> AllocFnFactory<'a> {
     fn ret_ty(&self,
               ty: &AllocatorTy,
               args: &mut Vec<Arg>,
-              mut ident: &mut FnMut() -> Ident,
+              ident: &mut FnMut() -> Ident,
               expr: P<Expr>) -> (P<Ty>, P<Expr>)
     {
         match *ty {

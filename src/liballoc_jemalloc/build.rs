@@ -63,7 +63,7 @@ fn main() {
         _ => return,
     };
 
-    let compiler = gcc::Config::new().get_compiler();
+    let compiler = gcc::Build::new().get_compiler();
     // only msvc returns None for ar so unwrap is okay
     let ar = build_helper::cc2ar(compiler.path(), &target).unwrap();
     let cflags = compiler.args()
@@ -93,29 +93,7 @@ fn main() {
        .env("AR", &ar)
        .env("RANLIB", format!("{} s", ar.display()));
 
-    if target.contains("windows") {
-        // A bit of history here, this used to be --enable-lazy-lock added in
-        // #14006 which was filed with jemalloc in jemalloc/jemalloc#83 which
-        // was also reported to MinGW:
-        //
-        //  http://sourceforge.net/p/mingw-w64/bugs/395/
-        //
-        // When updating jemalloc to 4.0, however, it was found that binaries
-        // would exit with the status code STATUS_RESOURCE_NOT_OWNED indicating
-        // that a thread was unlocking a mutex it never locked. Disabling this
-        // "lazy lock" option seems to fix the issue, but it was enabled by
-        // default for MinGW targets in 13473c7 for jemalloc.
-        //
-        // As a result of all that, force disabling lazy lock on Windows, and
-        // after reading some code it at least *appears* that the initialization
-        // of mutexes is otherwise ok in jemalloc, so shouldn't cause problems
-        // hopefully...
-        //
-        // tl;dr: make windows behave like other platforms by disabling lazy
-        //        locking, but requires passing an option due to a historical
-        //        default with jemalloc.
-        cmd.arg("--disable-lazy-lock");
-    } else if target.contains("ios") {
+    if target.contains("ios") {
         cmd.arg("--disable-tls");
     } else if target.contains("android") {
         // We force android to have prefixed symbols because apparently
@@ -133,9 +111,11 @@ fn main() {
         cmd.arg("--with-jemalloc-prefix=je_");
     }
 
-    if cfg!(feature = "debug-jemalloc") {
-        cmd.arg("--enable-debug");
-    }
+    // FIXME: building with jemalloc assertions is currently broken.
+    // See <https://github.com/rust-lang/rust/issues/44152>.
+    //if cfg!(feature = "debug") {
+    //    cmd.arg("--enable-debug");
+    //}
 
     cmd.arg(format!("--host={}", build_helper::gnu_target(&target)));
     cmd.arg(format!("--build={}", build_helper::gnu_target(&host)));
@@ -170,7 +150,7 @@ fn main() {
     // sure the symbols are available.
     if target.contains("androideabi") {
         println!("cargo:rerun-if-changed=pthread_atfork_dummy.c");
-        gcc::Config::new()
+        gcc::Build::new()
             .flag("-fvisibility=hidden")
             .file("pthread_atfork_dummy.c")
             .compile("libpthread_atfork_dummy.a");

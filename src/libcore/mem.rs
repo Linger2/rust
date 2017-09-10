@@ -188,26 +188,6 @@ pub fn forget<T>(t: T) {
 /// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(stage0)]
-pub fn size_of<T>() -> usize {
-    unsafe { intrinsics::size_of::<T>() }
-}
-
-/// Returns the size of a type in bytes.
-///
-/// More specifically, this is the offset in bytes between successive
-/// items of the same type, including alignment padding.
-///
-/// # Examples
-///
-/// ```
-/// use std::mem;
-///
-/// assert_eq!(4, mem::size_of::<i32>());
-/// ```
-#[inline]
-#[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(not(stage0))]
 pub const fn size_of<T>() -> usize {
     unsafe { intrinsics::size_of::<T>() }
 }
@@ -299,29 +279,6 @@ pub fn min_align_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(stage0)]
-pub fn align_of<T>() -> usize {
-    unsafe { intrinsics::min_align_of::<T>() }
-}
-
-/// Returns the [ABI]-required minimum alignment of a type.
-///
-/// Every reference to a value of the type `T` must be a multiple of this number.
-///
-/// This is the alignment used for struct fields. It may be smaller than the preferred alignment.
-///
-/// [ABI]: https://en.wikipedia.org/wiki/Application_binary_interface
-///
-/// # Examples
-///
-/// ```
-/// use std::mem;
-///
-/// assert_eq!(4, mem::align_of::<i32>());
-/// ```
-#[inline]
-#[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(not(stage0))]
 pub const fn align_of<T>() -> usize {
     unsafe { intrinsics::min_align_of::<T>() }
 }
@@ -754,39 +711,39 @@ pub unsafe fn transmute_copy<T, U>(src: &T) -> U {
 /// Opaque type representing the discriminant of an enum.
 ///
 /// See the `discriminant` function in this module for more information.
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 pub struct Discriminant<T>(u64, PhantomData<*const T>);
 
 // N.B. These trait implementations cannot be derived because we don't want any bounds on T.
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> Copy for Discriminant<T> {}
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> clone::Clone for Discriminant<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> cmp::PartialEq for Discriminant<T> {
     fn eq(&self, rhs: &Self) -> bool {
         self.0 == rhs.0
     }
 }
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> cmp::Eq for Discriminant<T> {}
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> hash::Hash for Discriminant<T> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 impl<T> fmt::Debug for Discriminant<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_tuple("Discriminant")
@@ -811,7 +768,6 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// the actual data:
 ///
 /// ```
-/// #![feature(discriminant_value)]
 /// use std::mem;
 ///
 /// enum Foo { A(&'static str), B(i32), C(i32) }
@@ -820,7 +776,7 @@ impl<T> fmt::Debug for Discriminant<T> {
 /// assert!(mem::discriminant(&Foo::B(1))     == mem::discriminant(&Foo::B(2)));
 /// assert!(mem::discriminant(&Foo::B(3))     != mem::discriminant(&Foo::C(3)));
 /// ```
-#[unstable(feature = "discriminant_value", reason = "recently added, follows RFC", issue = "24263")]
+#[stable(feature = "discriminant_value", since = "1.22.0")]
 pub fn discriminant<T>(v: &T) -> Discriminant<T> {
     unsafe {
         Discriminant(intrinsics::discriminant_value(v), PhantomData)
@@ -901,7 +857,7 @@ impl<T> ManuallyDrop<T> {
 
     /// Manually drops the contained value.
     ///
-    /// # Unsafety
+    /// # Safety
     ///
     /// This function runs the destructor of the contained value and thus the wrapped value
     /// now represents uninitialized data. It is up to the user of this method to ensure the
@@ -941,4 +897,16 @@ impl<T: ::fmt::Debug> ::fmt::Debug for ManuallyDrop<T> {
             fmt.debug_tuple("ManuallyDrop").field(&self.value).finish()
         }
     }
+}
+
+/// Tells LLVM that this point in the code is not reachable, enabling further
+/// optimizations.
+///
+/// NB: This is very different from the `unreachable!()` macro: Unlike the
+/// macro, which panics when it is executed, it is *undefined behavior* to
+/// reach code marked with this function.
+#[inline]
+#[unstable(feature = "unreachable", issue = "43751")]
+pub unsafe fn unreachable() -> ! {
+    intrinsics::unreachable()
 }

@@ -108,7 +108,7 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
 
         // <cur_ty as Deref>
         let trait_ref = TraitRef {
-            def_id: match tcx.lang_items.deref_trait() {
+            def_id: match tcx.lang_items().deref_trait() {
                 Some(f) => f,
                 None => return None,
             },
@@ -217,7 +217,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             cur_ty: self.resolve_type_vars_if_possible(&base_ty),
             obligations: vec![],
             at_start: true,
-            span: span,
+            span,
         }
     }
 

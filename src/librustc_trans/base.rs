@@ -41,7 +41,7 @@ use rustc::middle::lang_items::StartFnLangItem;
 use rustc::middle::cstore::{EncodedMetadata, EncodedMetadataHashes};
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::dep_graph::AssertDepGraphSafe;
-use rustc::middle::cstore::LinkMeta;
+use rustc::middle::cstore::{self, LinkMeta, LinkagePreference};
 use rustc::hir::map as hir_map;
 use rustc::util::common::{time, print_time_passes_entry};
 use rustc::session::config::{self, NoDebugInfo, OutputFilenames, OutputType};
@@ -75,6 +75,7 @@ use type_::Type;
 use type_of;
 use value::Value;
 use rustc::util::nodemap::{NodeSet, FxHashMap, FxHashSet};
+use CrateInfo;
 
 use libc::c_uint;
 use std::ffi::{CStr, CString};
@@ -99,9 +100,9 @@ impl<'a, 'tcx> StatRecorder<'a, 'tcx> {
     pub fn new(ccx: &'a CrateContext<'a, 'tcx>, name: String) -> StatRecorder<'a, 'tcx> {
         let istart = ccx.stats().n_llvm_insns.get();
         StatRecorder {
-            ccx: ccx,
+            ccx,
             name: Some(name),
-            istart: istart,
+            istart,
         }
     }
 }
@@ -191,7 +192,7 @@ pub fn compare_simd_types<'a, 'tcx>(
 /// adjustment.
 ///
 /// The `old_info` argument is a bit funny. It is intended for use
-/// in an upcast, where the new vtable for an object will be drived
+/// in an upcast, where the new vtable for an object will be derived
 /// from the old one.
 pub fn unsized_info<'ccx, 'tcx>(ccx: &CrateContext<'ccx, 'tcx>,
                                 source: Ty<'tcx>,
@@ -488,7 +489,7 @@ impl Lifetime {
     // on), and `ptr` is nonzero-sized, then extracts the size of `ptr`
     // and the intrinsic for `lt` and passes them to `emit`, which is in
     // charge of generating code to call the passed intrinsic on whatever
-    // block of generated code is targetted for the intrinsic.
+    // block of generated code is targeted for the intrinsic.
     //
     // If LLVM lifetime intrinsic support is disabled (i.e.  optimizations
     // off) or `ptr` is zero-sized, then no-op (does not call `emit`).
@@ -664,7 +665,7 @@ fn check_for_rustc_errors_attr(tcx: TyCtxt) {
     }
 }
 
-/// Create the `main` function which will initialise the rust runtime and call
+/// Create the `main` function which will initialize the rust runtime and call
 /// users main function.
 fn maybe_create_entry_wrapper(ccx: &CrateContext) {
     let (main_def_id, span) = match *ccx.sess().entry_fn.borrow() {
@@ -844,8 +845,7 @@ fn create_imps(sess: &Session,
             let imp = llvm::LLVMAddGlobal(llvm_module.llmod,
                                           i8p_ty.to_ref(),
                                           imp_name.as_ptr() as *const _);
-            let init = llvm::LLVMConstBitCast(val, i8p_ty.to_ref());
-            llvm::LLVMSetInitializer(imp, init);
+            llvm::LLVMSetInitializer(imp, consts::ptrcast(val, i8p_ty));
             llvm::LLVMRustSetLinkage(imp, llvm::Linkage::ExternalLinkage);
         }
     }
@@ -905,7 +905,7 @@ pub fn find_exported_symbols(tcx: TyCtxt, reachable: &NodeSet) -> NodeSet {
         match tcx.hir.get(id) {
             hir_map::NodeForeignItem(..) => {
                 let def_id = tcx.hir.local_def_id(id);
-                tcx.sess.cstore.is_statically_included_foreign_item(def_id)
+                tcx.is_statically_included_foreign_item(def_id)
             }
 
             // Only consider nodes that actually have exported symbols.
@@ -971,6 +971,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     } else {
         None
     };
+    let crate_info = CrateInfo::new(tcx);
 
     // Skip crate items and just output metadata in -Z no-trans mode.
     if tcx.sess.opts.debugging_opts.no_trans ||
@@ -988,6 +989,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             no_builtins,
             None,
             linker_info,
+            crate_info,
             false);
 
         ongoing_translation.submit_pre_translated_module_to_llvm(tcx.sess, metadata_module, true);
@@ -1040,6 +1042,7 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         no_builtins,
         windows_subsystem,
         linker_info,
+        crate_info,
         no_integrated_as);
 
     // Translate an allocator shim, if any
@@ -1059,8 +1062,8 @@ pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             let (llcx, llmod) =
                 context::create_context_and_module(tcx.sess, "allocator");
             let modules = ModuleLlvm {
-                llmod: llmod,
-                llcx: llcx,
+                llmod,
+                llcx,
             };
             time(tcx.sess.time_passes(), "write allocator module", || {
                 allocator::trans(tcx, &modules, kind)
@@ -1372,7 +1375,7 @@ fn assert_symbols_are_distinct<'a, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>, trans_i
             // Deterministically select one of the spans for error reporting
             let span = match (span1, span2) {
                 (Some(span1), Some(span2)) => {
-                    Some(if span1.lo.0 > span2.lo.0 {
+                    Some(if span1.lo().0 > span2.lo().0 {
                         span1
                     } else {
                         span2
@@ -1465,7 +1468,7 @@ fn collect_and_partition_translation_items<'a, 'tcx>(scx: &SharedCrateContext<'a
                 let mut output = i.to_string(scx.tcx());
                 output.push_str(" @@");
                 let mut empty = Vec::new();
-                let mut cgus = item_to_cgus.get_mut(i).unwrap_or(&mut empty);
+                let cgus = item_to_cgus.get_mut(i).unwrap_or(&mut empty);
                 cgus.as_mut_slice().sort_by_key(|&(ref name, _)| name.clone());
                 cgus.dedup();
                 for &(ref cgu_name, (linkage, _)) in cgus.iter() {
@@ -1502,4 +1505,47 @@ fn collect_and_partition_translation_items<'a, 'tcx>(scx: &SharedCrateContext<'a
     }
 
     (translation_items, codegen_units)
+}
+
+impl CrateInfo {
+    pub fn new<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) -> CrateInfo {
+        let mut info = CrateInfo {
+            panic_runtime: None,
+            compiler_builtins: None,
+            profiler_runtime: None,
+            sanitizer_runtime: None,
+            is_no_builtins: FxHashSet(),
+            native_libraries: FxHashMap(),
+            used_libraries: tcx.native_libraries(LOCAL_CRATE),
+            link_args: tcx.link_args(LOCAL_CRATE),
+            crate_name: FxHashMap(),
+            used_crates_dynamic: cstore::used_crates(tcx, LinkagePreference::RequireDynamic),
+            used_crates_static: cstore::used_crates(tcx, LinkagePreference::RequireStatic),
+            used_crate_source: FxHashMap(),
+        };
+
+        for &cnum in tcx.crates().iter() {
+            info.native_libraries.insert(cnum, tcx.native_libraries(cnum));
+            info.crate_name.insert(cnum, tcx.crate_name(cnum).to_string());
+            info.used_crate_source.insert(cnum, tcx.used_crate_source(cnum));
+            if tcx.is_panic_runtime(cnum) {
+                info.panic_runtime = Some(cnum);
+            }
+            if tcx.is_compiler_builtins(cnum) {
+                info.compiler_builtins = Some(cnum);
+            }
+            if tcx.is_profiler_runtime(cnum) {
+                info.profiler_runtime = Some(cnum);
+            }
+            if tcx.is_sanitizer_runtime(cnum) {
+                info.sanitizer_runtime = Some(cnum);
+            }
+            if tcx.is_no_builtins(cnum) {
+                info.is_no_builtins.insert(cnum);
+            }
+        }
+
+
+        return info
+    }
 }

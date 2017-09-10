@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use super::{OverlapError, specializes};
+use super::OverlapError;
 
 use hir::def_id::DefId;
 use traits;
@@ -31,7 +31,7 @@ use util::nodemap::{DefIdMap, FxHashMap};
 ///
 /// - Parent extraction. In particular, the graph can give you the *immediate*
 ///   parents of a given specializing impl, which is needed for extracting
-///   default items amongst other thigns. In the simple "chain" rule, every impl
+///   default items amongst other things. In the simple "chain" rule, every impl
 ///   has at most one parent.
 pub struct Graph {
     // all impls have a parent; the "root" impls have as their parent the def_id
@@ -95,7 +95,7 @@ impl<'a, 'gcx, 'tcx> Children {
     }
 
     /// Attempt to insert an impl into this set of children, while comparing for
-    /// specialiation relationships.
+    /// specialization relationships.
     fn insert(&mut self,
               tcx: TyCtxt<'a, 'gcx, 'tcx>,
               impl_def_id: DefId,
@@ -113,17 +113,17 @@ impl<'a, 'gcx, 'tcx> Children {
                 let overlap = traits::overlapping_impls(&infcx,
                                                         possible_sibling,
                                                         impl_def_id);
-                if let Some(impl_header) = overlap {
+                if let Some(overlap) = overlap {
                     if tcx.impls_are_allowed_to_overlap(impl_def_id, possible_sibling) {
                         return Ok((false, false));
                     }
 
-                    let le = specializes(tcx, impl_def_id, possible_sibling);
-                    let ge = specializes(tcx, possible_sibling, impl_def_id);
+                    let le = tcx.specializes((impl_def_id, possible_sibling));
+                    let ge = tcx.specializes((possible_sibling, impl_def_id));
 
                     if le == ge {
                         // overlap, but no specialization; error out
-                        let trait_ref = impl_header.trait_ref.unwrap();
+                        let trait_ref = overlap.impl_header.trait_ref.unwrap();
                         let self_ty = trait_ref.self_ty();
                         Err(OverlapError {
                             with_impl: possible_sibling,
@@ -135,7 +135,8 @@ impl<'a, 'gcx, 'tcx> Children {
                                 Some(self_ty.to_string())
                             } else {
                                 None
-                            }
+                            },
+                            intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
                         })
                     } else {
                         Ok((le, ge))
@@ -206,7 +207,7 @@ impl<'a, 'gcx, 'tcx> Graph {
 
         // if the reference itself contains an earlier error (e.g., due to a
         // resolution failure), then we just insert the impl at the top level of
-        // the graph and claim that there's no overlap (in order to supress
+        // the graph and claim that there's no overlap (in order to suppress
         // bogus errors).
         if trait_ref.references_error() {
             debug!("insert: inserting dummy node for erroneous TraitRef {:?}, \

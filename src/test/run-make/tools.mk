@@ -5,6 +5,7 @@ HOST_RPATH_ENV = \
 TARGET_RPATH_ENV = \
     $(LD_LIB_PATH_ENVVAR)="$(TMPDIR):$(TARGET_RPATH_DIR):$($(LD_LIB_PATH_ENVVAR))"
 
+RUSTC_ORIGINAL := $(RUSTC)
 BARE_RUSTC := $(HOST_RPATH_ENV) '$(RUSTC)'
 RUSTC := $(BARE_RUSTC) --out-dir $(TMPDIR) -L $(TMPDIR) $(RUSTFLAGS)
 #CC := $(CC) -L $(TMPDIR)
@@ -82,7 +83,7 @@ ifeq ($(UNAME),Bitrig)
 	EXTRACXXFLAGS := -lc++ -lc++abi
 else
 ifeq ($(UNAME),SunOS)
-	EXTRACFLAGS := -lm -lpthread -lposix4 -lsocket
+	EXTRACFLAGS := -lm -lpthread -lposix4 -lsocket -lresolv
 else
 ifeq ($(UNAME),OpenBSD)
 	EXTRACFLAGS := -lm -lpthread

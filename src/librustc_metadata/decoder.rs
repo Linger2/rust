@@ -41,6 +41,7 @@ use rustc_serialize::{Decodable, Decoder, SpecializedDecoder, opaque};
 use syntax::attr;
 use syntax::ast::{self, Ident};
 use syntax::codemap;
+use syntax::symbol::{InternedString, Symbol};
 use syntax::ext::base::MacroKind;
 use syntax_pos::{self, Span, BytePos, Pos, DUMMY_SP, NO_EXPANSION};
 
@@ -69,7 +70,7 @@ pub trait Metadata<'a, 'tcx>: Copy {
             opaque: opaque::Decoder::new(self.raw_bytes(), pos),
             cdata: self.cdata(),
             sess: self.sess().or(tcx.map(|tcx| tcx.sess)),
-            tcx: tcx,
+            tcx,
             last_filemap_index: 0,
             lazy_state: LazyState::NoNode,
         }
@@ -242,7 +243,7 @@ impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
         let sess = if let Some(sess) = self.sess {
             sess
         } else {
-            return Ok(Span { lo: lo, hi: hi, ctxt: NO_EXPANSION });
+            return Ok(Span::new(lo, hi, NO_EXPANSION));
         };
 
         let (lo, hi) = if lo > hi {
@@ -289,7 +290,7 @@ impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
         let lo = (lo - filemap.original_start_pos) + filemap.translated_filemap.start_pos;
         let hi = (hi - filemap.original_start_pos) + filemap.translated_filemap.start_pos;
 
-        Ok(Span { lo: lo, hi: hi, ctxt: NO_EXPANSION })
+        Ok(Span::new(lo, hi, NO_EXPANSION))
     }
 }
 
@@ -438,6 +439,7 @@ impl<'tcx> EntryKind<'tcx> {
             EntryKind::Impl(_) |
             EntryKind::DefaultImpl(_) |
             EntryKind::Field |
+            EntryKind::Generator(_) |
             EntryKind::Closure(_) => return None,
         })
     }
@@ -468,11 +470,11 @@ impl<'a, 'tcx> CrateMetadata {
     fn local_def_id(&self, index: DefIndex) -> DefId {
         DefId {
             krate: self.cnum,
-            index: index,
+            index,
         }
     }
 
-    pub fn item_name(&self, item_index: DefIndex) -> ast::Name {
+    pub fn item_name(&self, item_index: DefIndex) -> InternedString {
         self.def_key(item_index)
             .disambiguated_data
             .data
@@ -519,12 +521,12 @@ impl<'a, 'tcx> CrateMetadata {
 
         ty::VariantDef {
             did: self.local_def_id(data.struct_ctor.unwrap_or(index)),
-            name: self.item_name(index),
+            name: Symbol::intern(&self.item_name(index)),
             fields: item.children.decode(self).map(|index| {
                 let f = self.entry(index);
                 ty::FieldDef {
                     did: self.local_def_id(index),
-                    name: self.item_name(index),
+                    name: Symbol::intern(&self.item_name(index)),
                     vis: f.visibility.decode(self)
                 }
             }).collect(),
@@ -703,8 +705,8 @@ impl<'a, 'tcx> CrateMetadata {
                         for child_index in child.children.decode((self, sess)) {
                             if let Some(def) = self.get_def(child_index) {
                                 callback(def::Export {
-                                    def: def,
-                                    ident: Ident::with_empty_ctxt(self.item_name(child_index)),
+                                    def,
+                                    ident: Ident::from_str(&self.item_name(child_index)),
                                     span: self.entry(child_index).span.decode((self, sess)),
                                 });
                             }
@@ -721,7 +723,7 @@ impl<'a, 'tcx> CrateMetadata {
                 let span = child.span.decode((self, sess));
                 if let (Some(def), Some(name)) =
                     (self.get_def(child_index), def_key.disambiguated_data.data.get_opt_name()) {
-                    let ident = Ident::with_empty_ctxt(name);
+                    let ident = Ident::from_str(&name);
                     callback(def::Export { def: def, ident: ident, span: span });
                     // For non-reexport structs and variants add their constructors to children.
                     // Reexport lists automatically contain constructors when necessary.
@@ -758,10 +760,10 @@ impl<'a, 'tcx> CrateMetadata {
         }
     }
 
-    pub fn item_body(&self,
-                     tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                     id: DefIndex)
-                     -> &'tcx hir::Body {
+    pub fn extern_const_body(&self,
+                             tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                             id: DefIndex)
+                             -> &'tcx hir::Body {
         assert!(!self.is_proc_macro(id));
         let ast = self.entry(id).ast.unwrap();
         let def_id = self.local_def_id(id);
@@ -835,8 +837,8 @@ impl<'a, 'tcx> CrateMetadata {
         };
 
         ty::AssociatedItem {
-            name: name,
-            kind: kind,
+            name: Symbol::intern(&name),
+            kind,
             vis: item.visibility.decode(self),
             defaultness: container.defaultness(),
             def_id: self.local_def_id(id),
@@ -892,7 +894,7 @@ impl<'a, 'tcx> CrateMetadata {
         if def_key.disambiguated_data.data == DefPathData::StructCtor {
             item = self.entry(def_key.parent.unwrap());
         }
-        let result = Rc::__from_array(self.get_attributes(&item).into_boxed_slice());
+        let result: Rc<[ast::Attribute]> = Rc::from(self.get_attributes(&item));
         let vec_ = &mut self.attribute_cache.borrow_mut()[node_as];
         if vec_.len() < node_index + 1 {
             vec_.resize(node_index + 1, None);
@@ -905,7 +907,7 @@ impl<'a, 'tcx> CrateMetadata {
         self.entry(id)
             .children
             .decode(self)
-            .map(|index| self.item_name(index))
+            .map(|index| Symbol::intern(&self.item_name(index)))
             .collect()
     }
 
@@ -1037,7 +1039,7 @@ impl<'a, 'tcx> CrateMetadata {
             .collect()
     }
 
-    pub fn get_macro(&self, id: DefIndex) -> (ast::Name, MacroDef) {
+    pub fn get_macro(&self, id: DefIndex) -> (InternedString, MacroDef) {
         let entry = self.entry(id);
         match entry.kind {
             EntryKind::MacroDef(macro_def) => (self.item_name(id), macro_def.decode(self)),
@@ -1098,6 +1100,23 @@ impl<'a, 'tcx> CrateMetadata {
             _ => bug!(),
         };
         sig.decode((self, tcx))
+    }
+
+    fn get_generator_data(&self,
+                      id: DefIndex,
+                      tcx: TyCtxt<'a, 'tcx, 'tcx>)
+                      -> Option<GeneratorData<'tcx>> {
+        match self.entry(id).kind {
+            EntryKind::Generator(data) => Some(data.decode((self, tcx))),
+            _ => None,
+        }
+    }
+
+    pub fn generator_sig(&self,
+                      id: DefIndex,
+                      tcx: TyCtxt<'a, 'tcx, 'tcx>)
+                      -> Option<ty::PolyGenSig<'tcx>> {
+        self.get_generator_data(id, tcx).map(|d| d.sig)
     }
 
     #[inline]

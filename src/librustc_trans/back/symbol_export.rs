@@ -13,6 +13,7 @@ use rustc::util::nodemap::{FxHashMap, NodeSet};
 use rustc::hir::def_id::{DefId, CrateNum, LOCAL_CRATE, INVALID_CRATE, CRATE_DEF_INDEX};
 use rustc::session::config;
 use rustc::ty::TyCtxt;
+use rustc_allocator::ALLOCATOR_METHODS;
 use syntax::attr;
 
 /// The SymbolExportLevel of a symbols specifies from which kinds of crates
@@ -83,6 +84,14 @@ impl ExportedSymbols {
                               SymbolExportLevel::C));
         }
 
+        if tcx.sess.allocator_kind.get().is_some() {
+            for method in ALLOCATOR_METHODS {
+                local_crate.push((format!("__rust_{}", method.name),
+                                  INVALID_DEF_ID,
+                                  SymbolExportLevel::Rust));
+            }
+        }
+
         if let Some(id) = tcx.sess.derive_registrar_fn.get() {
             let def_id = tcx.hir.local_def_id(id);
             let idx = def_id.index;
@@ -101,13 +110,13 @@ impl ExportedSymbols {
         let mut exports = FxHashMap();
         exports.insert(LOCAL_CRATE, local_crate);
 
-        for cnum in tcx.sess.cstore.crates() {
+        for &cnum in tcx.crates().iter() {
             debug_assert!(cnum != LOCAL_CRATE);
 
             // If this crate is a plugin and/or a custom derive crate, then
             // we're not even going to link those in so we skip those crates.
-            if tcx.sess.cstore.plugin_registrar_fn(cnum).is_some() ||
-               tcx.sess.cstore.derive_registrar_fn(cnum).is_some() {
+            if tcx.plugin_registrar_fn(cnum).is_some() ||
+               tcx.derive_registrar_fn(cnum).is_some() {
                 continue;
             }
 
@@ -119,12 +128,9 @@ impl ExportedSymbols {
             // Down below we'll hardwire all of the symbols to the `Rust` export
             // level instead.
             let special_runtime_crate =
-                tcx.is_panic_runtime(cnum.as_def_id()) ||
-                tcx.sess.cstore.is_compiler_builtins(cnum);
+                tcx.is_panic_runtime(cnum) || tcx.is_compiler_builtins(cnum);
 
             let crate_exports = tcx
-                .sess
-                .cstore
                 .exported_symbols(cnum)
                 .iter()
                 .map(|&def_id| {

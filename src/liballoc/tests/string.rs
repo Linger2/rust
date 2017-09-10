@@ -333,6 +333,26 @@ fn remove_bad() {
 }
 
 #[test]
+fn test_retain() {
+    let mut s = String::from("α_β_γ");
+
+    s.retain(|_| true);
+    assert_eq!(s, "α_β_γ");
+
+    s.retain(|c| c != '_');
+    assert_eq!(s, "αβγ");
+
+    s.retain(|c| c != 'β');
+    assert_eq!(s, "αγ");
+
+    s.retain(|c| c == 'α');
+    assert_eq!(s, "α");
+
+    s.retain(|_| false);
+    assert_eq!(s, "");
+}
+
+#[test]
 fn insert() {
     let mut s = "foobar".to_string();
     s.insert(0, 'ệ');
@@ -422,9 +442,8 @@ fn test_drain() {
 #[test]
 fn test_splice() {
     let mut s = "Hello, world!".to_owned();
-    let t: String = s.splice(7..12, "世界").collect();
+    s.splice(7..12, "世界");
     assert_eq!(s, "Hello, 世界!");
-    assert_eq!(t, "world");
 }
 
 #[test]
@@ -437,12 +456,10 @@ fn test_splice_char_boundary() {
 #[test]
 fn test_splice_inclusive_range() {
     let mut v = String::from("12345");
-    let t: String = v.splice(2...3, "789").collect();
+    v.splice(2...3, "789");
     assert_eq!(v, "127895");
-    assert_eq!(t, "34");
-    let t2: String = v.splice(1...2, "A").collect();
+    v.splice(1...2, "A");
     assert_eq!(v, "1A895");
-    assert_eq!(t2, "27");
 }
 
 #[test]
@@ -462,24 +479,15 @@ fn test_splice_inclusive_out_of_bounds() {
 #[test]
 fn test_splice_empty() {
     let mut s = String::from("12345");
-    let t: String = s.splice(1..2, "").collect();
+    s.splice(1..2, "");
     assert_eq!(s, "1345");
-    assert_eq!(t, "2");
 }
 
 #[test]
 fn test_splice_unbounded() {
     let mut s = String::from("12345");
-    let t: String = s.splice(.., "").collect();
+    s.splice(.., "");
     assert_eq!(s, "");
-    assert_eq!(t, "12345");
-}
-
-#[test]
-fn test_splice_forget() {
-    let mut s = String::from("12345");
-    ::std::mem::forget(s.splice(2..4, "789"));
-    assert_eq!(s, "12345");
 }
 
 #[test]

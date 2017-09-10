@@ -774,6 +774,26 @@ impl<'a, T: Clone> Option<&'a T> {
     }
 }
 
+impl<'a, T: Clone> Option<&'a mut T> {
+    /// Maps an `Option<&mut T>` to an `Option<T>` by cloning the contents of the
+    /// option.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(option_ref_mut_cloned)]
+    /// let mut x = 12;
+    /// let opt_x = Some(&mut x);
+    /// assert_eq!(opt_x, Some(&mut 12));
+    /// let cloned = opt_x.cloned();
+    /// assert_eq!(cloned, Some(12));
+    /// ```
+    #[unstable(feature = "option_ref_mut_cloned", issue = "43738")]
+    pub fn cloned(self) -> Option<T> {
+        self.map(|t| t.clone())
+    }
+}
+
 impl<T: Default> Option<T> {
     /// Returns the contained value or a default
     ///
@@ -872,7 +892,7 @@ impl<'a, T> IntoIterator for &'a mut Option<T> {
     type Item = &'a mut T;
     type IntoIter = IterMut<'a, T>;
 
-    fn into_iter(mut self) -> IterMut<'a, T> {
+    fn into_iter(self) -> IterMut<'a, T> {
         self.iter_mut()
     }
 }

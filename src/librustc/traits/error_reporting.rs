@@ -15,6 +15,8 @@ use super::{
     Obligation,
     ObligationCause,
     ObligationCauseCode,
+    OnUnimplementedDirective,
+    OnUnimplementedNote,
     OutputTypeParameterMismatch,
     TraitNotObjectSafe,
     PredicateObligation,
@@ -25,7 +27,6 @@ use super::{
 };
 
 use errors::DiagnosticBuilder;
-use fmt_macros::{Parser, Piece, Position};
 use hir;
 use hir::def_id::DefId;
 use infer::{self, InferCtxt};
@@ -111,8 +112,8 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    // returns if `cond` not occuring implies that `error` does not occur - i.e. that
-    // `error` occuring implies that `cond` occurs.
+    // returns if `cond` not occurring implies that `error` does not occur - i.e. that
+    // `error` occurring implies that `cond` occurs.
     fn error_implies(&self,
                      cond: &ty::Predicate<'tcx>,
                      error: &ty::Predicate<'tcx>)
@@ -251,6 +252,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                     AdtKind::Union => Some(16),
                     AdtKind::Enum => Some(17),
                 },
+                ty::TyGenerator(..) => Some(18),
                 ty::TyInfer(..) | ty::TyError => None
             }
         }
@@ -278,8 +280,8 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         let mut self_match_impls = vec![];
         let mut fuzzy_match_impls = vec![];
 
-        self.tcx.trait_def(trait_ref.def_id)
-            .for_each_relevant_impl(self.tcx, trait_self_ty, |def_id| {
+        self.tcx.for_each_relevant_impl(
+            trait_ref.def_id, trait_self_ty, |def_id| {
                 let impl_substs = self.fresh_substs_for_item(obligation.cause.span, def_id);
                 let impl_trait_ref = tcx
                     .impl_trait_ref(def_id)
@@ -315,77 +317,56 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn on_unimplemented_note(&self,
-                             trait_ref: ty::PolyTraitRef<'tcx>,
-                             obligation: &PredicateObligation<'tcx>) -> Option<String> {
+    fn on_unimplemented_note(
+        &self,
+        trait_ref: ty::PolyTraitRef<'tcx>,
+        obligation: &PredicateObligation<'tcx>) ->
+        OnUnimplementedNote
+    {
         let def_id = self.impl_similar_to(trait_ref, obligation)
             .unwrap_or(trait_ref.def_id());
-        let trait_ref = trait_ref.skip_binder();
+        let trait_ref = *trait_ref.skip_binder();
 
-        let span = obligation.cause.span;
-        let mut report = None;
-        if let Some(item) = self.tcx
-            .get_attrs(def_id)
-            .into_iter()
-            .filter(|a| a.check_name("rustc_on_unimplemented"))
-            .next()
-        {
-            let name = self.tcx.item_name(def_id).as_str();
-            let err_sp = item.span.substitute_dummy(span);
-            let trait_str = self.tcx.item_path_str(trait_ref.def_id);
-            if let Some(istring) = item.value_str() {
-                let istring = &*istring.as_str();
-                let generics = self.tcx.generics_of(trait_ref.def_id);
-                let generic_map = generics.types.iter().map(|param| {
-                    (param.name.as_str().to_string(),
-                        trait_ref.substs.type_for_def(param).to_string())
-                }).collect::<FxHashMap<String, String>>();
-                let parser = Parser::new(istring);
-                let mut errored = false;
-                let err: String = parser.filter_map(|p| {
-                    match p {
-                        Piece::String(s) => Some(s),
-                        Piece::NextArgument(a) => match a.position {
-                            Position::ArgumentNamed(s) => match generic_map.get(s) {
-                                Some(val) => Some(val),
-                                None if s == name => {
-                                    Some(&trait_str)
-                                }
-                                None => {
-                                    span_err!(self.tcx.sess, err_sp, E0272,
-                                              "the #[rustc_on_unimplemented] attribute on trait \
-                                               definition for {} refers to non-existent type \
-                                               parameter {}",
-                                              trait_str, s);
-                                    errored = true;
-                                    None
-                                }
-                            },
-                            _ => {
-                                span_err!(self.tcx.sess, err_sp, E0273,
-                                          "the #[rustc_on_unimplemented] attribute on trait \
-                                           definition for {} must have named format arguments, eg \
-                                           `#[rustc_on_unimplemented = \"foo {{T}}\"]`",
-                                          trait_str);
-                                errored = true;
-                                None
-                            }
-                        }
-                    }
-                }).collect();
-                // Report only if the format string checks out
-                if !errored {
-                    report = Some(err);
-                }
-            } else {
-                span_err!(self.tcx.sess, err_sp, E0274,
-                                        "the #[rustc_on_unimplemented] attribute on \
-                                                    trait definition for {} must have a value, \
-                                                    eg `#[rustc_on_unimplemented = \"foo\"]`",
-                                                    trait_str);
+        let desugaring;
+        let method;
+        let mut flags = vec![];
+        let direct = match obligation.cause.code {
+            ObligationCauseCode::BuiltinDerivedObligation(..) |
+            ObligationCauseCode::ImplDerivedObligation(..) => false,
+            _ => true
+        };
+        if direct {
+            // this is a "direct", user-specified, rather than derived,
+            // obligation.
+            flags.push(("direct", None));
+        }
+
+        if let ObligationCauseCode::ItemObligation(item) = obligation.cause.code {
+            // FIXME: maybe also have some way of handling methods
+            // from other traits? That would require name resolution,
+            // which we might want to be some sort of hygienic.
+            //
+            // Currently I'm leaving it for what I need for `try`.
+            if self.tcx.trait_of_item(item) == Some(trait_ref.def_id) {
+                method = self.tcx.item_name(item);
+                flags.push(("from_method", None));
+                flags.push(("from_method", Some(&*method)));
             }
         }
-        report
+
+        if let Some(k) = obligation.cause.span.compiler_desugaring_kind() {
+            desugaring = k.as_symbol().as_str();
+            flags.push(("from_desugaring", None));
+            flags.push(("from_desugaring", Some(&*desugaring)));
+        }
+
+        if let Ok(Some(command)) = OnUnimplementedDirective::of_item(
+            self.tcx, trait_ref.def_id, def_id
+        ) {
+            command.evaluate(self.tcx, trait_ref, &flags)
+        } else {
+            OnUnimplementedNote::empty()
+        }
     }
 
     fn find_similar_impl_candidates(&self,
@@ -396,10 +377,9 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                                               trait_ref.skip_binder().self_ty(),
                                               true);
         let mut impl_candidates = Vec::new();
-        let trait_def = self.tcx.trait_def(trait_ref.def_id());
 
         match simp {
-            Some(simp) => trait_def.for_each_impl(self.tcx, |def_id| {
+            Some(simp) => self.tcx.for_each_impl(trait_ref.def_id(), |def_id| {
                 let imp = self.tcx.impl_trait_ref(def_id).unwrap();
                 let imp_simp = fast_reject::simplify_type(self.tcx,
                                                           imp.self_ty(),
@@ -411,7 +391,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 }
                 impl_candidates.push(imp);
             }),
-            None => trait_def.for_each_impl(self.tcx, |def_id| {
+            None => self.tcx.for_each_impl(trait_ref.def_id(), |def_id| {
                 impl_candidates.push(
                     self.tcx.impl_trait_ref(def_id).unwrap());
             })
@@ -500,11 +480,21 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         // weird effect -- the diagnostic is reported as a lint, and
         // the builder which is returned is marked as canceled.
 
-        let mut err =
-            struct_span_err!(self.tcx.sess,
-                             error_span,
-                             E0276,
-                             "impl has stricter requirements than trait");
+        let msg = "impl has stricter requirements than trait";
+        let mut err = match lint_id {
+            Some(node_id) => {
+                self.tcx.struct_span_lint_node(EXTRA_REQUIREMENT_IN_IMPL,
+                                               node_id,
+                                               error_span,
+                                               msg)
+            }
+            None => {
+                struct_span_err!(self.tcx.sess,
+                                 error_span,
+                                 E0276,
+                                 "{}", msg)
+            }
+        };
 
         if let Some(trait_item_span) = self.tcx.hir.span_if_local(trait_item_def_id) {
             let span = self.tcx.sess.codemap().def_span(trait_item_span);
@@ -514,13 +504,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         err.span_label(
             error_span,
             format!("impl has extra requirement {}", requirement));
-
-        if let Some(node_id) = lint_id {
-            self.tcx.sess.add_lint_diagnostic(EXTRA_REQUIREMENT_IN_IMPL,
-                                              node_id,
-                                              (*err).clone());
-            err.cancel();
-        }
 
         err
     }
@@ -574,17 +557,23 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                         let (post_message, pre_message) =
                             self.get_parent_trait_ref(&obligation.cause.code)
                                 .map(|t| (format!(" in `{}`", t), format!("within `{}`, ", t)))
-                                .unwrap_or((String::new(), String::new()));
+                            .unwrap_or((String::new(), String::new()));
+
+                        let OnUnimplementedNote { message, label }
+                            = self.on_unimplemented_note(trait_ref, obligation);
+                        let have_alt_message = message.is_some() || label.is_some();
+
                         let mut err = struct_span_err!(
                             self.tcx.sess,
                             span,
                             E0277,
-                            "the trait bound `{}` is not satisfied{}",
-                            trait_ref.to_predicate(),
-                            post_message);
+                            "{}",
+                            message.unwrap_or_else(|| {
+                                format!("the trait bound `{}` is not satisfied{}",
+                                         trait_ref.to_predicate(), post_message)
+                            }));
 
-                        let unimplemented_note = self.on_unimplemented_note(trait_ref, obligation);
-                        if let Some(ref s) = unimplemented_note {
+                        if let Some(ref s) = label {
                             // If it has a custom "#[rustc_on_unimplemented]"
                             // error message, let's display it as the label!
                             err.span_label(span, s.as_str());
@@ -612,7 +601,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                             // which is somewhat confusing.
                             err.help(&format!("consider adding a `where {}` bound",
                                                 trait_ref.to_predicate()));
-                        } else if unimplemented_note.is_none() {
+                        } else if !have_alt_message {
                             // Can't show anything else useful, try to find similar impls.
                             let impl_candidates = self.find_similar_impl_candidates(trait_ref);
                             self.report_similar_impl_candidates(impl_candidates, &mut err);
@@ -680,7 +669,9 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                         // Additional context information explaining why the closure only implements
                         // a particular trait.
                         if let Some(tables) = self.in_progress_tables {
-                            match tables.borrow().closure_kinds.get(&node_id) {
+                            let tables = tables.borrow();
+                            let closure_hir_id = self.tcx.hir.node_to_hir_id(node_id);
+                            match tables.closure_kinds().get(closure_hir_id) {
                                 Some(&(ty::ClosureKind::FnOnce, Some((span, name)))) => {
                                     err.span_note(span, &format!(
                                         "closure is `FnOnce` because it moves the \
@@ -928,7 +919,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                 // anyway. In that case, why inundate the user.
                 if !self.tcx.sess.has_errors() {
                     if
-                        self.tcx.lang_items.sized_trait()
+                        self.tcx.lang_items().sized_trait()
                         .map_or(false, |sized_id| sized_id == trait_ref.def_id())
                     {
                         self.need_type_info(body_id, span, self_ty);
@@ -1107,8 +1098,19 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             ObligationCauseCode::StructInitializerSized => {
                 err.note("structs must have a statically known size to be initialized");
             }
-            ObligationCauseCode::FieldSized => {
-                err.note("only the last field of a struct may have a dynamically sized type");
+            ObligationCauseCode::FieldSized(ref item) => {
+                match *item {
+                    AdtKind::Struct => {
+                        err.note("only the last field of a struct may have a dynamically \
+                                  sized type");
+                    }
+                    AdtKind::Union => {
+                        err.note("no field of a union may have a dynamically sized type");
+                    }
+                    AdtKind::Enum => {
+                        err.note("no field of an enum variant may have a dynamically sized type");
+                    }
+                }
             }
             ObligationCauseCode::ConstSized => {
                 err.note("constant expressions must have a statically known size");
@@ -1150,8 +1152,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     fn suggest_new_overflow_limit(&self, err: &mut DiagnosticBuilder) {
         let current_limit = self.tcx.sess.recursion_limit.get();
         let suggested_limit = current_limit * 2;
-        err.help(&format!(
-                          "consider adding a `#![recursion_limit=\"{}\"]` attribute to your crate",
+        err.help(&format!("consider adding a `#![recursion_limit=\"{}\"]` attribute to your crate",
                           suggested_limit));
     }
 }

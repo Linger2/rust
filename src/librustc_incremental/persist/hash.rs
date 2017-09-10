@@ -38,8 +38,8 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
                incremental_hashes_map: &'a IncrementalHashesMap)
                -> Self {
         HashContext {
-            tcx: tcx,
-            incremental_hashes_map: incremental_hashes_map,
+            tcx,
+            incremental_hashes_map,
             metadata_hashes: FxHashMap(),
             crate_hashes: FxHashMap(),
         }
@@ -133,7 +133,7 @@ impl<'a, 'tcx> HashContext<'a, 'tcx> {
     fn load_data(&mut self, cnum: CrateNum) {
         debug!("load_data(cnum={})", cnum);
 
-        let svh = self.tcx.sess.cstore.crate_hash(cnum);
+        let svh = self.tcx.crate_hash(cnum);
         let old = self.crate_hashes.insert(cnum, svh);
         debug!("load_data: svh={}", svh);
         assert!(old.is_none(), "loaded data for crate {:?} twice", cnum);

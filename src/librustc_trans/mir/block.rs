@@ -330,7 +330,7 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                 self.set_debug_loc(&bcx, terminator.source_info);
 
                 // Get the location information.
-                let loc = bcx.sess().codemap().lookup_char_pos(span.lo);
+                let loc = bcx.sess().codemap().lookup_char_pos(span.lo());
                 let filename = Symbol::intern(&loc.file.name).as_str();
                 let filename = C_str_slice(bcx.ccx, filename);
                 let line = C_u32(bcx.ccx, loc.line as u32);
@@ -373,6 +373,27 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                         (lang_items::PanicFnLangItem,
                          vec![msg_file_line_col],
                          Some(ErrKind::Math(err.clone())))
+                    }
+                    mir::AssertMessage::GeneratorResumedAfterReturn |
+                    mir::AssertMessage::GeneratorResumedAfterPanic => {
+                        let str = if let mir::AssertMessage::GeneratorResumedAfterReturn = *msg {
+                            "generator resumed after completion"
+                        } else {
+                            "generator resumed after panicking"
+                        };
+                        let msg_str = Symbol::intern(str).as_str();
+                        let msg_str = C_str_slice(bcx.ccx, msg_str);
+                        let msg_file_line = C_struct(bcx.ccx,
+                                                     &[msg_str, filename, line],
+                                                     false);
+                        let align = llalign_of_min(bcx.ccx, common::val_ty(msg_file_line));
+                        let msg_file_line = consts::addr_of(bcx.ccx,
+                                                            msg_file_line,
+                                                            align,
+                                                            "panic_loc");
+                        (lang_items::PanicFnLangItem,
+                         vec![msg_file_line],
+                         None)
                     }
                 };
 
@@ -424,7 +445,7 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                 // Handle intrinsics old trans wants Expr's for, ourselves.
                 let intrinsic = match def {
                     Some(ty::InstanceDef::Intrinsic(def_id))
-                        => Some(bcx.tcx().item_name(def_id).as_str()),
+                        => Some(bcx.tcx().item_name(def_id)),
                     _ => None
                 };
                 let intrinsic = intrinsic.as_ref().map(|s| &s[..]);
@@ -557,6 +578,8 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                         destination.as_ref().map(|&(_, target)| (ret_dest, sig.output(), target)),
                         cleanup);
             }
+            mir::TerminatorKind::GeneratorDrop |
+            mir::TerminatorKind::Yield { .. } => bug!("generator ops in trans"),
         }
     }
 
@@ -673,8 +696,8 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                         Ref(ptr, align)
                     };
                     let op = OperandRef {
-                        val: val,
-                        ty: ty
+                        val,
+                        ty,
                     };
                     self.trans_argument(bcx, op, llargs, fn_ty, next_idx, llfn, def);
                 }
@@ -697,7 +720,7 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                     // If the tuple is immediate, the elements are as well
                     let op = OperandRef {
                         val: Immediate(elem),
-                        ty: ty
+                        ty,
                     };
                     self.trans_argument(bcx, op, llargs, fn_ty, next_idx, llfn, def);
                 }
@@ -713,7 +736,7 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
                     // Pair is always made up of immediates
                     let op = OperandRef {
                         val: Immediate(elem),
-                        ty: ty
+                        ty,
                     };
                     self.trans_argument(bcx, op, llargs, fn_ty, next_idx, llfn, def);
                 }

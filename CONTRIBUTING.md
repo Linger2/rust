@@ -99,7 +99,7 @@ Before you can start building the compiler you need to configure the build for
 your system. In most cases, that will just mean using the defaults provided
 for Rust.
 
-To change configuration, you must copy the file `src/bootstrap/config.toml.example`
+To change configuration, you must copy the file `config.toml.example`
 to `config.toml` in the directory from which you will be running the build, and
 change the settings provided.
 
@@ -232,15 +232,45 @@ Some common invocations of `x.py` are:
   guidelines as of yet, but basic rules like 4 spaces for indentation and no
   more than 99 characters in a single line should be kept in mind when writing
   code.
-- `rustup toolchain link <name> build/<host-triple>/<stage>` - Use the custom compiler build via [rustup](https://github.com/rust-lang-nursery/rustup.rs#working-with-custom-toolchains-and-local-builds).
+
+### Using your local build
+
+If you use Rustup to manage your rust install, it has a feature called ["custom
+toolchains"][toolchain-link] that you can use to access your newly-built compiler
+without having to install it to your system or user PATH. If you've run `python
+x.py build`, then you can add your custom rustc to a new toolchain like this:
+
+[toolchain-link]: https://github.com/rust-lang-nursery/rustup.rs#working-with-custom-toolchains-and-local-builds
+
+```
+rustup toolchain link <name> build/<host-triple>/stage2
+```
+
+Where `<host-triple>` is the build triple for the host (the triple of your
+computer, by default), and `<name>` is the name for your custom toolchain. (If you
+added `--stage 1` to your build command, the compiler will be in the `stage1`
+folder instead.) You'll only need to do this once - it will automatically point
+to the latest build you've done.
+
+Once this is set up, you can use your custom toolchain just like any other. For
+example, if you've named your toolchain `local`, running `cargo +local build` will
+compile a project with your custom rustc, setting `rustup override set local` will
+override the toolchain for your current directory, and `cargo +local doc` will use
+your custom rustc and rustdoc to generate docs. (If you do this with a `--stage 1`
+build, you'll need to build rustdoc specially, since it's not normally built in
+stage 1. `python x.py build --stage 1 src/libstd src/tools/rustdoc` will build
+rustdoc and libstd, which will allow rustdoc to be run with that toolchain.)
 
 ## Pull Requests
 
 Pull requests are the primary mechanism we use to change Rust. GitHub itself
-has some [great documentation][pull-requests] on using the Pull Request
-feature. We use the 'fork and pull' model described there.
+has some [great documentation][pull-requests] on using the Pull Request feature.
+We use the "fork and pull" model [described here][development-models], where
+contributors push changes to their personal fork and create pull requests to
+bring those changes into the source repository.
 
-[pull-requests]: https://help.github.com/articles/using-pull-requests/
+[pull-requests]: https://help.github.com/articles/about-pull-requests/
+[development-models]: https://help.github.com/articles/about-collaborative-development-models/
 
 Please make pull requests against the `master` branch.
 
@@ -294,6 +324,32 @@ will run all the tests on every platform we support. If it all works out,
 Speaking of tests, Rust has a comprehensive test suite. More information about
 it can be found
 [here](https://github.com/rust-lang/rust-wiki-backup/blob/master/Note-testsuite.md).
+
+### External Dependencies
+
+Currently building Rust will also build the following external projects:
+
+* [clippy](https://github.com/rust-lang-nursery/rust-clippy)
+
+If your changes break one of these projects, you need to fix them by opening
+a pull request against the broken project. When you have opened a pull request,
+you can point the submodule at your pull request by calling
+
+```
+git fetch origin pull/$id_of_your_pr/head:my_pr
+git checkout my_pr
+```
+
+within the submodule's directory. Don't forget to also add your changes with
+
+```
+git add path/to/submodule
+```
+
+outside the submodule.
+
+It can also be more convenient during development to set `submodules = false`
+in the `config.toml` to prevent `x.py` from resetting to the original branch.
 
 ## Writing Documentation
 
@@ -412,4 +468,4 @@ are:
 [tlgba]: http://tomlee.co/2014/04/a-more-detailed-tour-of-the-rust-compiler/
 [ro]: http://www.rustaceans.org/
 [rctd]: ./src/test/COMPILER_TESTS.md
-[cheatsheet]: https://buildbot.rust-lang.org/homu/
+[cheatsheet]: https://buildbot2.rust-lang.org/homu/

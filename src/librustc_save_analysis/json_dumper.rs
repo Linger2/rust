@@ -51,7 +51,11 @@ impl<'b> DumpOutput for CallbackOutput<'b> {
 
 impl<'b, W: Write> JsonDumper<WriteOutput<'b, W>> {
     pub fn new(writer: &'b mut W, config: Config) -> JsonDumper<WriteOutput<'b, W>> {
-        JsonDumper { output: WriteOutput { output: writer }, config, result: Analysis::new() }
+        JsonDumper {
+            output: WriteOutput { output: writer },
+            config: config.clone(),
+            result: Analysis::new(config)
+        }
     }
 }
 
@@ -61,8 +65,8 @@ impl<'b> JsonDumper<CallbackOutput<'b>> {
                          -> JsonDumper<CallbackOutput<'b>> {
         JsonDumper {
             output: CallbackOutput { callback: callback },
-            config,
-            result: Analysis::new(),
+            config: config.clone(),
+            result: Analysis::new(config),
         }
     }
 }
@@ -105,7 +109,7 @@ impl<'b, O: DumpOutput + 'b> JsonDumper<O> {
         }
         if data.kind == DefKind::Mod && data.span.file_name.to_str().unwrap() != data.value {
             // If the module is an out-of-line defintion, then we'll make the
-            // defintion the first character in the module's file and turn the
+            // definition the first character in the module's file and turn the
             // the declaration into a reference to it.
             let rf = Ref {
                 kind: RefKind::Mod,

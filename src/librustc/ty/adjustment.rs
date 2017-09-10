@@ -29,7 +29,7 @@ use ty::subst::Substs;
 /// by `autoref`, to either a raw or borrowed pointer. In these cases unsize is
 /// `false`.
 ///
-/// 2. A thin-to-fat coercon involves unsizing the underlying data. We start
+/// 2. A thin-to-fat coercion involves unsizing the underlying data. We start
 /// with a thin pointer, deref a number of times, unsize the underlying data,
 /// then autoref. The 'unsize' phase may change a fixed length array to a
 /// dynamically sized one, a concrete object to a trait object, or statically
@@ -52,7 +52,7 @@ use ty::subst::Substs;
 /// that case, we have the pointer we need coming in, so there are no
 /// autoderefs, and no autoref. Instead we just do the `Unsize` transformation.
 /// At some point, of course, `Box` should move out of the compiler, in which
-/// case this is analogous to transformating a struct. E.g., Box<[i32; 4]> ->
+/// case this is analogous to transforming a struct. E.g., Box<[i32; 4]> ->
 /// Box<[i32]> is an `Adjust::Unsize` with the target `Box<[i32]>`.
 #[derive(Clone, RustcEncodable, RustcDecodable)]
 pub struct Adjustment<'tcx> {
@@ -110,8 +110,8 @@ impl<'a, 'gcx, 'tcx> OverloadedDeref<'tcx> {
     pub fn method_call(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>, source: Ty<'tcx>)
                        -> (DefId, &'tcx Substs<'tcx>) {
         let trait_def_id = match self.mutbl {
-            hir::MutImmutable => tcx.lang_items.deref_trait(),
-            hir::MutMutable => tcx.lang_items.deref_mut_trait()
+            hir::MutImmutable => tcx.lang_items().deref_trait(),
+            hir::MutMutable => tcx.lang_items().deref_mut_trait()
         };
         let method_def_id = tcx.associated_items(trait_def_id.unwrap())
             .find(|m| m.kind == ty::AssociatedKind::Method).unwrap().def_id;

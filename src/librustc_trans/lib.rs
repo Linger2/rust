@@ -14,9 +14,6 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![crate_name = "rustc_trans"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -36,7 +33,6 @@
 
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
-use std::sync::Arc;
 
 extern crate flate2;
 extern crate libc;
@@ -46,7 +42,7 @@ extern crate rustc_allocator;
 extern crate rustc_back;
 extern crate rustc_data_structures;
 extern crate rustc_incremental;
-pub extern crate rustc_llvm as llvm;
+extern crate rustc_llvm as llvm;
 extern crate rustc_platform_intrinsics as intrinsics;
 extern crate rustc_const_math;
 #[macro_use]
@@ -70,15 +66,22 @@ pub use back::symbol_names::provide;
 pub use metadata::LlvmMetadataLoader;
 pub use llvm_util::{init, target_features, print_version, print_passes, print, enable_llvm_debug};
 
+use std::rc::Rc;
+
+use rustc::hir::def_id::CrateNum;
+use rustc::util::nodemap::{FxHashSet, FxHashMap};
+use rustc::middle::cstore::{NativeLibrary, CrateSource, LibSource};
+
 pub mod back {
     mod archive;
+    mod command;
     pub(crate) mod linker;
     pub mod link;
     mod lto;
     pub(crate) mod symbol_export;
     pub(crate) mod symbol_names;
     pub mod write;
-    pub mod rpath;
+    mod rpath;
 }
 
 mod diagnostics;
@@ -138,8 +141,8 @@ pub struct ModuleTranslation {
     /// unique amongst **all** crates.  Therefore, it should contain
     /// something unique to this crate (e.g., a module path) as well
     /// as the crate name and disambiguator.
-    pub name: String,
-    pub symbol_name_hash: u64,
+    name: String,
+    symbol_name_hash: u64,
     pub source: ModuleSource,
     pub kind: ModuleKind,
 }
@@ -206,7 +209,7 @@ pub enum ModuleSource {
 
 #[derive(Copy, Clone, Debug)]
 pub struct ModuleLlvm {
-    pub llcx: llvm::ContextRef,
+    llcx: llvm::ContextRef,
     pub llmod: llvm::ModuleRef,
 }
 
@@ -216,14 +219,28 @@ unsafe impl Sync for ModuleTranslation { }
 pub struct CrateTranslation {
     pub crate_name: Symbol,
     pub modules: Vec<CompiledModule>,
-    pub metadata_module: CompiledModule,
-    pub allocator_module: Option<CompiledModule>,
+    allocator_module: Option<CompiledModule>,
     pub link: rustc::middle::cstore::LinkMeta,
     pub metadata: rustc::middle::cstore::EncodedMetadata,
-    pub exported_symbols: Arc<back::symbol_export::ExportedSymbols>,
-    pub no_builtins: bool,
-    pub windows_subsystem: Option<String>,
-    pub linker_info: back::linker::LinkerInfo
+    windows_subsystem: Option<String>,
+    linker_info: back::linker::LinkerInfo,
+    crate_info: CrateInfo,
+}
+
+// Misc info we load from metadata to persist beyond the tcx
+pub struct CrateInfo {
+    panic_runtime: Option<CrateNum>,
+    compiler_builtins: Option<CrateNum>,
+    profiler_runtime: Option<CrateNum>,
+    sanitizer_runtime: Option<CrateNum>,
+    is_no_builtins: FxHashSet<CrateNum>,
+    native_libraries: FxHashMap<CrateNum, Rc<Vec<NativeLibrary>>>,
+    crate_name: FxHashMap<CrateNum, String>,
+    used_libraries: Rc<Vec<NativeLibrary>>,
+    link_args: Rc<Vec<String>>,
+    used_crate_source: FxHashMap<CrateNum, Rc<CrateSource>>,
+    used_crates_static: Vec<(CrateNum, LibSource)>,
+    used_crates_dynamic: Vec<(CrateNum, LibSource)>,
 }
 
 __build_diagnostic_array! { librustc_trans, DIAGNOSTICS }

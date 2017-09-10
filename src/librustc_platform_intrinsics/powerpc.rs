@@ -142,6 +142,261 @@ pub fn find(name: &str) -> Option<Intrinsic> {
             output: &::U32x4,
             definition: Named("llvm.ppc.altivec.vminuw")
         },
+        "_vec_subsbs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I8x16]; &INPUTS },
+            output: &::I8x16,
+            definition: Named("llvm.ppc.altivec.vsubsbs")
+        },
+        "_vec_sububs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U8x16]; &INPUTS },
+            output: &::U8x16,
+            definition: Named("llvm.ppc.altivec.vsububs")
+        },
+        "_vec_subshs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vsubshs")
+        },
+        "_vec_subuhs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vsubuhs")
+        },
+        "_vec_subsws" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vsubsws")
+        },
+        "_vec_subuws" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vsubuws")
+        },
+        "_vec_subc" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vsubcuw")
+        },
+        "_vec_addsbs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I8x16]; &INPUTS },
+            output: &::I8x16,
+            definition: Named("llvm.ppc.altivec.vaddsbs")
+        },
+        "_vec_addubs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U8x16]; &INPUTS },
+            output: &::U8x16,
+            definition: Named("llvm.ppc.altivec.vaddubs")
+        },
+        "_vec_addshs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vaddshs")
+        },
+        "_vec_adduhs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vadduhs")
+        },
+        "_vec_addsws" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vaddsws")
+        },
+        "_vec_adduws" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vadduws")
+        },
+        "_vec_addc" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vaddcuw")
+        },
+        "_vec_mulesb" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I8x16]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vmulesb")
+        },
+        "_vec_muleub" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U8x16]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vmuleub")
+        },
+        "_vec_mulesh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vmulesh")
+        },
+        "_vec_muleuh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vmuleuh")
+        },
+        "_vec_mulosb" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I8x16]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vmulosb")
+        },
+        "_vec_muloub" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U8x16]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vmuloub")
+        },
+        "_vec_mulosh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vmulosh")
+        },
+        "_vec_mulouh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vmulouh")
+        },
+        "_vec_avgsb" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I8x16]; &INPUTS },
+            output: &::I8x16,
+            definition: Named("llvm.ppc.altivec.vavgsb")
+        },
+        "_vec_avgub" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U8x16]; &INPUTS },
+            output: &::U8x16,
+            definition: Named("llvm.ppc.altivec.vavgub")
+        },
+        "_vec_avgsh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vavgsh")
+        },
+        "_vec_avguh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vavguh")
+        },
+        "_vec_avgsw" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vavgsw")
+        },
+        "_vec_avguw" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vavguw")
+        },
+        "_vec_packssh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::I8x16,
+            definition: Named("llvm.ppc.altivec.vpkshss")
+        },
+        "_vec_packsuh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U16x8, &::U16x8]; &INPUTS },
+            output: &::U8x16,
+            definition: Named("llvm.ppc.altivec.vpkuhus")
+        },
+        "_vec_packssw" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vpkswss")
+        },
+        "_vec_packsuw" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U32x4, &::U32x4]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vpkuwus")
+        },
+        "_vec_packsush" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I16x8]; &INPUTS },
+            output: &::U8x16,
+            definition: Named("llvm.ppc.altivec.vpkshus")
+        },
+        "_vec_packsusw" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::U16x8,
+            definition: Named("llvm.ppc.altivec.vpkswus")
+        },
+        "_vec_packpx" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vpkpx")
+        },
+        "_vec_unpacklsb" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 1] = [&::I8x16]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vupklsb")
+        },
+        "_vec_unpacklsh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 1] = [&::I16x8]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vupklsh")
+        },
+        "_vec_unpackhsb" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 1] = [&::I8x16]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vupkhsb")
+        },
+        "_vec_unpackhsh" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 1] = [&::I16x8]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vupkhsh")
+        },
+        "_vec_madds" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::I16x8, &::I16x8, &::I16x8]; &INPUTS },
+            output: &::I16x8,
+            definition: Named("llvm.ppc.altivec.vmhaddshs")
+        },
+        "_vec_msumubm" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::U8x16, &::U8x16, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vmsumubm")
+        },
+        "_vec_msumuhm" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::U16x8, &::U16x8, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vmsumuhm")
+        },
+        "_vec_msummbm" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::I8x16, &::U8x16, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vmsummbm")
+        },
+        "_vec_msumshm" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::I16x8, &::I16x8, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vmsumshm")
+        },
+        "_vec_msumshs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::I16x8, &::I16x8, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vmsumshs")
+        },
+        "_vec_msumuhs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 3] = [&::U16x8, &::U16x8, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vmsumuhs")
+        },
+        "_vec_sum2s" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vsum2sws")
+        },
+        "_vec_sum4sbs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I8x16, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vsum4sbs")
+        },
+        "_vec_sum4ubs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::U8x16, &::U32x4]; &INPUTS },
+            output: &::U32x4,
+            definition: Named("llvm.ppc.altivec.vsum4ubs")
+        },
+        "_vec_sum4shs" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I16x8, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vsum4shs")
+        },
+        "_vec_sums" => Intrinsic {
+            inputs: { static INPUTS: [&'static Type; 2] = [&::I32x4, &::I32x4]; &INPUTS },
+            output: &::I32x4,
+            definition: Named("llvm.ppc.altivec.vsumsws")
+        },
         _ => return None,
     })
 }

@@ -14,7 +14,7 @@ use hir::map::DefPathHash;
 use ich::{self, CachingCodemapView};
 use session::config::DebugInfoLevel::NoDebugInfo;
 use ty;
-use util::nodemap::NodeMap;
+use util::nodemap::{NodeMap, ItemLocalMap};
 
 use std::hash as std_hash;
 use std::collections::{HashMap, HashSet, BTreeMap};
@@ -205,13 +205,15 @@ impl<'a, 'gcx, 'tcx> HashStable<StableHashingContext<'a, 'gcx, 'tcx>> for ast::N
                 // corresponding entry in the `trait_map` we need to hash that.
                 // Make sure we don't ignore too much by checking that there is
                 // no entry in a debug_assert!().
-                debug_assert!(hcx.tcx.trait_map.get(self).is_none());
+                let hir_id = hcx.tcx.hir.node_to_hir_id(*self);
+                debug_assert!(hcx.tcx.in_scope_traits(hir_id).is_none());
             }
             NodeIdHashingMode::HashDefPath => {
                 hcx.tcx.hir.definitions().node_to_hir_id(*self).hash_stable(hcx, hasher);
             }
             NodeIdHashingMode::HashTraitsInScope => {
-                if let Some(traits) = hcx.tcx.trait_map.get(self) {
+                let hir_id = hcx.tcx.hir.node_to_hir_id(*self);
+                if let Some(traits) = hcx.tcx.in_scope_traits(hir_id) {
                     // The ordering of the candidates is not fixed. So we hash
                     // the def-ids and then sort them and hash the collection.
                     let mut candidates: AccumulateVec<[_; 8]> =
@@ -253,17 +255,17 @@ impl<'a, 'gcx, 'tcx> HashStable<StableHashingContext<'a, 'gcx, 'tcx>> for Span {
         // If this is not an empty or invalid span, we want to hash the last
         // position that belongs to it, as opposed to hashing the first
         // position past it.
-        let span_hi = if self.hi > self.lo {
+        let span_hi = if self.hi() > self.lo() {
             // We might end up in the middle of a multibyte character here,
             // but that's OK, since we are not trying to decode anything at
             // this position.
-            self.hi - ::syntax_pos::BytePos(1)
+            self.hi() - ::syntax_pos::BytePos(1)
         } else {
-            self.hi
+            self.hi()
         };
 
         {
-            let loc1 = hcx.codemap().byte_pos_to_line_and_col(self.lo);
+            let loc1 = hcx.codemap().byte_pos_to_line_and_col(self.lo());
             let loc1 = loc1.as_ref()
                            .map(|&(ref fm, line, col)| (&fm.name[..], line, col.to_usize()))
                            .unwrap_or(("???", 0, 0));
@@ -296,7 +298,7 @@ impl<'a, 'gcx, 'tcx> HashStable<StableHashingContext<'a, 'gcx, 'tcx>> for Span {
             }
         }
 
-        if self.ctxt == SyntaxContext::empty() {
+        if self.ctxt() == SyntaxContext::empty() {
             0u8.hash_stable(hcx, hasher);
         } else {
             1u8.hash_stable(hcx, hasher);
@@ -355,6 +357,18 @@ pub fn hash_stable_nodemap<'a, 'tcx, 'gcx, V, W>(
 {
     hash_stable_hashmap(hcx, hasher, map, |hcx, node_id| {
         hcx.tcx.hir.definitions().node_to_hir_id(*node_id).local_id
+    });
+}
+
+pub fn hash_stable_itemlocalmap<'a, 'tcx, 'gcx, V, W>(
+    hcx: &mut StableHashingContext<'a, 'gcx, 'tcx>,
+    hasher: &mut StableHasher<W>,
+    map: &ItemLocalMap<V>)
+    where V: HashStable<StableHashingContext<'a, 'gcx, 'tcx>>,
+          W: StableHasherResult,
+{
+    hash_stable_hashmap(hcx, hasher, map, |_, local_id| {
+        *local_id
     });
 }
 
